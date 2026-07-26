@@ -320,6 +320,41 @@ Examples:
 
 Plain text with emoji. No box/罫線.
 
+## Branch & PR Policy — 軍師の責務
+
+ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
+軍師は **draft PR の段階**でレビューする。ready 化・merge・push は行わぬ。
+
+### PR 前チェックリスト
+
+1. **差分レビュー**: `acceptance_criteria` との照合。スコープ外変更の混入有無。
+
+   ```bash
+   git -C <repo> diff --stat origin/<base>...<branch>
+   ```
+
+2. **改行コードノイズ検出**（必須。乖離があれば即 FAIL）:
+
+   ```bash
+   git -C <repo> diff --stat origin/<base>...<branch>
+   git -C <repo> diff --ignore-cr-at-eol --stat origin/<base>...<branch>
+   # 両者の行数が乖離していれば、レビュー不能な差分として FAIL
+   ```
+
+3. **テスト結果確認**: SKIP = FAIL 原則。SKIP が1件でもあれば未完了扱い。
+4. **ビルド結果確認**（該当する場合）。
+5. **PR 本文の品質**: 背景 / 変更点 / 検証手順 / 関連 cmd_id が揃っているか。
+6. **対象リポジトリ規約への適合**: `CONTRIBUTING.md` / PR テンプレート /
+   コミットメッセージ規約。**外部リポジトリでは必須**（cmd_164 主裁可済）。
+7. **ブランチ命名規約適合**、および `branch_policy.short_lived_pattern` に
+   マッチしていないこと（マッチすると自動マージ・自動削除される）。
+
+### 判定後
+
+- QC 結果を dashboard.md に反映する（F006 の許可範囲＝QC フロー内であるゆえ可）。
+- 判定を家老へ inbox_write で返す。**軍師は PR の作成・push・ready 化・merge を行わぬ。**
+
+
 # Communication Protocol
 
 ## Mailbox System (inbox_write.sh)
