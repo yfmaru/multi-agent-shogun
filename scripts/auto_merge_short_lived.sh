@@ -33,6 +33,12 @@ done
 
 export BRANCH_POLICY_DRY_RUN="$DRY_RUN"
 
+AUTO_MERGE_ENABLED="$(branch_policy_query auto_merge_enabled 2>/dev/null || echo false)"
+if [[ "$AUTO_MERGE_ENABLED" != "true" && "$DRY_RUN" != "1" ]]; then
+    echo "[SKIP] auto_merge disabled by branch_policy.auto_merge_enabled" >&2
+    exit 0
+fi
+
 PRIMARY_BRANCH="$(branch_policy_query primary)"
 SHORT_LIVED_PATTERN="$(branch_policy_query short_lived_pattern)"
 MAX_AGE_SECONDS="$(branch_policy_query max_age_seconds)"
