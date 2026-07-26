@@ -93,3 +93,13 @@ gh auth login
   対話フローの中で `Authenticate Git with your GitHub credentials?` と
   問われた場合、`Yes` を選択すると `gh` が `git` の認証情報ヘルパーとして
   自動設定される（これによりoriginへのgit pushが可能になる）。
+
+## workflow scope に関する教訓（cmd_163実体験）
+
+- `gh auth login` のデバイスフロー認証はデフォルトで `workflow` scope を
+  含まない。`.github/workflows/**` 配下へ push する必要がある場合は、
+  別途 `gh auth refresh -s workflow` の実行が必要。
+- `gh auth refresh` のような `gh` CLI コマンドを非対話・スクリプト文脈で
+  実行する場合は `-h github.com` のホスト指定が必須。
+- 本教訓は cmd_163 T2 で `.github/workflows/test.yml` を含む push が
+  workflow scope 不足により失敗した実体験に基づく。
