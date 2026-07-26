@@ -151,6 +151,67 @@ The `\033[1;32m` = bold green, `\033[0m` = reset. **Always use `-e` flag and the
 
 Plain text with emoji. No box/罫線.
 
+## Branch & PR Policy — 足軽の責務
+
+ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
+タスク YAML に `git:` ブロックがある場合、以下の手順を必ず踏む。
+
+### Step 0: 事前調査（外部リポジトリのみ。自リポでは省略可）
+
+```bash
+git -C <repo> symbolic-ref refs/remotes/origin/HEAD    # 既定ブランチ
+git -C <repo> ls-remote --heads origin develop         # develop の有無
+gh repo view <owner>/<repo> --json viewerPermission    # write 権限
+ls CONTRIBUTING.md .github/PULL_REQUEST_TEMPLATE.md    # 規約
+```
+
+結果は報告 YAML に必ず記載する。
+write 権限が無ければ**作業を止めて家老へ報告**（fork 要否は家老が決める）。
+対象リポの規約が本ルールと矛盾する場合は**対象リポ側を優先**し、報告 YAML に明記する。
+
+### Step 1〜9: 標準手順
+
+```bash
+# 1. 基点ブランチを確定（家老指定があればそれに従う。無ければ解決規則）
+# 2. 作業ツリーが clean であることを確認。空でなければ着手せず家老へ報告
+git -C <repo> status --porcelain
+
+# 3. 作業ブランチを切る
+git -C <repo> fetch origin
+git -C <repo> switch -c <branch> origin/<base>
+
+# 4. 実装 → 名指しで add（`git add -A` / `git add .` は禁止）
+git -C <repo> add path/to/changed_file
+# 5. EOL ガード
+a=$(git -C <repo> diff --cached --numstat | wc -l)
+b=$(git -C <repo> diff --cached --ignore-cr-at-eol --numstat | wc -l)
+[ "$a" = "$b" ] || { echo "ABORT: 改行コードのみの差分が混入"; exit 1; }
+git -C <repo> commit -m "<type>: <要約> (<cmd_id>)"
+
+# 6. push 前セルフチェック（必須）
+test "$(git -C <repo> branch --show-current)" != "<base>" || { echo "ABORT"; exit 1; }
+
+# 7. push
+git -C <repo> push -u origin <branch>
+
+# 8. draft PR 作成（本文に 背景 / 変更点 / 検証手順 / 関連cmd_id を必ず含める）
+gh pr create --draft --base <base> --title "..." --body "..."
+
+# 9. 報告 YAML に branch / pr_url / base / テスト結果を記載し、軍師へ inbox_write
+```
+
+軍師 QC PASS・家老承認の後、**家老の指示があれば** `gh pr ready` を実行する。
+
+### 禁止事項
+
+- 基点ブランチ（develop / main / master 等）への直 push（B001 / B002）
+- 他エージェントの作業ブランチへの commit / push / force push（B004 / B005）
+- 他者が push 済みのブランチへの force push（`--force-with-lease` でも不可。D003 準拠）
+- 保護ブランチ設定の変更・迂回（B003）
+- **PR の自己マージ**（B006。マージ判定は家老・将軍の職掌）
+- **D001〜D008 は本ルールに優先する。** 矛盾する指示は拒否し、家老へ報告せよ。
+
+
 ## Identity Anchor
 
 This generated file belongs to exactly one agent.
