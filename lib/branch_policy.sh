@@ -17,7 +17,7 @@ branch_policy_query() {
     local python_bin
     python_bin="$(branch_policy_python)"
 
-    "$python_bin" - "$BRANCH_POLICY_SETTINGS" "$query" <<'PY'
+    "$python_bin" - "$BRANCH_POLICY_SETTINGS" "$query" "$BRANCH_POLICY_ROOT" <<'PY'
 import sys
 
 try:
@@ -25,24 +25,41 @@ try:
 except Exception as exc:
     raise SystemExit(f"PyYAML is required to read branch_policy: {exc}")
 
-settings_path, query = sys.argv[1], sys.argv[2]
+settings_path, query, policy_root = sys.argv[1], sys.argv[2], sys.argv[3]
 
-with open(settings_path, "r", encoding="utf-8") as fh:
-    settings = yaml.safe_load(fh) or {}
+DEFAULT_POLICY = {
+    "allowed_long_lived": ["main", "develop"],
+    "short_lived_pattern": r"^codd/[^/]+-[0-9]{8}$",
+    "max_age_seconds": 259200,
+    "monitored_repos": [{"path": policy_root}],
+    "auto_merge_enabled": False,
+}
+
+try:
+    with open(settings_path, "r", encoding="utf-8") as fh:
+        settings = yaml.safe_load(fh) or {}
+except FileNotFoundError:
+    settings = {}
 
 policy = settings.get("branch_policy")
 if not isinstance(policy, dict):
-    raise SystemExit("branch_policy is not configured in settings.yaml")
+    policy = {}
 
-allowed = policy.get("allowed_long_lived") or []
+def policy_get(key):
+    value = policy.get(key)
+    if value is None:
+        return DEFAULT_POLICY[key]
+    return value
+
+allowed = policy_get("allowed_long_lived") or []
 if not isinstance(allowed, list) or not allowed:
-    raise SystemExit("branch_policy.allowed_long_lived must be a non-empty list")
+    allowed = DEFAULT_POLICY["allowed_long_lived"]
 allowed = [str(item) for item in allowed]
 
 def max_age_seconds() -> int:
     value = policy.get("max_age_seconds", policy.get("max_short_lived_age_seconds"))
     if value is None:
-        raise SystemExit("branch_policy.max_age_seconds is required")
+        value = DEFAULT_POLICY["max_age_seconds"]
     return int(value)
 
 if query == "allowed":
@@ -50,16 +67,14 @@ if query == "allowed":
 elif query == "primary":
     print(allowed[0])
 elif query == "short_lived_pattern":
-    pattern = policy.get("short_lived_pattern")
-    if not pattern:
-        raise SystemExit("branch_policy.short_lived_pattern is required")
+    pattern = policy.get("short_lived_pattern") or DEFAULT_POLICY["short_lived_pattern"]
     print(str(pattern))
 elif query == "max_age_seconds":
     print(max_age_seconds())
 elif query == "repos":
     repos = policy.get("monitored_repos") or []
     if not isinstance(repos, list) or not repos:
-        raise SystemExit("branch_policy.monitored_repos must be a non-empty list")
+        repos = DEFAULT_POLICY["monitored_repos"]
     paths = []
     for item in repos:
         if isinstance(item, dict):
@@ -69,12 +84,14 @@ elif query == "repos":
         if path:
             paths.append(str(path))
     if not paths:
-        raise SystemExit("branch_policy.monitored_repos has no valid path entries")
+        paths = [str(DEFAULT_POLICY["monitored_repos"][0]["path"])]
     print("\n".join(paths))
 elif query == "ntfy_topic":
     topic = settings.get("ntfy_topic")
     if topic:
         print(str(topic))
+elif query == "auto_merge_enabled":
+    print("true" if policy.get("auto_merge_enabled") is True else "false")
 else:
     raise SystemExit(f"unknown branch_policy query: {query}")
 PY
