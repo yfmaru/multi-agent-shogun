@@ -136,6 +136,7 @@ logs/
 !docs/
 !docs/philosophy.md
 !docs/vps_pr118_verification_plan.md
+!docs/gh_cli_setup.md
 
 # Screenshots (masked — no secrets)
 !images/
