@@ -875,6 +875,53 @@ These checks supplement Gunshi's QC. They do **not** replace the Ashigaru → Gu
 **Exception**: If the L4+ task is simple enough (e.g., small code review), an ashigaru can handle it.
 Use Gunshi for tasks that genuinely need deep thinking — don't over-route trivial analysis.
 
+## Branch & PR Policy — 家老の責務
+
+ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
+
+### タスク分解時
+
+- **適用判定は家老が行う。** 足軽に判定を委ねてはならぬ（判断のばらつきを防ぐ）。
+  該当するならタスク YAML に `git:` ブロックを必ず記載する:
+
+  ```yaml
+  git:
+    repo_path: /mnt/c/tools/multi-agent-shogun
+    base_branch: develop
+    branch_name: feat/cmd_163-branch-policy
+    pr_base: develop
+    pr_draft: true
+  ```
+
+- **ブランチ名は命名規約から機械的に導出する。** 家老は規約適合を確認し、
+  衝突時のみ調停する。恣意的な命名をしてはならぬ。
+- **ブランチ排他所有**: 1ブランチには足軽1名のみを割り当てる。同一 cmd を並行処理
+  する場合は、ファイル領域の重ならぬ単位に分割し、足軽ごとに独立ブランチ・独立 PR
+  とする。同一ファイルを2名が触る分割は不可。
+- PR 間に依存があるときは merge 順序を決め、後続タスクを `blocked_by` で待機させる。
+
+### PR 進行管理
+
+- 足軽は PR を **draft** で作成する。軍師の QC PASS を受けて、家老が
+  ready へ上げる可否を最終判定する（足軽へ `gh pr ready` を指示する）。
+- **監査**: 各 PR 着地後、基点ブランチへの直 push が無かったことを確認する。
+
+  ```bash
+  git -C <repo> log --first-parent --no-merges origin/develop -5
+  # マージコミット以外が並んでいれば直 push の疑い
+  ```
+
+  違反を検出したら即 dashboard.md の 🚨要対応 へ記載し、将軍へ上申する。
+
+### 外部リポジトリ
+
+- 足軽の事前調査結果（write 権限・規約）を受け、**fork 要否と PR 方針を決定する**
+  （cmd_164 主裁可済）。write 権限が無ければ fork 経由 PR に切り替える。
+- **他者所有リポジトリへの PR 提出・develop 新設は家老の判断で進めてはならぬ。**
+  将軍経由で主の裁可を得るまで足軽を待機させる。
+- 対象リポジトリの規約が本ルールと矛盾する場合は対象リポジトリ側を優先し、
+  その判断を dashboard.md に記録する。
+
 ## OSS Pull Request Review
 
 External PRs are reinforcements. Treat with respect.
