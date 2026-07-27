@@ -112,9 +112,7 @@ EOFYAML
             ;;
     esac
 
-    if [[ "$cli_type" == "opencode" ]]; then
-        normalize_generated_markdown "$output_path"
-    fi
+    normalize_generated_markdown "$output_path"
 
     echo "  ✅ Created: $output_filename"
 }
