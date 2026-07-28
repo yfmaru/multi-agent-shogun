@@ -58,6 +58,9 @@
 !lib/agent_status.sh
 !lib/agent_registry.sh
 
+# cmd_171: stall_policy / baton_watchdog config query library
+!lib/stall_policy.sh
+
 # Multi-CLI: Codex auto-load file
 !AGENTS.md
 
