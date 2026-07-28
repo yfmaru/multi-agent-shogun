@@ -59,6 +59,26 @@ start_watcher_if_missing() {
     ) 9>"$lockfile"
 }
 
+# baton_watchdog は agent 単位ではない単一インスタンスの大域 watcher
+# （cmd_171/T3）。全体整合性（バトン喪失）の判定を9本の inbox_watcher に
+# 分散させると同一結論に9重で達し通知が9重に飛ぶため、専用プロセス1本に
+# 起動を限定する。pgrep 判定は start_watcher_if_missing の重複起動防止と
+# 同格の仕組みで既に足りる（1プロセスのみ許す）。
+start_baton_watchdog_if_missing() {
+    local log_file="$1"
+    local lockfile="/tmp/shogun_watcher_start_baton_watchdog.lock"
+
+    (
+        flock -n 9 || return 0
+        if pgrep -f "scripts/baton_watchdog.sh" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        nohup bash scripts/baton_watchdog.sh >> "$log_file" 2>&1 &
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [START] baton_watchdog started PID=$!" >&2
+    ) 9>"$lockfile"
+}
+
 watcher_specs() {
     local pane_base
     local agent
@@ -72,12 +92,19 @@ watcher_specs() {
         fi
         printf '%s\t%s\tlogs/inbox_watcher_%s.log\n' "$agent" "$pane" "$agent"
     done < <(agent_registry_agents)
+
+    # エージェント名ではない単一の大域 watcher。pane は存在しない（"-"）。
+    printf 'baton_watchdog\t-\tlogs/baton_watchdog.log\n'
 }
 
 start_all_watchers() {
     local agent pane log_file
     while IFS=$'\t' read -r agent pane log_file; do
-        start_watcher_if_missing "$agent" "$pane" "$log_file"
+        if [ "$agent" = "baton_watchdog" ]; then
+            start_baton_watchdog_if_missing "$log_file"
+        else
+            start_watcher_if_missing "$agent" "$pane" "$log_file"
+        fi
     done < <(watcher_specs)
 }
 

@@ -125,6 +125,7 @@ scripts/seo_qc.sh
 !scripts/switch_cli.sh
 !scripts/dashboard-viewer.py
 !scripts/mcp_health_check.sh
+!scripts/baton_watchdog.sh
 
 
 # SayTask (sample template only, not actual data)
