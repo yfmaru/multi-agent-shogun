@@ -19,6 +19,15 @@
 #   2〜4分: Copilot/Kimi は Escape×2 + Ctrl-C + nudge。
 #            Claude/Codex/OpenCode は通常nudgeへフォールバック
 #   4分〜 : /clear送信（5分に1回まで。強制リセット+YAML再読）
+#
+# 停止検知（cmd_171。上記エスカレーションとは別系統。未読の有無を問わず、
+# pane が静止したまま busy に見える状態を対象とする。stall_policy.enabled
+# が true のときのみ動く opt-in 機構）:
+#   判定順序は必ず以下を守る（順序を誤ると使用量制限中のエージェントへ
+#   Escape/nudge/clearを送ってしまう）:
+#     Gate 0: pane_is_active（人間操作中は何もしない）
+#     Gate 1: 類型C（使用量制限）を最優先で排除 — limitedなら何もしない
+#     Gate 2: 類型Aの検知（is_stalled_pane） — unknownならEscapeのみ、okなら全段
 # ═══════════════════════════════════════════════════════════════
 
 # ─── Testing guard ───
@@ -70,6 +79,14 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
     _agent_status_lib="${SCRIPT_DIR}/lib/agent_status.sh"
     if [ -f "$_agent_status_lib" ]; then
         source "$_agent_status_lib"
+    fi
+
+    # Source stall_policy query lib (cmd_171). Provides stall_policy_query /
+    # baton_watchdog_query with safe defaults even when the config section
+    # (or config/settings.yaml itself) is absent.
+    _stall_policy_lib="${SCRIPT_DIR}/lib/stall_policy.sh"
+    if [ -f "$_stall_policy_lib" ]; then
+        source "$_stall_policy_lib"
     fi
 
     # Detect OS and select file-watching backend
@@ -182,6 +199,12 @@ ASW_NO_IDLE_FULL_READ=${ASW_NO_IDLE_FULL_READ:-1}
 # - ASW_PROCESS_TIMEOUT=0: do not process unread on timeout ticks (event-only)
 ASW_DISABLE_ESCALATION=${ASW_DISABLE_ESCALATION:-0}
 ASW_PROCESS_TIMEOUT=${ASW_PROCESS_TIMEOUT:-1}
+
+# ─── Stall detection state (cmd_171 / T1) ───
+# Process-local; tracks the last observed pane hash for is_stalled_pane().
+STALL_HASH=${STALL_HASH:-}
+STALL_HASH_SINCE=${STALL_HASH_SINCE:-0}
+STALL_ACTED_AT=${STALL_ACTED_AT:-0}
 
 # ─── Metrics hooks (FR-006 / NFR-003) ───
 # unread_latency_sec / read_count / estimated_tokens are intentionally explicit
@@ -507,6 +530,11 @@ PY
 # 実行時にtmux paneの @agent_cli を再確認し、ドリフト時はpane値を優先する。
 send_cli_command() {
     local cmd="$1"
+    # cmd_171/C1-3: attempt_stall_recovery() passes force_busy=1. A stall is
+    # BY DEFINITION busy (is_stalled_pane requires agent_is_busy() true), so
+    # the ordinary busy-guard below would silently swallow /clear every time
+    # a stall is detected — defeating the ladder's final step entirely.
+    local force_busy="${2:-0}"
     local effective_cli
     effective_cli=$(get_effective_cli_type)
 
@@ -538,7 +566,7 @@ send_cli_command() {
     if [[ "$cmd" == "/clear" ]]; then
         pane_snapshot=$(timeout 2 tmux capture-pane -t "$PANE_TARGET" -p 2>/dev/null || true)
     fi
-    if [[ "$cmd" == "/clear" ]] && ! [[ "$effective_cli" == "opencode" && -z "${pane_snapshot//[[:space:]]/}" ]] && agent_is_busy; then
+    if [[ "$cmd" == "/clear" ]] && [ "$force_busy" -ne 1 ] && ! [[ "$effective_cli" == "opencode" && -z "${pane_snapshot//[[:space:]]/}" ]] && agent_is_busy; then
         echo "[$(date)] [SKIP] Agent is busy — /clear deferred to next cycle (agent=$AGENT_ID)" >&2
         return 0
     fi
@@ -851,6 +879,54 @@ agent_is_busy() {
     fi
 }
 
+# ─── Stall detection (cmd_171 / T1) ───
+# usage_limit_state() lives in lib/usage_limit.sh (owner: T2). T1 and T2 are
+# developed in parallel worktrees, so fall back to "unknown" when the lib
+# hasn't landed yet — this breaks the T1↔T2 ordering dependency (spec §4).
+declare -f usage_limit_state >/dev/null || usage_limit_state() { echo unknown; }
+
+# is_stalled_pane: type-A (interactive-modal-style) stall detection.
+# True only when busy AND the pane content hash has been unchanged for
+# stall_after_sec. This is the false-positive guard — genuine long-running
+# turns keep printing tokens/spinner, so the hash keeps changing.
+is_stalled_pane() {
+    local now
+    now=$(date +%s)
+
+    # Not busy → not stalled. Reset tracking state.
+    if ! agent_is_busy; then
+        STALL_HASH=""
+        STALL_HASH_SINCE=0
+        return 1
+    fi
+
+    local capture_output capture_rc
+    capture_output=$(timeout 2 tmux capture-pane -t "$PANE_TARGET" -p 2>/dev/null)
+    capture_rc=$?
+    # Capture failure or empty pane (e.g. pane gone) → indeterminate, do nothing.
+    # NOTE: we check capture_output directly rather than the post-cksum hash —
+    # cksum of zero bytes still yields a non-empty checksum ("4294967295"), so
+    # testing the hash for emptiness would never catch this case.
+    if [ "$capture_rc" -ne 0 ] || [ -z "$capture_output" ]; then
+        STALL_HASH=""
+        return 1
+    fi
+
+    local h
+    h=$(printf '%s' "$capture_output" | cksum | awk '{print $1}')
+
+    if [ "$h" != "$STALL_HASH" ]; then
+        STALL_HASH="$h"
+        STALL_HASH_SINCE="$now"
+        return 1  # screen moved — alive
+    fi
+
+    # Same hash persisting — check duration against threshold
+    local stall_after_sec
+    stall_after_sec=$(stall_policy_query stall_after_sec 2>/dev/null) || stall_after_sec=480
+    [ $((now - STALL_HASH_SINCE)) -ge "$stall_after_sec" ]
+}
+
 # ─── Pane focus detection (human safety) ───
 # If the target pane is currently active, avoid injecting keystrokes.
 pane_is_active() {
@@ -1044,6 +1120,99 @@ send_wakeup_with_escape() {
 
     echo "[$(date)] WARNING: send-keys failed for Escape+nudge ($AGENT_ID)" >&2
     return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
+}
+
+# ─── Stall recovery (cmd_171 / T1) ───
+# Escalation ladder for a detected type-A stall: Escape×2 -> (30s) nudge ->
+# (30s) /clear. Re-checks is_stalled_pane() before each step and aborts the
+# remaining steps the instant the screen starts moving again (TC-STALL-007).
+# opt-in via stall_policy.enabled (default false — lord's authorization).
+attempt_stall_recovery() {
+    if [ "$(stall_policy_query enabled 2>/dev/null)" != "true" ]; then
+        return 0
+    fi
+
+    # Gate 0: human may be operating this pane right now — never inject keys.
+    if pane_is_active && session_has_client; then
+        return 0
+    fi
+
+    # Gate 1: type-C (usage limit) takes priority over type-A. An agent
+    # stalled by a usage limit has a frozen pane that looks identical to a
+    # type-A stall — evaluating this first is the whole point of §1.0.
+    local usage_state
+    usage_state=$(usage_limit_state "$AGENT_ID" 2>/dev/null) || usage_state="unknown"
+    if [ "$usage_state" = "limited" ]; then
+        echo "[$(date)] [STALL] $AGENT_ID: type_C usage_limited — no action taken" >&2
+        return 0
+    fi
+
+    # Gate 2: type-A detection
+    if ! is_stalled_pane; then
+        return 0
+    fi
+
+    # Retry cooldown — don't re-trigger the ladder repeatedly on one stall.
+    local now cooldown
+    now=$(date +%s)
+    cooldown=$(stall_policy_query stall_retry_cooldown_sec 2>/dev/null) || cooldown=600
+    if [ "${STALL_ACTED_AT:-0}" -ne 0 ] && [ "$((now - STALL_ACTED_AT))" -lt "$cooldown" ]; then
+        return 0
+    fi
+
+    # Recovery ceiling depends on how confidently we've ruled out type-C:
+    #   usage_state=unknown -> unknown_policy (default escape_only)
+    #   usage_state=ok      -> recovery_level (default escape_only)
+    local policy
+    if [ "$usage_state" = "unknown" ]; then
+        policy=$(stall_policy_query unknown_policy 2>/dev/null) || policy="escape_only"
+    else
+        policy=$(stall_policy_query recovery_level 2>/dev/null) || policy="escape_only"
+    fi
+
+    if [ "$policy" = "none" ]; then
+        echo "[$(date)] [STALL] $AGENT_ID: stall detected (usage=$usage_state) but policy=none — no action" >&2
+        return 0
+    fi
+
+    STALL_ACTED_AT=$now
+    echo "[$(date)] [STALL] $AGENT_ID: type-A stall detected (usage=$usage_state, policy=$policy) — Escape x2" >&2
+    timeout 5 tmux send-keys -t "$PANE_TARGET" Escape Escape 2>/dev/null || true
+
+    if [ "$policy" = "escape_only" ]; then
+        return 0
+    fi
+
+    sleep 30
+    if ! is_stalled_pane; then
+        echo "[$(date)] [STALL] $AGENT_ID: pane moved after Escape — aborting ladder" >&2
+        return 0
+    fi
+
+    echo "[$(date)] [STALL] $AGENT_ID: still stalled after Escape — nudge" >&2
+    timeout 5 tmux send-keys -t "$PANE_TARGET" "inbox?" 2>/dev/null || true
+    sleep 0.3
+    timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null || true
+
+    sleep 30
+    if ! is_stalled_pane; then
+        echo "[$(date)] [STALL] $AGENT_ID: pane moved after nudge — aborting ladder" >&2
+        return 0
+    fi
+
+    # C1-6: command-layer agents never get /clear from the stall ladder either
+    # (same protection as the existing Phase 3 escalation).
+    if [ "$AGENT_ID" = "shogun" ] || [ "$AGENT_ID" = "karo" ] || [ "$AGENT_ID" = "gunshi" ]; then
+        echo "[$(date)] [SKIP] $AGENT_ID: command-layer agent — suppressing /clear in stall ladder" >&2
+        return 0
+    fi
+
+    echo "[$(date)] [STALL] $AGENT_ID: still stalled after nudge — /clear" >&2
+    # force_busy=1: a detected stall is BY DEFINITION busy (is_stalled_pane
+    # requires agent_is_busy() true), so send_cli_command's ordinary busy
+    # guard must be bypassed here or /clear would never actually fire.
+    send_cli_command "/clear" 1
+    return 0
 }
 
 # ─── Process cycle ───
@@ -1273,9 +1442,34 @@ for s in data.get('specials', []):
         FIRST_UNREAD_SEEN=0
         NEW_CONTEXT_SENT=0
         reset_nudge_throttle
+
+        # ─── Stall detection (cmd_171 / T1) ───
+        # Must run before the idle-flag touch below: for claude, touching the
+        # flag first would make agent_is_busy() report idle on the spot, so
+        # is_stalled_pane() would see "not busy" and reset its tracking state
+        # before stall_after_sec is ever reached.
+        attempt_stall_recovery
+
         # Ensure idle flag exists when all messages are read.
         # Recovers from stop_hook_inbox.sh flag loss during block cycles.
-        touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
+        # cmd_171/C1-4: for claude, agent_is_busy() treats "flag present" as
+        # authoritative idle. Touching it unconditionally here — as before —
+        # would mask a genuine stall (agent stuck mid-turn, Stop hook never
+        # fired): the very next tick would see the flag and conclude idle,
+        # permanently hiding the stall from is_stalled_pane(). Condition the
+        # touch on the pane-based check (agent_is_busy_check) independently
+        # agreeing the agent is idle. Non-claude CLIs never consult this flag
+        # for busy detection, so their touch stays unconditional (existing
+        # stop_hook-flag-loss recovery is unchanged for them).
+        local idle_flag_cli
+        idle_flag_cli=$(get_effective_cli_type)
+        if [ "$idle_flag_cli" = "claude" ]; then
+            if ! agent_is_busy_check "$PANE_TARGET" "$idle_flag_cli"; then
+                touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
+            fi
+        else
+            touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
+        fi
         # Clear stale nudge text from input field (Codex CLI prefills last input on idle).
         # Only send C-u when agent is idle — during Working it would be disruptive.
         if ! agent_is_busy; then
@@ -1366,4 +1560,11 @@ fi  # end testing guard
 _agent_status_lib="${SCRIPT_DIR}/lib/agent_status.sh"
 if [ -f "$_agent_status_lib" ] && ! type agent_is_busy_check &>/dev/null; then
     source "$_agent_status_lib"
+fi
+
+# Same double-source guard for stall_policy_query() (cmd_171), so it is
+# available in test mode too.
+_stall_policy_lib="${SCRIPT_DIR}/lib/stall_policy.sh"
+if [ -f "$_stall_policy_lib" ] && ! type stall_policy_query &>/dev/null; then
+    source "$_stall_policy_lib"
 fi
