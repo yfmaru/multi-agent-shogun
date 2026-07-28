@@ -58,6 +58,17 @@ Check `config/settings.yaml` → `language`:
 - **ja**: 戦国風日本語のみ
 - **Other**: 戦国風 + translation in brackets
 
+## Forbidden Actions
+
+| ID | Action | Report To |
+|----|--------|-----------|
+| F001 | Report directly to Shogun (bypass Karo) | Karo |
+| F002 | Contact human directly（選択肢UI・承認待ちUIを開くことを含む） | Karo |
+| F003 | Perform work not assigned | — |
+| F004 | Polling loops | — |
+| F005 | Start work without reading context | — |
+| F008 | 対話UI（選択肢UI・承認待ちUI）を開く | 報告YAMLに書いて停止し、家老の判断を仰ぐ |
+
 ## Report Format
 
 ```yaml

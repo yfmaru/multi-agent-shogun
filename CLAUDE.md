@@ -196,6 +196,24 @@ Race condition is eliminated: the context reset wipes old context. Agent re-read
 
 **Always Read before Write/Edit.** Claude Code rejects Write/Edit on unread files.
 
+## 待機の成立条件 (all agents)
+
+**「相手の応答を待つ」と判断・記録する前に、相手が実際に仕事を
+保持していることを実測せよ。** 確認できぬ待機は、待機ではなく停止である。
+
+```bash
+grep -c 'read: false' queue/inbox/<相手>.yaml   # 0 なら依頼を保持しておらぬ
+grep -m1 '  status:' queue/tasks/<相手>.yaml    # done/別task_id なら未着手
+```
+
+両方が空振りなら待つな。自ら次手を打つか、依頼を発出せよ。
+dashboard や報告に「〜待ち」と書く場合は、上記の実測値を併記すること。
+
+**バトンの規律**: 開いている cmd それぞれについて、常にただ一人が
+バトンを保持する。手渡しは「タスクYAMLへの記載」と「inbox_write」の
+**両方**が揃って初めて成立する。片方だけでは手渡しではない。
+バトンを渡さずに idle へ入ることは、待機ではなく取り落ちである。
+
 # Context Layers
 
 ```
@@ -320,6 +338,7 @@ multi-agent-shogun 自身は develop を持つため、常に規則 3 に該当�
 | B004 | 他エージェント／他者の作業ブランチへの割り込み commit・push |
 | B005 | 他者のブランチへの force push。`--force-with-lease` であっても禁止（D003 準拠） |
 | B006 | PR の自己マージ。マージ可否の判定は家老・将軍の職掌 |
+| B007 | 長寿命ブランチ（develop / main / master 等）を head とする PR のマージに `--delete-branch` を付すこと。head が `branch_policy.allowed_long_lived` に含まれる場合は必ず外す |
 
 ## ブランチ命名規約
 
