@@ -306,7 +306,8 @@ declare -A CODEX_CONTEXT
 CODEX_WARNINGS=""
 CODEX_STATUS="OK"
 
-# Shared quota (same ChatGPT Pro account — capture from first idle agent with /status)
+# Shared quota (same ChatGPT account — plan tier is not exposed by the API,
+# so it is not asserted here; capture from first idle agent with /status)
 CODEX_ACCT_5H_LEFT=""
 CODEX_ACCT_5H_RESET=""
 CODEX_ACCT_7D_LEFT=""
@@ -430,7 +431,7 @@ fi
 
 # --- Claude group ---
 if [[ ${#CLAUDE_AGENTS[@]} -gt 0 ]]; then
-    printf "\n── Claude Max ────────────────────────\n"
+    printf "\n── Claude ────────────────────────────\n"
 
     # Agent list with models
     agent_list=""
@@ -495,7 +496,7 @@ fi
 
 # --- Codex group ---
 if [[ ${#CODEX_AGENTS[@]} -gt 0 ]]; then
-    printf "\n── ChatGPT Pro ───────────────────────\n"
+    printf "\n── ChatGPT ────────────────────────────\n"
 
     # Shared model
     codex_model="${AGENT_MODEL[${CODEX_AGENTS[0]}]}"

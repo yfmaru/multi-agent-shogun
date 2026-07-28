@@ -12,11 +12,26 @@
 #                                     unreachable / malformed response).
 #   usage_limit_state [agent_id]   → stdout: "limited" | "ok" | "unknown"
 #
+# Judgement order (cmd_171 section 1.3, corrected 2026-07-29 per EV-C2 -- a
+# real ~10h stall where five_hour=43% looked fine while seven_day=78% with
+# an active weekly_all warning was the actual constraint):
+#   a) any limits[] entry has is_active==true and severity != "normal"
+#      -> limited (the API assigns meaning to these fields itself; no
+#         threshold guess needed -- this is the primary, most robust signal)
+#   b) five_hour.utilization  >= usage_limit_threshold_pct -> limited
+#   c) seven_day.utilization  >= usage_limit_threshold_pct -> limited
+#      (b/c are a fallback kept in case limits[] is ever absent)
 # usage_limit_state never returns "ok" when the underlying signal could not
-# be determined — it returns "unknown" instead (cmd_171 §1.3). The 5-hour
-# utilization is a single account-wide figure (one OAuth credential covers
-# the whole machine), so the result does not vary by agent_id except for
-# the CLI-type gate below.
+# be determined (missing/unreadable credentials, API unreachable, malformed
+# response) -- it returns "unknown" instead.
+#
+# Pane-text matching (secondary/supplementary per section 1.3) is NOT
+# implemented here -- that lives in inbox_watcher.sh (T1), which has access
+# to captured pane text; this library only receives an agent_id.
+#
+# The usage figures are a single account-wide signal (one OAuth credential
+# covers the whole machine), so the result does not vary by agent_id except
+# for the CLI-type gate below.
 
 USAGE_LIMIT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -36,7 +51,8 @@ usage_limit_python() {
 }
 
 # usage_limit_fetch_raw — hits the Anthropic OAuth usage API and prints
-# KEY=VALUE lines (same shape scripts/ratelimit_check.sh parses today).
+# KEY=VALUE lines (same shape scripts/ratelimit_check.sh parses today, plus
+# LIMITS_FLAGGED for the limits[] check -- see judgement order above).
 # Returns non-zero and prints nothing if credentials are missing/unreadable,
 # python is unavailable, or the API call fails / returns malformed JSON.
 usage_limit_fetch_raw() {
@@ -80,6 +96,17 @@ sd = data.get('seven_day') or {}
 ss = data.get('seven_day_sonnet') or {}
 so = data.get('seven_day_opus') or {}
 ex = data.get('extra_usage') or {}
+limits = data.get('limits') or []
+
+# EV-C2: the API assigns meaning to is_active/severity itself -- an active,
+# non-normal-severity entry is the primary 'limited' signal, more robust
+# than any single utilization threshold we'd otherwise have to guess.
+limits_flagged = any(
+    isinstance(item, dict)
+    and item.get('is_active') is True
+    and str(item.get('severity', 'normal')).lower() != 'normal'
+    for item in limits
+)
 
 print(f'5H_UTIL={fh.get(\"utilization\", \"?\")}')
 print(f'5H_RESET={fh.get(\"resets_at\", \"?\")[:16]}')
@@ -88,7 +115,40 @@ print(f'7D_RESET={sd.get(\"resets_at\", \"?\")[:10]}')
 print(f'7D_SONNET={ss.get(\"utilization\", \"-\")}')
 print(f'7D_OPUS={so.get(\"utilization\", \"-\")}')
 print(f'EXTRA={ex.get(\"is_enabled\", False)}')
+print(f'LIMITS_FLAGGED={\"true\" if limits_flagged else \"false\"}')
 " 2>/dev/null
+}
+
+# _usage_limit_decide raw_kv_lines -> "limited" | "ok"
+# Applies the judgement order documented at the top of this file to an
+# already-fetched usage_limit_fetch_raw payload.
+_usage_limit_decide() {
+    local raw="$1"
+    local flagged util5h util7d threshold
+
+    flagged=$(printf '%s' "$raw" | grep '^LIMITS_FLAGGED=' | cut -d= -f2)
+    if [[ "$flagged" == "true" ]]; then
+        printf 'limited\n'
+        return 0
+    fi
+
+    threshold="$(stall_policy_query usage_limit_threshold_pct 2>/dev/null || echo 95)"
+
+    util5h=$(printf '%s' "$raw" | grep '^5H_UTIL=' | cut -d= -f2)
+    if [[ "$util5h" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+        && awk -v u="$util5h" -v t="$threshold" 'BEGIN { exit !(u >= t) }'; then
+        printf 'limited\n'
+        return 0
+    fi
+
+    util7d=$(printf '%s' "$raw" | grep '^7D_UTIL=' | cut -d= -f2)
+    if [[ "$util7d" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+        && awk -v u="$util7d" -v t="$threshold" 'BEGIN { exit !(u >= t) }'; then
+        printf 'limited\n'
+        return 0
+    fi
+
+    printf 'ok\n'
 }
 
 # usage_limit_state [agent_id] → "limited" | "ok" | "unknown"
@@ -114,19 +174,13 @@ usage_limit_state() {
         return 0
     fi
 
-    local raw util threshold state
+    local raw state
     raw="$(usage_limit_fetch_raw)" || raw=""
-    util=$(printf '%s' "$raw" | grep '^5H_UTIL=' | cut -d= -f2)
 
-    if [[ -z "$util" ]] || ! [[ "$util" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    if [[ -z "$raw" ]]; then
         state="unknown"
     else
-        threshold="$(stall_policy_query usage_limit_threshold_pct 2>/dev/null || echo 95)"
-        if awk -v u="$util" -v t="$threshold" 'BEGIN { exit !(u >= t) }'; then
-            state="limited"
-        else
-            state="ok"
-        fi
+        state="$(_usage_limit_decide "$raw")"
     fi
 
     export USAGE_LIMIT_CACHE_STATE="$state"
