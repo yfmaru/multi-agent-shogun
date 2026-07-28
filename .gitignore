@@ -61,6 +61,9 @@
 # cmd_171: stall_policy / baton_watchdog config query library
 !lib/stall_policy.sh
 
+# cmd_171: usage_limit_state (type-C stall detection) library
+!lib/usage_limit.sh
+
 # Multi-CLI: Codex auto-load file
 !AGENTS.md
 
