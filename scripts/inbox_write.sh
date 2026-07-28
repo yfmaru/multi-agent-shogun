@@ -2,6 +2,9 @@
 # inbox_write.sh — メールボックスへのメッセージ書き込み（排他ロック付き）
 # Usage: bash scripts/inbox_write.sh <target_agent> <content> <type> <from>
 # Example: bash scripts/inbox_write.sh karo "足軽5号、任務完了" report_received ashigaru5
+#
+# 過去の既読メッセージ（overflow時に退避されたもの）を参照したい場合は
+# `grep` で `queue/inbox/archive/<agent>-*.yaml` を検索せよ。
 
 set -e
 
@@ -79,6 +82,7 @@ while [ $attempt -lt $max_attempts ]; do
         trap _release_lock EXIT
         if "$SCRIPT_DIR/.venv/bin/python3" -c "
 import yaml, sys
+import tempfile, os
 
 try:
     # Load existing inbox
@@ -102,16 +106,44 @@ try:
     }
     data['messages'].append(new_msg)
 
-    # Overflow protection: keep max 50 messages
+    # Overflow protection: keep max 50 messages.
+    # Older read messages are archived (not discarded) to queue/inbox/archive/.
     if len(data['messages']) > 50:
         msgs = data['messages']
         unread = [m for m in msgs if not m.get('read', False)]
         read = [m for m in msgs if m.get('read', False)]
-        # Keep all unread + newest 30 read messages
+        # Keep all unread + newest 30 read messages; archive the rest.
+        to_archive = read[:-30] if len(read) > 30 else []
         data['messages'] = unread + read[-30:]
 
+        # Invariant: unread (read: false) messages must NEVER be archived/discarded.
+        if to_archive:
+            archive_dir = os.path.join(os.path.dirname('$INBOX'), 'archive')
+            os.makedirs(archive_dir, exist_ok=True)
+            archive_date = '$TIMESTAMP'.split('T')[0]
+            archive_path = os.path.join(archive_dir, '${TARGET}-' + archive_date + '.yaml')
+
+            if os.path.exists(archive_path):
+                with open(archive_path) as af:
+                    archive_data = yaml.safe_load(af)
+            else:
+                archive_data = None
+            if not archive_data:
+                archive_data = {}
+            if not archive_data.get('messages'):
+                archive_data['messages'] = []
+            archive_data['messages'].extend(to_archive)
+
+            archive_tmp_fd, archive_tmp_path = tempfile.mkstemp(dir=archive_dir, suffix='.tmp')
+            try:
+                with os.fdopen(archive_tmp_fd, 'w') as af:
+                    yaml.dump(archive_data, af, default_flow_style=False, allow_unicode=True, indent=2)
+                os.replace(archive_tmp_path, archive_path)
+            except:
+                os.unlink(archive_tmp_path)
+                raise
+
     # Atomic write: tmp file + rename (prevents partial reads)
-    import tempfile, os
     tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname('$INBOX'), suffix='.tmp')
     try:
         with os.fdopen(tmp_fd, 'w') as f:
