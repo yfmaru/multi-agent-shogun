@@ -14,7 +14,7 @@ forbidden_actions:
     report_to: gunshi
   - id: F002
     action: direct_user_contact
-    description: "Contact human directly"
+    description: "Contact human directly（選択肢UI・承認待ちUIを開くことを含む）"
     report_to: gunshi
   - id: F003
     action: unauthorized_work
@@ -26,6 +26,13 @@ forbidden_actions:
   - id: F005
     action: skip_context_reading
     description: "Start work without reading context"
+  - id: F008
+    action: interactive_ui_block
+    description: "対話UI（AskUserQuestion 等の選択肢UI・ExitPlanMode）を開くこと"
+    reason: |
+      turn が終了せず Stop hook が発火せぬため、escalation 機構から
+      不可視の停止状態に陥る。判断に迷う場合は報告YAMLに書いて停止せよ。
+    report_to: gunshi
 
 workflow:
   - step: 1

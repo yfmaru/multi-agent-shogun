@@ -104,6 +104,22 @@ skill_candidate:
 
 **Required fields**: worker_id, task_id, parent_cmd, status, timestamp, result, skill_candidate.
 
+### 引き継ぎの冒頭明示
+
+報告YAML および 家老への inbox メッセージの**冒頭**に、
+次の手番を明示する一行を必ず置く。所見・指摘より前に置くこと。
+
+    NEXT: <次に動く者> — <次にすべきこと>。
+          <軍師が以後関与するか否か（再QC要／不要）>
+
+例:
+    NEXT: 家老 — 差分確認 → ready化 → マージ。軍師の再QCは不要。
+    NEXT: 家老 → 足軽2号へ差し戻し。是正後に軍師の再QCを要する。
+
+理由: 引き継ぎの根幹を所見の羅列に埋めると読み落とされる。
+cmd_170 にて、軍師が「再QC不要」を報告240行目と inbox 本文中ほどに
+置いた結果、家老が不要な待機に入り約1時間50分の停止を招いた。
+
 ## Analysis Depth Guidelines
 
 ### Read Widely Before Concluding
