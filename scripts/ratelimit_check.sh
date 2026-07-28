@@ -27,6 +27,7 @@ done
 # ─── Load shared libraries ───
 source "$SCRIPT_DIR/lib/agent_status.sh"
 source "$SCRIPT_DIR/lib/cli_adapter.sh"
+source "$SCRIPT_DIR/lib/usage_limit.sh"
 
 PYTHON="${SCRIPT_DIR}/.venv/bin/python3"
 
@@ -207,41 +208,11 @@ CLAUDE_EXTRA_ENABLED="false"
 CLAUDE_STATUS="OK"
 
 # OAuth usage API (primary source — real subscription rate limits)
-CLAUDE_CREDS="$HOME/.claude/.credentials.json"
+# Call extracted to lib/usage_limit.sh (usage_limit_fetch_raw) so the
+# API-calling logic isn't duplicated between this script and stall detection.
+CLAUDE_CREDS="$USAGE_LIMIT_CREDS"
 if [[ ${#CLAUDE_AGENTS[@]} -gt 0 ]] && [[ -f "$CLAUDE_CREDS" ]] && [[ -x "$PYTHON" ]]; then
-    oauth_data=$("$PYTHON" -c "
-import json, subprocess, sys
-
-with open('${CLAUDE_CREDS}') as f:
-    creds = json.load(f)
-token = creds.get('claudeAiOauth', {}).get('accessToken', '')
-if not token:
-    sys.exit(1)
-
-result = subprocess.run([
-    'curl', '-s', '-m', '10',
-    '-H', f'Authorization: Bearer {token}',
-    '-H', 'Accept: application/json',
-    '-H', 'anthropic-beta: oauth-2025-04-20',
-    'https://api.anthropic.com/api/oauth/usage'
-], capture_output=True, text=True)
-
-data = json.loads(result.stdout)
-
-fh = data.get('five_hour') or {}
-sd = data.get('seven_day') or {}
-ss = data.get('seven_day_sonnet') or {}
-so = data.get('seven_day_opus') or {}
-ex = data.get('extra_usage') or {}
-
-print(f'5H_UTIL={fh.get(\"utilization\", \"?\")}')
-print(f'5H_RESET={fh.get(\"resets_at\", \"?\")[:16]}')
-print(f'7D_UTIL={sd.get(\"utilization\", \"?\")}')
-print(f'7D_RESET={sd.get(\"resets_at\", \"?\")[:10]}')
-print(f'7D_SONNET={ss.get(\"utilization\", \"-\")}')
-print(f'7D_OPUS={so.get(\"utilization\", \"-\")}')
-print(f'EXTRA={ex.get(\"is_enabled\", False)}')
-" 2>/dev/null) || oauth_data=""
+    oauth_data=$(usage_limit_fetch_raw) || oauth_data=""
 
     if [[ -n "$oauth_data" ]]; then
         CLAUDE_5H_UTIL=$(echo "$oauth_data" | grep '^5H_UTIL=' | cut -d= -f2)
