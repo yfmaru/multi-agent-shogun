@@ -18,12 +18,25 @@
 #   TC-BATON-008: shogun_to_karo.yaml が壊れている/無い場合も落ちない（open_cmds=0扱い）
 #
 # D-1（cmd_171/FU-1。既存B-1〜B-3とは独立したOR条件。配送機構死亡検知）:
-#   TC-D1-001: 未読1件・timestampが600秒超過 → 通知される
+# 条件はAND: (i) stale unread がある かつ (ii) 当該agentのinbox_watcher.shが
+# 死んでいる。pgrep はデフォルトで「該当プロセス無し（死亡）」をモックする
+# （TEST_HARNESS内）。TC-D1-001〜006 は (ii) が満たされる前提での検知テスト。
+#   TC-D1-001: 未読1件・timestampが600秒超過・watcher死亡 → 通知される
 #   TC-D1-002: 未読1件だがtimestampが600秒以内 → 通知されない
 #   TC-D1-003: 未読0件 → 通知されない
 #   TC-D1-005: D-1もtmuxに一切触れない
 #   TC-D1-006: 同一の継続停止に対して二重通知しない
+#   TC-D1-007: 未読1件・timestampが600秒超過だがwatcherが生きている → 通知されない
+#              （軍師QC §SC-5：busyでの正常な滞留を誤検知しないためのAND条件）
+#   TC-D1-008: 【回帰・QC-70】実際の scripts/inbox_write.sh が書く
+#              naive・ローカル時刻のtimestampが正しく解釈されること
 #   （TC-D1-004＝既存TC-BATON-001〜008の回帰は本ファイル全体の実行で担保）
+#
+# QC-70（PR #16 差し戻し）: naive timestamp を「UTC」と誤読していたため
+# D-1が本番で約9時間発火しない欠陥があった。テストフィクスチャが
+# `date -u` でUTCのnaive文字列を書いていたため本番との乖離が緑のまま
+# 見逃されていた。以降フィクスチャは `-u` を使わず、本番と同一の
+# ローカル時刻naive書式で timestamp を生成する。
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHDOG_SCRIPT="$PROJECT_ROOT/scripts/baton_watchdog.sh"
@@ -35,8 +48,10 @@ setup() {
 
     export MOCK_TMUX_LOG="$TEST_TMPDIR/tmux_calls.log"
     export NOTIFY_LOG="$TEST_TMPDIR/notify.log"
+    export PGREP_LOG="$TEST_TMPDIR/pgrep_calls.log"
     > "$MOCK_TMUX_LOG"
     > "$NOTIFY_LOG"
+    > "$PGREP_LOG"
 
     # --- 既定フィクスチャ: 未読0・稼働中タスク0・未完了cmd0（安全なベースライン） ---
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << 'YAML'
@@ -80,6 +95,17 @@ branch_policy_notify() {
     echo "NOTIFY: \$1" >> "$NOTIFY_LOG"
     return 0
 }
+
+# pgrep のデフォルトモック: 実マシン上で本物の inbox_watcher.sh が稼働中でも
+# テスト結果がそれに引きずられないよう、常にこの関数で置き換える
+# （real pgrep バイナリは呼ばない）。既定では該当プロセス無し＝watcher死亡
+# とみなす（exit 1）。生存を模したいテストは呼び出し後にこの関数を
+# 上書きしてよい。
+pgrep() {
+    echo "MOCKPGREP \$*" >> "$PGREP_LOG"
+    return 1
+}
+export -f pgrep
 HARNESS
     chmod +x "$TEST_HARNESS"
 }
@@ -281,7 +307,10 @@ YAML
 
 @test "TC-D1-001: delivery stall detected when an unread message's timestamp exceeds threshold" {
     local stale_ts
-    stale_ts=$(date -u -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # `-u` を付けぬこと。本番の書き手 scripts/inbox_write.sh:46 は
+    # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
+    # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
@@ -301,7 +330,7 @@ YAML
 
 @test "TC-D1-002: no delivery-stall notification when the unread message is fresh" {
     local fresh_ts
-    fresh_ts=$(date -u -d "@$(( $(date +%s) - 100 ))" +"%Y-%m-%dT%H:%M:%S")
+    fresh_ts=$(date -d "@$(( $(date +%s) - 100 ))" +"%Y-%m-%dT%H:%M:%S")
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_fresh
@@ -334,7 +363,10 @@ YAML
 
 @test "TC-D1-005: tmux is never called by check_d1_once even when a stall is detected" {
     local stale_ts
-    stale_ts=$(date -u -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # `-u` を付けぬこと。本番の書き手 scripts/inbox_write.sh:46 は
+    # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
+    # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
@@ -355,7 +387,10 @@ YAML
 
 @test "TC-D1-006: no duplicate notification for the same continued delivery stall" {
     local stale_ts
-    stale_ts=$(date -u -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # `-u` を付けぬこと。本番の書き手 scripts/inbox_write.sh:46 は
+    # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
+    # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
@@ -371,4 +406,59 @@ YAML
     "
     [ "$status" -eq 0 ]
     [ "$(grep -c "NOTIFY: delivery_stall" "$NOTIFY_LOG")" -eq 1 ]
+}
+
+# --- TC-D1-007: 【軍師QC §SC-5】watcherが生きていれば、未読が滞留していても通知しない ---
+
+@test "TC-D1-007: no notification when the message is stale but the agent's watcher is alive (busy, not dead)" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        # このテストに限り watcher が生きていることにする
+        # （長いturnを回している間の正常な滞留を模す）。
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$NOTIFY_LOG" ]
+    grep -q "inbox_watcher.sh karo " "$PGREP_LOG"
+}
+
+# --- TC-D1-008: 【回帰・QC-70】inbox_write.shが実際に書くnaive・ローカル時刻timestampの解釈 ---
+
+@test "TC-D1-008: naive local timestamp actually written by scripts/inbox_write.sh is correctly interpreted as local time" {
+    # inbox_write.sh は自身の BASH_SOURCE から SCRIPT_DIR（= queue/ の親）を
+    # 決めるため、fixture配下に実体をコピーして呼べば FIXTURE_ROOT/queue/inbox/
+    # に書かせられる。同スクリプトが使う .venv も併せて用意する（本番と同じ
+    # venv を再利用。フィクスチャ独自のvenvは持たない）。
+    mkdir -p "$FIXTURE_ROOT/scripts"
+    cp "$PROJECT_ROOT/scripts/inbox_write.sh" "$FIXTURE_ROOT/scripts/inbox_write.sh"
+    ln -s "$PROJECT_ROOT/.venv" "$FIXTURE_ROOT/.venv"
+
+    run bash "$FIXTURE_ROOT/scripts/inbox_write.sh" karo "regression message for QC-70" task_assigned ashigaru3
+    [ "$status" -eq 0 ]
+    [ -f "$FIXTURE_ROOT/queue/inbox/karo.yaml" ]
+    grep -q "read: false" "$FIXTURE_ROOT/queue/inbox/karo.yaml"
+
+    # 実際に書かれた timestamp の「書式」はそのまま（naive・ローカル時刻）に、
+    # 「値」だけを600秒前に差し替える。書式そのものを検証するのが本テストの主旨。
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    sed -i "s/timestamp: .*/timestamp: '${stale_ts}'/" "$FIXTURE_ROOT/queue/inbox/karo.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "NOTIFY: delivery_stall" "$NOTIFY_LOG"
 }

@@ -136,8 +136,17 @@ check_once() {
 # 溜まる一方であり、B-1（未読合計0）が常に偽になってしまうため。
 #
 # D-1はこれを補う独立したOR条件: read:false のまま
-# BATON_D1_STALE_AFTER_SEC 秒以上放置されたメッセージが queue/inbox/*.yaml
-# に1件でもあれば、「配送が停止している」とみなし即座に通知する。
+# BATON_D1_STALE_AFTER_SEC 秒以上放置されたメッセージを持つ inbox が
+# 1件でもあり、**かつ**その agent の inbox_watcher.sh プロセスが
+# 生きていなければ、「配送が停止している」とみなし即座に通知する
+# （軍師QC §SC-5・PR #16再QC分）。
+#
+# watcher が生きたまま未読が滞留するのは、当該 agent が長い turn を
+# 回している間の正常な滞留でありうる（send_wakeup は busy 中 nudge を
+# スキップするため）。それを「配送死亡」と誤検知しないよう、
+# プロセス生存確認を AND 条件として要求する。pgrep はプロセス確認で
+# あり tmux ではないため、通知のみ・裁可を要さぬという性質は保たれる。
+#
 # メッセージ自身の timestamp が既に停止の継続時間を表しているため、
 # B-1〜B-3のような別途の継続時間計測（BATON_LOST_SINCE相当）は不要である。
 #
@@ -146,10 +155,14 @@ check_once() {
 BATON_D1_STALE_AFTER_SEC=600   # 10分。既存baton_lost_after_secとは独立した固定値
 BATON_D1_NOTIFIED=0            # 同一の継続停止に対して二重通知しないためのガード
 
-# queue/inbox/*.yaml の全メッセージのうち、read: false かつ timestamp が
-# BATON_D1_STALE_AFTER_SEC 秒以上前のものの件数を返す。
+# queue/inbox/*.yaml のうち、read: false かつ timestamp が
+# BATON_D1_STALE_AFTER_SEC 秒以上前のメッセージを1件以上含む inbox の
+# agent名（ファイル名から拡張子を除いたもの）を、1行1件で標準出力へ返す。
+# naive（tzinfo無し）timestamp は「ローカル時刻」として解釈する
+# （書き手 scripts/inbox_write.sh:46 は `date "+%Y-%m-%dT%H:%M:%S"` で
+#   ローカル時刻・オフセット表記なしのnaive文字列を書くため）。
 # 読むのは queue/inbox/*.yaml のみ。tmux には一切触れない（TC-D1-005）。
-baton_watchdog_count_stale_unread() {
+baton_watchdog_list_stale_inbox_agents() {
     local python_bin
     python_bin="$(stall_policy_python)"
     "$python_bin" - "$ROOT" "$BATON_D1_STALE_AFTER_SEC" <<'PY'
@@ -163,7 +176,6 @@ root, threshold = sys.argv[1], int(sys.argv[2])
 try:
     import yaml
 except Exception:
-    print(0)
     raise SystemExit(0)
 
 
@@ -178,12 +190,13 @@ def parse_ts(value):
     except Exception:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        # naive はローカル時刻として書かれている（inbox_write.sh:46）。
+        # astimezone() は naive をシステムのローカルタイムゾーンとみなして aware 化する。
+        dt = dt.astimezone()
     return dt.astimezone(timezone.utc)
 
 
 now = datetime.now(timezone.utc)
-stale = 0
 for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -195,6 +208,7 @@ for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
     messages = data.get("messages")
     if not isinstance(messages, list):
         continue
+    stale_here = False
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -204,25 +218,43 @@ for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
         if dt is None:
             continue
         if (now - dt).total_seconds() >= threshold:
-            stale += 1
-print(stale)
+            stale_here = True
+            break
+    if stale_here:
+        print(os.path.splitext(os.path.basename(path))[0])
 PY
+}
+
+# agent の inbox_watcher.sh が生きていれば真を返す。
+# watcher_supervisor.sh の重複起動防止判定と同一パターンを用いる
+# （末尾スペースは ashigaru1 が ashigaru10 等に部分一致するのを防ぐ）。
+baton_watchdog_watcher_alive() {
+    local agent="$1"
+    pgrep -f "scripts/inbox_watcher.sh ${agent} " >/dev/null 2>&1
 }
 
 # D-1を1回だけ判定する。check_once()（B-1〜B-3）とは完全に独立した関数であり、
 # check_once() を呼ばない・その内部にも触れない。
+#
+# 条件はAND: (i) stale unread な inbox がある **かつ**
+#            (ii) その agent の inbox_watcher.sh プロセスが生きていない
 check_d1_once() {
-    local stale
+    local agent dead_stale_count=0
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
     fi
 
-    stale=$(baton_watchdog_count_stale_unread)
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+        if ! baton_watchdog_watcher_alive "$agent"; then
+            dead_stale_count=$((dead_stale_count + 1))
+        fi
+    done < <(baton_watchdog_list_stale_inbox_agents)
 
-    if [ "${stale:-0}" -gt 0 ]; then
+    if [ "$dead_stale_count" -gt 0 ]; then
         if [ "$BATON_D1_NOTIFIED" -eq 0 ]; then
-            branch_policy_notify "delivery_stall: stale_unread=${stale} (${BATON_D1_STALE_AFTER_SEC}s+未読放置。配送機構=watcher群の停止疑い)"
+            branch_policy_notify "delivery_stall: dead_watcher_stale_inboxes=${dead_stale_count} (${BATON_D1_STALE_AFTER_SEC}s+未読放置 かつ watcherプロセス不在。配送機構死亡の疑い)"
             BATON_D1_NOTIFIED=1
         fi
     else
