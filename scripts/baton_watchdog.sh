@@ -19,6 +19,13 @@
 #
 # 読むのは queue/ 配下のファイルのみ。dashboard.md（二次データ）は見ない。
 # tmux には一切触れない（テストで固定：TC-BATON-006）。
+#
+# 【periodic /clear (cmd_172/P7) — 同プロセスへの並存拡張】
+# 上記B-1/B-2/B-3判定（check_once）とは完全に独立した別機能を同居させる。
+# karo/軍師それぞれが「手隙」を periodic_clear_idle_sec 以上継続した場合に
+# 限り、既存の clear_command 配送経路（inbox_write.sh → inbox_watcher.sh）
+# へ1回だけ書き込み、文脈をリセットさせる。opt-in（既定 disabled）。
+# 詳細は periodic_clear_* 関数群（check_once 定義の直前）を参照。
 # ═══════════════════════════════════════════════════════════════
 
 # ─── Testing guard ───
@@ -38,6 +45,11 @@ source "$SCRIPT_DIR/lib/branch_policy.sh"
 # ─── プロセスローカル状態 ───
 BATON_LOST_SINCE=0   # 3条件が揃い始めた epoch（揃っていなければ0）
 BATON_NOTIFIED=0     # 同一の継続停止に対して二重通知しないためのガード
+
+# ─── periodic /clear (cmd_172/P7) プロセスローカル状態 ───
+# エージェントごとに独立（B-1/B-2/B-3の全体判定とは完全に並存する別機能）。
+declare -A PERIODIC_CLEAR_IDLE_SINCE=()  # agent -> idle条件が揃い始めた epoch（0なら未計測）
+declare -A PERIODIC_CLEAR_SENT=()        # agent -> 同一idle windowで送信済みか(1/0)
 
 baton_watchdog_count_unread() {
     local unread=0 f n
@@ -95,6 +107,138 @@ if not isinstance(cmds, list):
 
 print(sum(1 for c in cmds if isinstance(c, dict) and c.get("status") != "done"))
 PY
+}
+
+# ═══════════════════════════════════════════════════════════════
+# periodic /clear (cmd_172/P7) — karo/軍師の定期文脈切断
+#
+# 既存のB-1/B-2/B-3判定（check_once）とは完全に独立した別機能。
+# 「手隙が長時間続いた」ことを検知して clear_command を1回だけ書き込む。
+# tmux には一切触れない（inbox_write.sh はファイル書き込みのみ）。
+# periodic_clear_enabled=false（既定）なら常に no-op。
+# ═══════════════════════════════════════════════════════════════
+
+periodic_clear_count_unread() {
+    local file="$1" n
+    if [ -f "$file" ]; then
+        n=$(grep -c 'read: false' "$file" 2>/dev/null || true)
+    else
+        n=0
+    fi
+    echo "${n:-0}"
+}
+
+# karo の安全判定用: ashigaru*.yaml と gunshi.yaml のうち
+# assigned/in_progress が1件でもあれば非0を返す。
+periodic_clear_count_active_ashigaru_gunshi() {
+    local active=0 f
+    for f in "$ROOT"/queue/tasks/ashigaru*.yaml "$ROOT"/queue/tasks/gunshi.yaml; do
+        [ -f "$f" ] || continue
+        if grep -qE '^  status: (assigned|in_progress)' "$f" 2>/dev/null; then
+            active=$((active + 1))
+        fi
+    done
+    echo "$active"
+}
+
+# karo の安全判定用: shogun_to_karo.yaml の commands のうち
+# status: in_progress の件数（baton_watchdog_count_open_cmds は != done で
+# 別目的のため流用しない）。ファイル欠損・壊れたYAMLでも0を返す。
+periodic_clear_count_in_progress_cmds() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" <<'PY'
+import sys
+
+try:
+    import yaml
+except Exception:
+    print(0)
+    raise SystemExit(0)
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+cmds = data.get("commands")
+if cmds is None:
+    cmds = data.get("cmds")
+if isinstance(cmds, dict):
+    cmds = list(cmds.values())
+if not isinstance(cmds, list):
+    cmds = []
+
+print(sum(1 for c in cmds if isinstance(c, dict) and c.get("status") == "in_progress"))
+PY
+}
+
+# agent(karo|gunshi) を1つ受け取り、「今すぐ/clearしてよい」条件を真偽で返す。
+# instructions/karo.md の既存「Karo Self-/clear」節（未読0・assigned/in_progress
+# タスクなし・in_progress cmdなし）と同じ考え方をkaro/軍師それぞれに適用する。
+periodic_clear_agent_idle() {
+    local agent="$1"
+    local unread
+    unread=$(periodic_clear_count_unread "$ROOT/queue/inbox/${agent}.yaml")
+    [ "${unread:-0}" -eq 0 ] || return 1
+
+    case "$agent" in
+        karo)
+            local active in_progress
+            active=$(periodic_clear_count_active_ashigaru_gunshi)
+            [ "${active:-0}" -eq 0 ] || return 1
+            in_progress=$(periodic_clear_count_in_progress_cmds)
+            [ "${in_progress:-0}" -eq 0 ] || return 1
+            ;;
+        gunshi)
+            local f="$ROOT/queue/tasks/gunshi.yaml"
+            if [ -f "$f" ] && grep -qE '^  status: (assigned|in_progress)' "$f" 2>/dev/null; then
+                return 1
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# 1回だけ判定する。check_once の直後（メインループ・--once どちらからも）
+# 毎サイクル呼ばれる。periodic_clear_enabled=false なら即座に何もしない。
+periodic_clear_check_once() {
+    if [ "$(baton_watchdog_query periodic_clear_enabled)" != "true" ]; then
+        return 0
+    fi
+
+    local now threshold agent agents_raw
+    now=$(date +%s)
+    threshold=$(baton_watchdog_query periodic_clear_idle_sec)
+    agents_raw=$(baton_watchdog_query periodic_clear_agents)
+
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+        if periodic_clear_agent_idle "$agent"; then
+            if [ "${PERIODIC_CLEAR_IDLE_SINCE[$agent]:-0}" -eq 0 ]; then
+                PERIODIC_CLEAR_IDLE_SINCE[$agent]=$now
+            fi
+            if [ $(( now - PERIODIC_CLEAR_IDLE_SINCE[$agent] )) -ge "$threshold" ] \
+                && [ "${PERIODIC_CLEAR_SENT[$agent]:-0}" -eq 0 ]; then
+                bash "$ROOT/scripts/inbox_write.sh" "$agent" "定期メンテナンスによる文脈整理" clear_command baton_watchdog
+                PERIODIC_CLEAR_SENT[$agent]=1
+            fi
+        else
+            # 条件が崩れた＝busyになった・新規タスク・未読発生。
+            # 次のidle windowで再送可能にするため状態をリセットする
+            # （BATON_NOTIFIEDのリセットと同じ考え方）。
+            PERIODIC_CLEAR_IDLE_SINCE[$agent]=0
+            PERIODIC_CLEAR_SENT[$agent]=0
+        fi
+    done <<< "$agents_raw"
 }
 
 # 1回だけ判定する。メインループ・--once どちらからも呼ばれる。
@@ -273,12 +417,14 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     if [ "${1:-}" = "--once" ]; then
         check_once
         check_d1_once
+        periodic_clear_check_once
         exit 0
     fi
 
     while true; do
         check_once
         check_d1_once
+        periodic_clear_check_once
         sleep "$(baton_watchdog_query poll_interval_sec)"
     done
 fi
