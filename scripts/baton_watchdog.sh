@@ -31,6 +31,9 @@
 # 両経路は独立したガード変数・独立した閾値を持ち、一方が死んでも他方は
 # 生きる。
 #
+# 【M-2是正・軍師発見】check_d1_once（D-1・配送機構死亡検知）にも同型の
+# 二経路化を適用する（詳細はcheck_d1_once直前のコメントを参照）。
+#
 # 【periodic /clear (cmd_172/P7) — 同プロセスへの並存拡張】
 # 上記B-1/B-2/B-3判定（check_once）とは完全に独立した別機能を同居させる。
 # karo/軍師それぞれが「手隙」を periodic_clear_idle_sec 以上継続した場合に
@@ -312,6 +315,182 @@ check_once() {
     echo "[$(date)] [baton_watchdog/check_once] unread=${unread} active=${active} open_cmds=${open_cmds} baton_condition=${condition}"
 }
 
+# ═══════════════════════════════════════════════════════════════
+# D-1: 配送機構死亡検知（既存B-1〜B-3とは独立したOR条件）(cmd_171/FU-1)
+#
+# PR #14（cmd_172）のQCで判明: B-1〜B-3は「配送機構（watcher群）自体が
+# 死ぬ」形の停止を検知できない。watcher群が死ねば nudge が届かず未読が
+# 溜まる一方であり、B-1（未読合計0）が常に偽になってしまうため。
+#
+# D-1はこれを補う独立したOR条件: read:false のまま
+# BATON_D1_STALE_AFTER_SEC 秒以上放置されたメッセージを持つ inbox が
+# 1件でもあり、**かつ**その agent の inbox_watcher.sh プロセスが
+# 生きていなければ、「配送が停止している」とみなし即座に通知する
+# （軍師QC §SC-5・PR #16再QC分）。
+#
+# watcher が生きたまま未読が滞留するのは、当該 agent が長い turn を
+# 回している間の正常な滞留でありうる（send_wakeup は busy 中 nudge を
+# スキップするため）。それを「配送死亡」と誤検知しないよう、
+# プロセス生存確認を AND 条件として要求する。pgrep はプロセス確認で
+# あり tmux ではないため、通知のみ・裁可を要さぬという性質は保たれる。
+#
+# メッセージ自身の timestamp が既に停止の継続時間を表しているため、
+# 主経路（将軍inbox）の発火判定にB-1〜B-3のような別途の継続時間計測
+# （BATON_LOST_SINCE相当）は不要である。
+#
+# 既存の check_once()（B-1〜B-3判定）の内部は一切変更しない。
+#
+# 【M-2是正・軍師発見】develop統合後、check_d1_once は branch_policy_notify
+# （ntfy）を直接・単独で呼ぶ作りのままだった。これはcheck_once是正前の
+# 「通知経路がntfy一本」構造そのものであり、ntfy_topic未設定時に同型の
+# 事故を再現しかねない。check_onceと同じ二経路化パターンをここにも適用:
+#   主経路: baton_watchdog_notify_shogun。既存どおりBATON_D1_STALE_AFTER_SEC
+#     （600秒）分stale化したメッセージの検知＝継続の証拠とし、追加の待機を
+#     挟まず無条件・即座に発火する（既存の即時発火という設計判断を維持）。
+#   副経路: ntfy。D-1は「配送機構自体の死亡」＝既存のB-1〜B-3より緊急度が
+#     高い検知であるため、check_once用のbaton_ntfy_after_sec（既定1800秒）
+#     をそのまま流用するのは緊急度に見合わないと判断し、より短い専用閾値
+#     baton_d1_ntfy_after_sec（既定900秒）を新設する。この閾値は
+#     「dead_stale_count>0の状態が観測され始めてからの継続時間」で計測する
+#     （BATON_D1_CONDITION_SINCE。check_onceのBATON_LOST_SINCEと同型）。
+# ═══════════════════════════════════════════════════════════════
+BATON_D1_STALE_AFTER_SEC=600     # 10分。既存baton_lost_after_secとは独立した固定値
+BATON_D1_NOTIFIED=0              # 主経路（将軍inbox）の二重通知防止ガード
+BATON_D1_CONDITION_SINCE=0       # dead_stale_count>0 になり始めたepoch（0なら未計測）
+BATON_D1_NTFY_NOTIFIED=0         # 副経路（ntfy）の二重通知防止ガード
+
+# queue/inbox/*.yaml のうち、read: false かつ timestamp が
+# BATON_D1_STALE_AFTER_SEC 秒以上前のメッセージを1件以上含む inbox の
+# agent名（ファイル名から拡張子を除いたもの）を、1行1件で標準出力へ返す。
+# naive（tzinfo無し）timestamp は「ローカル時刻」として解釈する
+# （書き手 scripts/inbox_write.sh:46 は `date "+%Y-%m-%dT%H:%M:%S"` で
+#   ローカル時刻・オフセット表記なしのnaive文字列を書くため）。
+# 読むのは queue/inbox/*.yaml のみ。tmux には一切触れない（TC-D1-005）。
+baton_watchdog_list_stale_inbox_agents() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT" "$BATON_D1_STALE_AFTER_SEC" <<'PY'
+import glob
+import os
+import sys
+from datetime import datetime, timezone
+
+root, threshold = sys.argv[1], int(sys.argv[2])
+
+try:
+    import yaml
+except Exception:
+    raise SystemExit(0)
+
+
+def parse_ts(value):
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        # naive はローカル時刻として書かれている（inbox_write.sh:46）。
+        # astimezone() は naive をシステムのローカルタイムゾーンとみなして aware 化する。
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc)
+
+
+now = datetime.now(timezone.utc)
+for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        continue
+    stale_here = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("read") is not False:
+            continue
+        dt = parse_ts(msg.get("timestamp"))
+        if dt is None:
+            continue
+        if (now - dt).total_seconds() >= threshold:
+            stale_here = True
+            break
+    if stale_here:
+        print(os.path.splitext(os.path.basename(path))[0])
+PY
+}
+
+# agent の inbox_watcher.sh が生きていれば真を返す。
+# watcher_supervisor.sh の重複起動防止判定と同一パターンを用いる
+# （末尾スペースは ashigaru1 が ashigaru10 等に部分一致するのを防ぐ）。
+baton_watchdog_watcher_alive() {
+    local agent="$1"
+    pgrep -f "scripts/inbox_watcher.sh ${agent} " >/dev/null 2>&1
+}
+
+# D-1を1回だけ判定する。check_once()（B-1〜B-3）とは完全に独立した関数であり、
+# check_once() を呼ばない・その内部にも触れない。
+#
+# 条件はAND: (i) stale unread な inbox がある **かつ**
+#            (ii) その agent の inbox_watcher.sh プロセスが生きていない
+check_d1_once() {
+    local agent dead_stale_count=0
+    local now elapsed ntfy_threshold
+
+    if [ "$(baton_watchdog_query enabled)" != "true" ]; then
+        return 0
+    fi
+
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+        if ! baton_watchdog_watcher_alive "$agent"; then
+            dead_stale_count=$((dead_stale_count + 1))
+        fi
+    done < <(baton_watchdog_list_stale_inbox_agents)
+
+    if [ "$dead_stale_count" -gt 0 ]; then
+        now=$(date +%s)
+        if [ "$BATON_D1_CONDITION_SINCE" -eq 0 ]; then
+            BATON_D1_CONDITION_SINCE=$now
+        fi
+        elapsed=$((now - BATON_D1_CONDITION_SINCE))
+
+        # 主経路: 将軍inbox通知。既存どおり、検知した時点で無条件・即座に
+        # 発火する（メッセージ自身が既にBATON_D1_STALE_AFTER_SEC秒分stale
+        # であることが継続の証拠であり、追加の待機は挟まない）。
+        # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
+        if [ "$BATON_D1_NOTIFIED" -eq 0 ]; then
+            baton_watchdog_notify_shogun "delivery_stall: dead_watcher_stale_inboxes=${dead_stale_count} (${BATON_D1_STALE_AFTER_SEC}s+未読放置 かつ watcherプロセス不在。配送機構死亡の疑い)"
+            BATON_D1_NOTIFIED=1
+        fi
+
+        # 副経路: ntfy（主のスマホ）。D-1専用の閾値（既定900秒。check_once用
+        # baton_ntfy_after_secの1800秒より短い — D-1は配送機構死亡という
+        # より緊急度の高い検知であるため）を、検知が継続した時間で計測する。
+        # 失敗許容 — 失敗してもログに残すのみで将軍inbox通知には無関係。
+        ntfy_threshold=$(baton_watchdog_query baton_d1_ntfy_after_sec)
+        if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "$BATON_D1_NTFY_NOTIFIED" -eq 0 ]; then
+            if ! branch_policy_notify "delivery_stall: dead_watcher_stale_inboxes=${dead_stale_count} (${BATON_D1_STALE_AFTER_SEC}s+未読放置 かつ watcherプロセス不在。配送機構死亡の疑い。${ntfy_threshold}s+検知継続・ntfy)"; then
+                echo "[$(date)] [baton_watchdog] D-1 ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+            fi
+            BATON_D1_NTFY_NOTIFIED=1
+        fi
+    else
+        BATON_D1_CONDITION_SINCE=0
+        BATON_D1_NOTIFIED=0
+        BATON_D1_NTFY_NOTIFIED=0
+    fi
+}
+
 if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     mkdir -p "$ROOT/logs"
 
@@ -322,12 +501,14 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
 
     if [ "${1:-}" = "--once" ]; then
         check_once
+        check_d1_once
         periodic_clear_check_once
         exit 0
     fi
 
     while true; do
         check_once
+        check_d1_once
         periodic_clear_check_once
         sleep "$(baton_watchdog_query poll_interval_sec)"
     done

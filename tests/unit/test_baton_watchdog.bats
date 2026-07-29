@@ -24,6 +24,33 @@
 #   TC-NOTIFY-003: ntfy失敗は将軍inbox通知の成否・処理継続に影響しない
 #   TC-NOTIFY-004: check_once は発火有無に関わらず毎回ステータス行を標準出力へ出す
 # （TC-NOTIFY-005＝回帰: 上記TC-BATON-001〜008が全PASSし続けることをもって兼ねる）
+#
+# 【M-2是正・軍師発見】D-1（check_d1_once）も同じ二経路化パターンを適用する。
+#   TC-NOTIFY-D1-001: D-1条件成立時、ntfy_topic 未設定でも将軍inboxへ通知される
+#   TC-NOTIFY-D1-002: ntfy(branch_policy_notify)はD-1副経路閾値到達時のみ呼ばれる
+#   TC-NOTIFY-D1-003: ntfy失敗はD-1の将軍inbox通知・処理継続に影響しない
+#   TC-NOTIFY-D1-004（回帰）: 既存のD-1関連テスト・check_once関連テストが全PASS
+#
+# D-1（cmd_171/FU-1。既存B-1〜B-3とは独立したOR条件。配送機構死亡検知）:
+# 条件はAND: (i) stale unread がある かつ (ii) 当該agentのinbox_watcher.shが
+# 死んでいる。pgrep はデフォルトで「該当プロセス無し（死亡）」をモックする
+# （TEST_HARNESS内）。TC-D1-001〜006 は (ii) が満たされる前提での検知テスト。
+#   TC-D1-001: 未読1件・timestampが600秒超過・watcher死亡 → 通知される
+#   TC-D1-002: 未読1件だがtimestampが600秒以内 → 通知されない
+#   TC-D1-003: 未読0件 → 通知されない
+#   TC-D1-005: D-1もtmuxに一切触れない
+#   TC-D1-006: 同一の継続停止に対して二重通知しない
+#   TC-D1-007: 未読1件・timestampが600秒超過だがwatcherが生きている → 通知されない
+#              （軍師QC §SC-5：busyでの正常な滞留を誤検知しないためのAND条件）
+#   TC-D1-008: 【回帰・QC-70】実際の scripts/inbox_write.sh が書く
+#              naive・ローカル時刻のtimestampが正しく解釈されること
+#   （TC-D1-004＝既存TC-BATON-001〜008の回帰は本ファイル全体の実行で担保）
+#
+# QC-70（PR #16 差し戻し）: naive timestamp を「UTC」と誤読していたため
+# D-1が本番で約9時間発火しない欠陥があった。テストフィクスチャが
+# `date -u` でUTCのnaive文字列を書いていたため本番との乖離が緑のまま
+# 見逃されていた。以降フィクスチャは `-u` を使わず、本番と同一の
+# ローカル時刻naive書式で timestamp を生成する。
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHDOG_SCRIPT="$PROJECT_ROOT/scripts/baton_watchdog.sh"
@@ -36,9 +63,11 @@ setup() {
     export MOCK_TMUX_LOG="$TEST_TMPDIR/tmux_calls.log"
     export NOTIFY_LOG="$TEST_TMPDIR/notify.log"
     export SHOGUN_NOTIFY_LOG="$TEST_TMPDIR/shogun_notify.log"
+    export PGREP_LOG="$TEST_TMPDIR/pgrep_calls.log"
     > "$MOCK_TMUX_LOG"
     > "$NOTIFY_LOG"
     > "$SHOGUN_NOTIFY_LOG"
+    > "$PGREP_LOG"
 
     # baton_watchdog_notify_shogun は "$ROOT/scripts/inbox_write.sh" を直接
     # 呼ぶため（ROOT=フィクスチャroot）、フィクスチャ内にモックを配置する。
@@ -91,6 +120,17 @@ branch_policy_notify() {
     echo "NOTIFY: \$1" >> "$NOTIFY_LOG"
     return 0
 }
+
+# pgrep のデフォルトモック: 実マシン上で本物の inbox_watcher.sh が稼働中でも
+# テスト結果がそれに引きずられないよう、常にこの関数で置き換える
+# （real pgrep バイナリは呼ばない）。既定では該当プロセス無し＝watcher死亡
+# とみなす（exit 1）。生存を模したいテストは呼び出し後にこの関数を
+# 上書きしてよい。
+pgrep() {
+    echo "MOCKPGREP \$*" >> "$PGREP_LOG"
+    return 1
+}
+export -f pgrep
 HARNESS
     chmod +x "$TEST_HARNESS"
 }
@@ -102,10 +142,14 @@ teardown() {
 # settings.yaml を書き直すヘルパー。
 # $1=enabled(true/false) $2=baton_lost_after_sec $3=poll_interval_sec
 # $4=baton_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定1800に委ねる）
+# $5=baton_d1_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定900に委ねる）
 write_settings() {
-    local ntfy_line=""
+    local ntfy_line="" d1_ntfy_line=""
     if [ -n "${4:-}" ]; then
         ntfy_line="  baton_ntfy_after_sec: $4"
+    fi
+    if [ -n "${5:-}" ]; then
+        d1_ntfy_line="  baton_d1_ntfy_after_sec: $5"
     fi
     cat > "$FIXTURE_ROOT/config/settings.yaml" << YAML
 baton_watchdog:
@@ -113,6 +157,7 @@ baton_watchdog:
   baton_lost_after_sec: $2
   poll_interval_sec: $3
 $ntfy_line
+$d1_ntfy_line
 YAML
 }
 
@@ -294,6 +339,7 @@ YAML
     [ ! -s "$NOTIFY_LOG" ]
 }
 
+
 # --- TC-NOTIFY-001: ntfy_topic 未設定でも将軍inboxへは無条件に通知される ---
 
 @test "TC-NOTIFY-001: shogun inbox is notified unconditionally when baton_lost_after_sec is reached, regardless of ntfy_topic" {
@@ -393,4 +439,258 @@ YAML
     "
     [ "$status" -eq 0 ]
     [[ "$output" == *"baton_condition=true"* ]]
+}
+
+# ═══════════════════════════════════════════════════════════════
+# D-1: 配送機構死亡検知（既存B-1〜B-3とは独立したOR条件。cmd_171/FU-1）
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-D1-001: 未読1件・timestampが600秒超過 → 通知される ---
+
+@test "TC-D1-001: delivery stall detected when an unread message's timestamp exceeds threshold" {
+    local stale_ts
+    # `-u` を付けぬこと。本番の書き手 scripts/inbox_write.sh:46 は
+    # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
+    # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    # M-2是正後: 主経路は将軍inbox通知（無条件・即座に発火）
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    grep -q "delivery_stall" "$SHOGUN_NOTIFY_LOG"
+}
+
+# --- TC-D1-002: 未読1件だがtimestampが600秒以内 → 通知されない ---
+
+@test "TC-D1-002: no delivery-stall notification when the unread message is fresh" {
+    local fresh_ts
+    fresh_ts=$(date -d "@$(( $(date +%s) - 100 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_fresh
+    read: false
+    timestamp: '${fresh_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$NOTIFY_LOG" ]
+}
+
+# --- TC-D1-003: 未読0件 → 通知されない ---
+
+@test "TC-D1-003: no delivery-stall notification when there are no unread messages" {
+    # デフォルトフィクスチャは既に read: true のみ
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$NOTIFY_LOG" ]
+}
+
+# --- TC-D1-005: D-1もtmuxに一切触れない ---
+
+@test "TC-D1-005: tmux is never called by check_d1_once even when a stall is detected" {
+    local stale_ts
+    # `-u` を付けぬこと。本番の書き手 scripts/inbox_write.sh:46 は
+    # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
+    # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    # 検知は確かに起きている（前提の健全性を確認。M-2是正後は将軍inbox経路）
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    # にもかかわらず tmux は一度も呼ばれていない
+    [ ! -s "$MOCK_TMUX_LOG" ]
+}
+
+# --- TC-D1-006: 同一の継続停止に対して二重通知しない ---
+
+@test "TC-D1-006: no duplicate notification for the same continued delivery stall" {
+    local stale_ts
+    # `-u` を付けぬこと。本番の書き手 scripts/inbox_write.sh:46 は
+    # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
+    # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+        check_d1_once
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG")" -eq 1 ]
+}
+
+# --- TC-D1-007: 【軍師QC §SC-5】watcherが生きていれば、未読が滞留していても通知しない ---
+
+@test "TC-D1-007: no notification when the message is stale but the agent's watcher is alive (busy, not dead)" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        # このテストに限り watcher が生きていることにする
+        # （長いturnを回している間の正常な滞留を模す）。
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$NOTIFY_LOG" ]
+    grep -q "inbox_watcher.sh karo " "$PGREP_LOG"
+}
+
+# --- TC-D1-008: 【回帰・QC-70】inbox_write.shが実際に書くnaive・ローカル時刻timestampの解釈 ---
+
+@test "TC-D1-008: naive local timestamp actually written by scripts/inbox_write.sh is correctly interpreted as local time" {
+    # inbox_write.sh は自身の BASH_SOURCE から SCRIPT_DIR（= queue/ の親）を
+    # 決めるため、fixture配下に実体をコピーして呼べば FIXTURE_ROOT/queue/inbox/
+    # に書かせられる。同スクリプトが使う .venv も併せて用意する（本番と同じ
+    # venv を再利用。フィクスチャ独自のvenvは持たない）。
+    # 注: この cp は setup() が置いたモック($FIXTURE_ROOT/scripts/inbox_write.sh)
+    # を実物で上書きする。これにより check_d1_once → baton_watchdog_notify_shogun
+    # の呼び出しも実物経由になり、$FIXTURE_ROOT/queue/inbox/shogun.yaml へ
+    # 実際に書き込まれる（このテストに限りSHOGUN_NOTIFY_LOGは使われない）。
+    mkdir -p "$FIXTURE_ROOT/scripts"
+    cp "$PROJECT_ROOT/scripts/inbox_write.sh" "$FIXTURE_ROOT/scripts/inbox_write.sh"
+    ln -s "$PROJECT_ROOT/.venv" "$FIXTURE_ROOT/.venv"
+
+    run bash "$FIXTURE_ROOT/scripts/inbox_write.sh" karo "regression message for QC-70" task_assigned ashigaru3
+    [ "$status" -eq 0 ]
+    [ -f "$FIXTURE_ROOT/queue/inbox/karo.yaml" ]
+    grep -q "read: false" "$FIXTURE_ROOT/queue/inbox/karo.yaml"
+
+    # 実際に書かれた timestamp の「書式」はそのまま（naive・ローカル時刻）に、
+    # 「値」だけを600秒前に差し替える。書式そのものを検証するのが本テストの主旨。
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    sed -i "s/timestamp: .*/timestamp: '${stale_ts}'/" "$FIXTURE_ROOT/queue/inbox/karo.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ -f "$FIXTURE_ROOT/queue/inbox/shogun.yaml" ]
+    grep -q "delivery_stall" "$FIXTURE_ROOT/queue/inbox/shogun.yaml"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 【M-2是正・軍師発見】check_d1_once の通知経路二重化（cmd_172）
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-NOTIFY-D1-001: D-1条件成立時、ntfy_topic未設定でも将軍inboxへ無条件に通知される ---
+
+@test "TC-NOTIFY-D1-001: shogun inbox is notified unconditionally when D-1 condition is met, regardless of ntfy_topic" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    grep -q "baton_alert" "$SHOGUN_NOTIFY_LOG"
+    grep -q "baton_watchdog" "$SHOGUN_NOTIFY_LOG"
+}
+
+# --- TC-NOTIFY-D1-002: ntfyはD-1専用のbaton_d1_ntfy_after_sec到達で初めて発火する ---
+
+@test "TC-NOTIFY-D1-002: ntfy fires only once the D-1-specific baton_d1_ntfy_after_sec threshold is reached" {
+    write_settings true 5 60 1800 8   # baton_d1_ntfy_after_sec=8s（D-1専用・短い閾値）
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    # 検知直後（BATON_D1_CONDITION_SINCE計測開始直後）: 主経路は即発火するが副経路はまだ
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    [ ! -s "$NOTIFY_LOG" ]
+
+    # BATON_D1_CONDITION_SINCEを直接過去化し、ntfy閾値(8s)到達後の状態を模す
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_D1_CONDITION_SINCE=\$(( \$(date +%s) - 10 ))
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "NOTIFY: delivery_stall" "$NOTIFY_LOG"
+}
+
+# --- TC-NOTIFY-D1-003: ntfy失敗はD-1の将軍inbox通知・処理継続に影響しない ---
+
+@test "TC-NOTIFY-D1-003: ntfy failure does not affect D-1 shogun inbox notification or check_d1_once exit status" {
+    write_settings true 5 60 1800 5   # baton_d1_ntfy_after_sec=5s
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        branch_policy_notify() { return 1; }  # ntfy_topic未設定時のexit 1相当を模擬
+        BATON_D1_CONDITION_SINCE=\$(( \$(date +%s) - 10 ))
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
 }
