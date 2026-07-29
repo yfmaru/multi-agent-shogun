@@ -453,7 +453,8 @@ YAML
     # 「値」だけを600秒前に差し替える。書式そのものを検証するのが本テストの主旨。
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
-    sed -i "s/timestamp: .*/timestamp: '${stale_ts}'/" "$FIXTURE_ROOT/queue/inbox/karo.yaml"
+    sed "s/timestamp: .*/timestamp: '${stale_ts}'/" "$FIXTURE_ROOT/queue/inbox/karo.yaml" > "$FIXTURE_ROOT/queue/inbox/karo.yaml.tmp" \
+      && mv "$FIXTURE_ROOT/queue/inbox/karo.yaml.tmp" "$FIXTURE_ROOT/queue/inbox/karo.yaml"
 
     run bash -c "
         source '$TEST_HARNESS'
