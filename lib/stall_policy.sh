@@ -106,10 +106,18 @@ settings_path, query = sys.argv[1], sys.argv[2]
 
 # Safe defaults (cmd_171 §2.2). enabled defaults to True: baton_watchdog is
 # notify-only (no key injection), so it carries no destructive side effect.
+#
+# periodic_clear_* (cmd_172/P7) is a distinct, opt-in feature layered on top
+# of the same watchdog process: unlike B-1/B-2/B-3 notification, it actually
+# triggers a /clear via clear_command, so it defaults to disabled even though
+# baton_watchdog itself defaults to enabled (lord's dual-safety-valve policy).
 DEFAULT_BATON_WATCHDOG = {
     "enabled": True,
     "baton_lost_after_sec": 900,
     "poll_interval_sec": 60,
+    "periodic_clear_enabled": False,
+    "periodic_clear_idle_sec": 1800,
+    "periodic_clear_agents": ["karo", "gunshi"],
 }
 
 try:
@@ -128,10 +136,15 @@ def policy_get(key):
         return DEFAULT_BATON_WATCHDOG[key]
     return value
 
-if query == "enabled":
-    print("true" if policy_get("enabled") is True else "false")
-elif query in ("baton_lost_after_sec", "poll_interval_sec"):
+if query in ("enabled", "periodic_clear_enabled"):
+    print("true" if policy_get(query) is True else "false")
+elif query in ("baton_lost_after_sec", "poll_interval_sec", "periodic_clear_idle_sec"):
     print(int(policy_get(query)))
+elif query == "periodic_clear_agents":
+    agents = policy_get(query)
+    if not isinstance(agents, list) or not agents:
+        agents = DEFAULT_BATON_WATCHDOG["periodic_clear_agents"]
+    print("\n".join(str(a) for a in agents))
 else:
     raise SystemExit(f"unknown baton_watchdog query: {query}")
 PY
