@@ -128,6 +128,108 @@ check_once() {
     fi
 }
 
+# ═══════════════════════════════════════════════════════════════
+# D-1: 配送機構死亡検知（既存B-1〜B-3とは独立したOR条件）(cmd_171/FU-1)
+#
+# PR #14（cmd_172）のQCで判明: B-1〜B-3は「配送機構（watcher群）自体が
+# 死ぬ」形の停止を検知できない。watcher群が死ねば nudge が届かず未読が
+# 溜まる一方であり、B-1（未読合計0）が常に偽になってしまうため。
+#
+# D-1はこれを補う独立したOR条件: read:false のまま
+# BATON_D1_STALE_AFTER_SEC 秒以上放置されたメッセージが queue/inbox/*.yaml
+# に1件でもあれば、「配送が停止している」とみなし即座に通知する。
+# メッセージ自身の timestamp が既に停止の継続時間を表しているため、
+# B-1〜B-3のような別途の継続時間計測（BATON_LOST_SINCE相当）は不要である。
+#
+# 既存の check_once()（B-1〜B-3判定）の内部は一切変更しない。
+# ═══════════════════════════════════════════════════════════════
+BATON_D1_STALE_AFTER_SEC=600   # 10分。既存baton_lost_after_secとは独立した固定値
+BATON_D1_NOTIFIED=0            # 同一の継続停止に対して二重通知しないためのガード
+
+# queue/inbox/*.yaml の全メッセージのうち、read: false かつ timestamp が
+# BATON_D1_STALE_AFTER_SEC 秒以上前のものの件数を返す。
+# 読むのは queue/inbox/*.yaml のみ。tmux には一切触れない（TC-D1-005）。
+baton_watchdog_count_stale_unread() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT" "$BATON_D1_STALE_AFTER_SEC" <<'PY'
+import glob
+import os
+import sys
+from datetime import datetime, timezone
+
+root, threshold = sys.argv[1], int(sys.argv[2])
+
+try:
+    import yaml
+except Exception:
+    print(0)
+    raise SystemExit(0)
+
+
+def parse_ts(value):
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+now = datetime.now(timezone.utc)
+stale = 0
+for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        continue
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("read") is not False:
+            continue
+        dt = parse_ts(msg.get("timestamp"))
+        if dt is None:
+            continue
+        if (now - dt).total_seconds() >= threshold:
+            stale += 1
+print(stale)
+PY
+}
+
+# D-1を1回だけ判定する。check_once()（B-1〜B-3）とは完全に独立した関数であり、
+# check_once() を呼ばない・その内部にも触れない。
+check_d1_once() {
+    local stale
+
+    if [ "$(baton_watchdog_query enabled)" != "true" ]; then
+        return 0
+    fi
+
+    stale=$(baton_watchdog_count_stale_unread)
+
+    if [ "${stale:-0}" -gt 0 ]; then
+        if [ "$BATON_D1_NOTIFIED" -eq 0 ]; then
+            branch_policy_notify "delivery_stall: stale_unread=${stale} (${BATON_D1_STALE_AFTER_SEC}s+未読放置。配送機構=watcher群の停止疑い)"
+            BATON_D1_NOTIFIED=1
+        fi
+    else
+        BATON_D1_NOTIFIED=0
+    fi
+}
+
 if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     mkdir -p "$ROOT/logs"
 
@@ -138,11 +240,13 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
 
     if [ "${1:-}" = "--once" ]; then
         check_once
+        check_d1_once
         exit 0
     fi
 
     while true; do
         check_once
+        check_d1_once
         sleep "$(baton_watchdog_query poll_interval_sec)"
     done
 fi

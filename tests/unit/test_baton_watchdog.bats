@@ -16,6 +16,14 @@
 #   TC-BATON-006: 検知しても tmux を一切呼ばない
 #   TC-BATON-007: baton_watchdog.enabled=false なら即座に何もしない
 #   TC-BATON-008: shogun_to_karo.yaml が壊れている/無い場合も落ちない（open_cmds=0扱い）
+#
+# D-1（cmd_171/FU-1。既存B-1〜B-3とは独立したOR条件。配送機構死亡検知）:
+#   TC-D1-001: 未読1件・timestampが600秒超過 → 通知される
+#   TC-D1-002: 未読1件だがtimestampが600秒以内 → 通知されない
+#   TC-D1-003: 未読0件 → 通知されない
+#   TC-D1-005: D-1もtmuxに一切触れない
+#   TC-D1-006: 同一の継続停止に対して二重通知しない
+#   （TC-D1-004＝既存TC-BATON-001〜008の回帰は本ファイル全体の実行で担保）
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHDOG_SCRIPT="$PROJECT_ROOT/scripts/baton_watchdog.sh"
@@ -263,4 +271,104 @@ YAML
     "
     [ "$status" -eq 0 ]
     [ ! -s "$NOTIFY_LOG" ]
+}
+
+# ═══════════════════════════════════════════════════════════════
+# D-1: 配送機構死亡検知（既存B-1〜B-3とは独立したOR条件。cmd_171/FU-1）
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-D1-001: 未読1件・timestampが600秒超過 → 通知される ---
+
+@test "TC-D1-001: delivery stall detected when an unread message's timestamp exceeds threshold" {
+    local stale_ts
+    stale_ts=$(date -u -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "NOTIFY: delivery_stall" "$NOTIFY_LOG"
+}
+
+# --- TC-D1-002: 未読1件だがtimestampが600秒以内 → 通知されない ---
+
+@test "TC-D1-002: no delivery-stall notification when the unread message is fresh" {
+    local fresh_ts
+    fresh_ts=$(date -u -d "@$(( $(date +%s) - 100 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_fresh
+    read: false
+    timestamp: '${fresh_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$NOTIFY_LOG" ]
+}
+
+# --- TC-D1-003: 未読0件 → 通知されない ---
+
+@test "TC-D1-003: no delivery-stall notification when there are no unread messages" {
+    # デフォルトフィクスチャは既に read: true のみ
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$NOTIFY_LOG" ]
+}
+
+# --- TC-D1-005: D-1もtmuxに一切触れない ---
+
+@test "TC-D1-005: tmux is never called by check_d1_once even when a stall is detected" {
+    local stale_ts
+    stale_ts=$(date -u -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "NOTIFY: delivery_stall" "$NOTIFY_LOG"
+    [ ! -s "$MOCK_TMUX_LOG" ]
+}
+
+# --- TC-D1-006: 同一の継続停止に対して二重通知しない ---
+
+@test "TC-D1-006: no duplicate notification for the same continued delivery stall" {
+    local stale_ts
+    stale_ts=$(date -u -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+        check_d1_once
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "NOTIFY: delivery_stall" "$NOTIFY_LOG")" -eq 1 ]
 }
