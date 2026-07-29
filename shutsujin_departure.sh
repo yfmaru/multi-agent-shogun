@@ -938,6 +938,25 @@ NINJA_EOF
 
     log_success "  └─ $((_ASHIGARU_COUNT + 3))エージェント分のinbox_watcher起動完了（将軍+家老+足軽${_ASHIGARU_COUNT}+軍師）"
 
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 6.6.5: watcher_supervisor起動（cmd_172: 配線漏れ是正）
+    # ═══════════════════════════════════════════════════════════════════
+    # baton_watchdog.sh（cmd_171/T3, 類型Bバトン喪失検知）はwatcher_supervisor.sh
+    # 経由でのみ起動される単一インスタンスの大域watcherである。個別の
+    # inbox_watcher起動（STEP 6.6, 上記）とは独立しており、削除・変更しない。
+    # supervisor自体がpgrepで重複起動を防止する常駐ループ（scripts/watcher_supervisor.sh
+    # :34-52 の start_watcher_if_missing と同様の機構）ゆえ、ここでの二重起動防止は
+    # supervisorプロセス自体の有無のみ確認すればよい。
+    log_info "🛡️  watcher_supervisor起動中..."
+    if pgrep -f "scripts/watcher_supervisor.sh" >/dev/null 2>&1; then
+        log_info "  └─ watcher_supervisorは既に稼働中のためスキップ"
+    else
+        nohup bash "$SCRIPT_DIR/scripts/watcher_supervisor.sh" \
+            >> "$SCRIPT_DIR/logs/watcher_supervisor.log" 2>&1 &
+        disown
+        log_success "  └─ watcher_supervisor起動完了（baton_watchdog等の大域watcherを統括）"
+    fi
+
     # STEP 6.7 は廃止 — CLAUDE.md Session Start (step 1: tmux agent_id) で各自が自律的に
     # 自分のinstructions/*.mdを読み込む。検証済み (2026-02-08)。
     log_info "📜 指示書読み込みは各エージェントが自律実行（CLAUDE.md Session Start）"
