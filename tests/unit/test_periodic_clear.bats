@@ -11,9 +11,9 @@
 # This file is intentionally separate from test_baton_watchdog.bats: it tests
 # a distinct, independently-toggled feature (periodic_clear_*) that must be
 # provably non-interfering with the existing B-1/B-2/B-3 judgment. Keeping it
-# in its own file makes that separation legible; TC-PCLEAR-005 below plus a
-# full `bats tests/unit/test_baton_watchdog.bats` regression run are the
-# actual proof (see task report).
+# in its own file makes that separation legible; non-interference itself is
+# proven by a full `bats tests/unit/test_baton_watchdog.bats` regression run
+# (TC-BATON-001〜008 all PASS — see task report), not by a test case here.
 #
 # テスト構成:
 #   TC-PCLEAR-001: idle条件が periodic_clear_idle_sec を超えて継続 → karo/軍師
@@ -22,6 +22,9 @@
 #   TC-PCLEAR-003: 一度送信したら同一idle windowで再送されない。
 #                  busy→idleを経れば再送される
 #   TC-PCLEAR-004: periodic_clear_enabled=false（既定）なら一切呼ばれない
+#   TC-PCLEAR-005（cmd_172/P7 追記・軍師提案）: shogunは
+#                  periodic_clear_agentsに誤って含まれても常に対象外
+#                  （*) return 1 のデフォルト防御を固定）
 #   TC-PCLEAR-006: tmux は一切呼ばれない
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
@@ -292,6 +295,44 @@ YAML
     [ "$status" -eq 0 ]
     [ ! -s "$INBOX_WRITE_LOG" ]
     [ ! -s "$MOCK_TMUX_LOG" ]
+}
+
+# --- TC-PCLEAR-005: shogunは誤設定でも常に対象外（*) return 1 のデフォルト防御） ---
+#
+# shogunの会話paneは本システムで絶対に/clearしてはならぬ対象（人間である
+# 主自身の文脈）。periodic_clear_agents は既定で ["karo", "gunshi"] のみを
+# 含み shogun は含まれないが、設定ミスで紛れ込んだ場合の多層防御として
+# periodic_clear_agent_idle() 自体が shogun を常に false（=手隙でない）
+# 扱いすることを固定する。
+
+@test "TC-PCLEAR-005: shogun is never targeted even if misconfigured into periodic_clear_agents" {
+    write_settings true 5 "karo gunshi shogun"
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_1
+    read: true
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+
+        # 直接呼び出し: 未読0など他条件を全て満たしていても shogun は常に false
+        if periodic_clear_agent_idle shogun; then
+            echo 'FAIL: periodic_clear_agent_idle shogun returned true'
+            exit 1
+        fi
+
+        # check_once 経由でも、閾値超過を人工的に用意して呼んでも
+        # shogun へは一切送信されないことを確認する
+        PERIODIC_CLEAR_IDLE_SINCE[shogun]=\$(( \$(date +%s) - 10 ))
+        PERIODIC_CLEAR_IDLE_SINCE[karo]=\$(( \$(date +%s) - 10 ))
+        periodic_clear_check_once
+    "
+    [ "$status" -eq 0 ]
+    # sanity: karo には送られている（判定ロジック自体は機能している前提の確認）
+    grep -q "inbox_write karo .* clear_command baton_watchdog" "$INBOX_WRITE_LOG"
+    # 本題: shogun には一度も送られていない
+    ! grep -q "inbox_write shogun" "$INBOX_WRITE_LOG"
 }
 
 # --- TC-PCLEAR-006: 【重要】検知しても tmux を一切呼ばない ---
