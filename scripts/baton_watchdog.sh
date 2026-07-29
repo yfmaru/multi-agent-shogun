@@ -20,6 +20,17 @@
 # 読むのは queue/ 配下のファイルのみ。dashboard.md（二次データ）は見ない。
 # tmux には一切触れない（テストで固定：TC-BATON-006）。
 #
+# 【通知経路（cmd_172・二重化）】
+# 主経路: 将軍inbox（baton_watchdog_notify_shogun）。baton_lost_after_sec
+#   （既定900秒）継続で無条件に発火する。ntfy_topic の設定有無に一切
+#   依存しない（2026-07-29の事故 — ntfy_topic未設定によりntfy.shがexit 1
+#   し、通知が誰にも届かなかった件の是正）。
+# 副経路: ntfy（主のスマホ・branch_policy_notify）。より長い
+#   baton_ntfy_after_sec（既定1800秒）継続で初めて試みる。失敗許容
+#   （失敗してもログに残すのみ・将軍inbox通知には無関係）。
+# 両経路は独立したガード変数・独立した閾値を持ち、一方が死んでも他方は
+# 生きる。
+#
 # 【periodic /clear (cmd_172/P7) — 同プロセスへの並存拡張】
 # 上記B-1/B-2/B-3判定（check_once）とは完全に独立した別機能を同居させる。
 # karo/軍師それぞれが「手隙」を periodic_clear_idle_sec 以上継続した場合に
@@ -43,8 +54,9 @@ source "$SCRIPT_DIR/lib/stall_policy.sh"
 source "$SCRIPT_DIR/lib/branch_policy.sh"
 
 # ─── プロセスローカル状態 ───
-BATON_LOST_SINCE=0   # 3条件が揃い始めた epoch（揃っていなければ0）
-BATON_NOTIFIED=0     # 同一の継続停止に対して二重通知しないためのガード
+BATON_LOST_SINCE=0     # 3条件が揃い始めた epoch（揃っていなければ0）
+BATON_NOTIFIED=0       # 将軍inbox通知を同一継続停止で二重送信しないためのガード
+BATON_NTFY_NOTIFIED=0  # ntfy通知（cmd_172/急報）を同一継続停止で二重送信しないためのガード
 
 # ─── periodic /clear (cmd_172/P7) プロセスローカル状態 ───
 # エージェントごとに独立（B-1/B-2/B-3の全体判定とは完全に並存する別機能）。
@@ -241,9 +253,17 @@ periodic_clear_check_once() {
     done <<< "$agents_raw"
 }
 
+# 将軍inboxへの通知（主経路）。ntfy_topic の設定有無・ntfy 到達可否には
+# 一切依存しない。ファイル書き込みのみ・tmux不使用（既存の不変条件のまま）。
+baton_watchdog_notify_shogun() {
+    local message="$1"
+    bash "$ROOT/scripts/inbox_write.sh" shogun "$message" baton_alert baton_watchdog
+}
+
 # 1回だけ判定する。メインループ・--once どちらからも呼ばれる。
 check_once() {
-    local now unread active open_cmds threshold
+    local now unread active open_cmds condition
+    local shogun_threshold ntfy_threshold elapsed
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -255,21 +275,41 @@ check_once() {
     open_cmds=$(baton_watchdog_count_open_cmds)
 
     if [ "${unread:-0}" -eq 0 ] && [ "${active:-0}" -eq 0 ] && [ "${open_cmds:-0}" -gt 0 ]; then
+        condition=true
+
         if [ "$BATON_LOST_SINCE" -eq 0 ]; then
             BATON_LOST_SINCE=$now
         fi
+        elapsed=$((now - BATON_LOST_SINCE))
 
-        threshold=$(baton_watchdog_query baton_lost_after_sec)
-        if [ $((now - BATON_LOST_SINCE)) -ge "$threshold" ] && [ "$BATON_NOTIFIED" -eq 0 ]; then
-            branch_policy_notify "baton_lost: unread=0 active=0 open_cmds=${open_cmds} (${threshold}s+継続)"
+        # 主経路: 将軍inbox通知。900秒(既定)継続で無条件に発火する。
+        # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
+        shogun_threshold=$(baton_watchdog_query baton_lost_after_sec)
+        if [ "$elapsed" -ge "$shogun_threshold" ] && [ "$BATON_NOTIFIED" -eq 0 ]; then
+            baton_watchdog_notify_shogun "baton_lost: unread=0 active=0 open_cmds=${open_cmds} (${shogun_threshold}s+継続)"
             BATON_NOTIFIED=1
         fi
+
+        # 副経路: ntfy（主のスマホ）。長引いた場合のみ・独立した閾値
+        # (既定1800秒)。失敗許容 — 失敗してもログに残すのみで将軍inbox
+        # 通知には一切影響させない。
+        ntfy_threshold=$(baton_watchdog_query baton_ntfy_after_sec)
+        if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "$BATON_NTFY_NOTIFIED" -eq 0 ]; then
+            if ! branch_policy_notify "baton_lost: unread=0 active=0 open_cmds=${open_cmds} (${ntfy_threshold}s+継続・ntfy)"; then
+                echo "[$(date)] [baton_watchdog] ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+            fi
+            BATON_NTFY_NOTIFIED=1
+        fi
     else
-        # 条件が崩れた＝バトンは持たれている。状態をリセットし、
-        # 次に条件が揃った際は新たな継続として計測し直す。
+        condition=false
+        # 条件が崩れた＝バトンは持たれている。両トラッカーをリセットし、
+        # 次に条件が揃った際は新たな継続として独立して計測し直す。
         BATON_LOST_SINCE=0
         BATON_NOTIFIED=0
+        BATON_NTFY_NOTIFIED=0
     fi
+
+    echo "[$(date)] [baton_watchdog/check_once] unread=${unread} active=${active} open_cmds=${open_cmds} baton_condition=${condition}"
 }
 
 if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
