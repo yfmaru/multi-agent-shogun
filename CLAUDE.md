@@ -464,6 +464,35 @@ b=$(git diff --cached --ignore-cr-at-eol --numstat | wc -l)
 | `git clean -f` | `git clean -n` (dry run) first |
 | Bulk file write (>30 files) | Split into batches of 30 |
 
+## pgrep Self-Match Pitfall in Wait Loops (Bash tool environment)
+
+**罠**: このBashツール環境では、プロセスの起動コマンド全文がそのままcmdlineに
+埋め込まれるため、`pgrep -f "<pattern>"`の`<pattern>`文字列が実行中の
+`pgrep`自身の呼び出しコマンド行にliteralに含まれていると、`pgrep`は
+**自分自身に誤マッチ**する。対象プロセス（例: `bats-exec-suite`）が
+既に終了していても、以下のような待機ループは「まだ居る」と答え続け、
+**永遠にループを抜けない**：
+
+```bash
+# 罠の例：patternが自分自身のコマンド行にも一致してしまう
+while pgrep -f "bats-exec-suite.*test_baton_watchdog.bats" >/dev/null 2>&1; do
+  sleep 5
+done
+```
+
+**対処法**:
+- 待機ループでプロセス生存確認に`pgrep -f`を使う場合、パターン文字列の
+  一部を`test_baton_watch[d]og`のように角括弧で分割し、`pgrep`自身の
+  コマンド行との文字列一致を回避する
+- または`pgrep`を使わず、対象プロセス起動時にPIDを取得しておき、
+  `kill -0 $PID`（プロセスの生死のみ確認、シグナル送信はしない）で
+  終了判定する
+
+**実例**: 2026-07-29のPR #14（cmd_172起動配線修正）で足軽3号が本罠を
+一度発見・解決していたが、教訓が本条文として明文化されていなかった
+ため、2026-07-30未明に同じ足軽が別の待機ループで再び踏み、**全軍が
+約8時間45分停止した**（2026-07-29 22:51〜2026-07-30 07:38頃）。
+
 ## WSL2-Specific Protections
 
 - **NEVER delete or recursively modify** paths under `/mnt/c/` or `/mnt/d/` except within the project working tree.
