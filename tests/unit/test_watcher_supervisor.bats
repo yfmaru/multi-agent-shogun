@@ -37,6 +37,12 @@ MOCK
 teardown() {
     rm -rf "$TEST_TMP"
     rm -f /tmp/shogun_watcher_start_ashigaru1_*_${$}_dedup*.lock
+    rm -f /tmp/shogun_watcher_start_cmd176fake.lock
+    # T-WS-005's decoy self-terminates via `sleep 5`; no kill needed (D006).
+    # Just reap it if it's still around to avoid a zombie.
+    if [ -n "${decoy_pid:-}" ]; then
+        wait "$decoy_pid" 2>/dev/null || true
+    fi
 }
 
 # Source the function under test with mocked dependencies injected via env overrides.
@@ -191,6 +197,57 @@ source_supervisor_functions() {
     # A launched entry should exist in the log
     [ -f "$launched_log" ]
     grep -q "launched:" "$launched_log"
+}
+
+# ---------------------------------------------------------------------------
+# T-WS-005 (cmd_176): real (unmocked) pgrep correctly detects an already-
+# running watcher without falling through to the stale-WARN branch.
+#
+# T-WS-001..004 and TC-DEDUP-001..003 above all mock `pgrep` with a shell
+# function, so none of them ever invoke the real pgrep binary — which is
+# exactly why they stayed green through the cmd_176 regression: this host's
+# procps-ng pgrep does not support `-E` and exits 2 on it, so the line-48
+# exact-match check always failed and fell through to the stale-WARN branch
+# at line 52 even when the correct-pane watcher was already running. Only a
+# test that calls the real pgrep binary can catch that class of bug.
+#
+# The "already-running watcher" is simulated with a self-terminating decoy
+# process rather than the real scripts/inbox_watcher.sh (which runs forever
+# and cannot be self-cleaned without kill/pkill, forbidden by D006). The
+# decoy uses `exec -a "<name>" sleep 5` so its /proc/PID/cmdline becomes
+# exactly "<name> 5" via execve (no leftover shell wrapper text, and no
+# bash tail-call surprises since sleep is the final and only exec'd image),
+# giving pgrep -f a literal, stable match for the full 5s lifetime. It
+# exits on its own; teardown() only `wait`s on it, never kills it.
+# ---------------------------------------------------------------------------
+@test "T-WS-005: real pgrep detects an already-running watcher via exact agent+pane match" {
+    local agent="cmd176fake"
+    local pane="faketest:0.0"
+    local warn_log="$TEST_TMP/stderr_ws005.log"
+    local launched_log="$TEST_TMP/watcher_launched_ws005.log"
+
+    bash -c "exec -a \"scripts/inbox_watcher.sh ${agent} ${pane}\" sleep 5" &
+    decoy_pid=$!
+    # Give exec -a a brief moment to land before pgrep looks for it.
+    sleep 0.3
+
+    (
+        pane_exists() { return 0; }
+        nohup() { echo "launched: $*" >> "$launched_log"; }
+
+        eval "$(
+            awk '/^(start_watcher_if_missing|ensure_inbox_file)\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        cd "$TEST_TMP"
+        start_watcher_if_missing "$agent" "$pane" "/tmp/test_ws_005.log" 2>"$warn_log"
+        result=$?
+
+        [ "$result" -eq 0 ]
+        [ ! -f "$launched_log" ]
+        [ ! -s "$warn_log" ]
+    )
 }
 
 # ---------------------------------------------------------------------------
