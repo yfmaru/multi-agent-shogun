@@ -114,6 +114,8 @@ settings_path, query = sys.argv[1], sys.argv[2]
 DEFAULT_BATON_WATCHDOG = {
     "enabled": True,
     "baton_lost_after_sec": 900,
+    "baton_ntfy_after_sec": 1800,
+    "baton_d1_ntfy_after_sec": 900,
     "poll_interval_sec": 60,
     "periodic_clear_enabled": False,
     "periodic_clear_idle_sec": 1800,
@@ -138,7 +140,7 @@ def policy_get(key):
 
 if query in ("enabled", "periodic_clear_enabled"):
     print("true" if policy_get(query) is True else "false")
-elif query in ("baton_lost_after_sec", "poll_interval_sec", "periodic_clear_idle_sec"):
+elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "poll_interval_sec", "periodic_clear_idle_sec"):
     print(int(policy_get(query)))
 elif query == "periodic_clear_agents":
     agents = policy_get(query)
