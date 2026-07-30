@@ -464,6 +464,66 @@ b=$(git diff --cached --ignore-cr-at-eol --numstat | wc -l)
 | `git clean -f` | `git clean -n` (dry run) first |
 | Bulk file write (>30 files) | Split into batches of 30 |
 
+## pgrep Self-Match Pitfall in Wait Loops (Bash tool environment)
+
+**罠**: このBashツール環境では、コマンド全文が
+`/bin/bash -c … eval '<コマンド全文>'`というラッパプロセスのcmdlineに
+そのまま抱え込まれる。`pgrep`は自PIDを結果から除外するため、**pgrep自身
+に誤マッチすることはない**——誤マッチするのは、この**ラッパプロセス**
+である。`pgrep -f "<pattern>"`の`<pattern>`文字列が、実行中の`pgrep`呼び
+出しを含む同一コマンド行のどこかにliteralに含まれていると、その文字列が
+ラッパのcmdlineに載り続けるため、対象プロセス（例: `bats-exec-suite`）が
+既に終了していても、以下のような待機ループは「まだ居る」と答え続け、
+**永遠にループを抜けない**：
+
+```bash
+# 罠の例：patternが同一コマンド行（ラッパのcmdline）にも一致してしまう
+while pgrep -f "bats-exec-suite.*test_baton_watchdog.bats" >/dev/null 2>&1; do
+  sleep 5
+done
+```
+
+**対処法**:
+- 第一選択: `pgrep`を使わず、対象プロセス起動時にPIDを取得しておき、
+  `kill -0 $PID`（プロセスの生死のみ確認、シグナル送信はしない）で
+  終了判定する
+- 代替案: 待機ループでプロセス生存確認に`pgrep -f`を使う場合、パターン
+  文字列の一部を`test_baton_watch[d]og`のように角括弧で分割し、`pgrep`
+  自身のコマンド行との文字列一致を回避する。**ただしこれが効くのは、
+  同一のツール呼び出しのコマンド行全体に、素のパターン文字列がどこにも
+  現れない場合に限る**。同じ呼び出し内の別コマンド・echo・コメントに
+  素の文字列を書くと、ラッパのcmdline経由で再び一致してしまい、対処が
+  無効化される（例: `echo "waiting for test_baton_watchdog.bats"; while
+  pgrep -f "test_baton_watch[d]og"; do …`は、対処したつもりで元の罠に
+  戻る典型例である）
+
+**実例**: 2026-07-29のPR #14（cmd_172起動配線修正）で足軽3号が本罠を
+一度発見・解決していたが、教訓が本条文として明文化されていなかった
+ため、2026-07-30未明に同じ足軽が別の待機ループで再び踏み、**全軍が
+約8時間45分停止した**（2026-07-29 22:51〜2026-07-30 07:38頃）。
+
+**`pkill`も同じ罠を踏む**: 誤マッチの対象は`pgrep`単体だけではない。
+`pkill -f "<pattern>"`も、`<pattern>`文字列が実行中の`pkill`呼び出し
+自身のコマンドライン（ラッパのcmdline）にliteralに含まれていると、
+そのラッパプロセス＝**実行中の自分自身のシェル**に誤マッチし、
+シェルごと終了させてしまう。`pgrep`は自PIDを結果から除外するが、
+`pkill`にそのような自己除外は無く、しかもマッチしたプロセスへ実際に
+シグナルを送信するため、影響は「誤検知」で済まず「自滅」に至る。
+
+**実例**: 2026-07-30未明のinbox_watcher二重起動インシデント収拾時、
+主ご自身が`pkill -f "inbox_watcher.sh"; kill <複数PID>`を実行した際、
+`pkill`が自身の呼び出しコマンドライン（ラッパのcmdline）に含まれる
+`inbox_watcher.sh`という文字列に誤マッチし、実行中のシェルごと
+終了してしまった。結果、セミコロンで繋いだ後続の`kill`コマンドは
+実行されなかった。これで本罠の実例は4件目となる。
+
+**対処**: `pkill`を一括停止の用途で使う場合（`kill -0`によるPID直接
+確認は個別プロセスの生死判定にしか使えず、一括停止の代替にはならない
+ため）、パターン文字列を`pkill -f "inbox_watch[e]r.sh"`のように角括弧
+分割し、`pkill`自身の呼び出しコマンドラインとの文字列一致を回避せよ。
+上記「対処法」の代替案と同じ制約（同一コマンド行の他所に素の文字列を
+書くと無効化される）が適用される。
+
 ## WSL2-Specific Protections
 
 - **NEVER delete or recursively modify** paths under `/mnt/c/` or `/mnt/d/` except within the project working tree.

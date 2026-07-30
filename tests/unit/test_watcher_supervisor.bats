@@ -36,6 +36,7 @@ MOCK
 
 teardown() {
     rm -rf "$TEST_TMP"
+    rm -f /tmp/shogun_watcher_start_ashigaru1_*_${$}_dedup*.lock
 }
 
 # Source the function under test with mocked dependencies injected via env overrides.
@@ -166,6 +167,10 @@ source_supervisor_functions() {
             echo "codex"
         }
 
+        # macOS runners lack flock; stub it so the lock guard doesn't
+        # short-circuit the test via the function's early `return 0`.
+        flock() { return 0; }
+
         # Override nohup + bash to capture the launch without actually spawning
         nohup() {
             echo "launched: $*" >> "$launched_log"
@@ -184,6 +189,123 @@ source_supervisor_functions() {
     )
 
     # A launched entry should exist in the log
+    [ -f "$launched_log" ]
+    grep -q "launched:" "$launched_log"
+}
+
+# ---------------------------------------------------------------------------
+# TC-DEDUP-001 (most important): agent matches but pane does not → no new
+# watcher is started, only the existing WARN log is emitted (cmd_171 postmortem:
+# previously this fell through to an unconditional nohup, causing duplicates).
+# ---------------------------------------------------------------------------
+@test "TC-DEDUP-001: agent match + pane mismatch does not start duplicate watcher" {
+    local launched_log="$TEST_TMP/watcher_launched.log"
+    local warn_log="$TEST_TMP/stderr.log"
+    # Unique per-test agent name: avoids /tmp/shogun_watcher_start_<agent>.lock
+    # colliding with the real, live watcher_supervisor.sh daemon on this host
+    # (same isolation approach as T-WS-004).
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_dedup001"
+
+    (
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane pgrep call (contains literal "( |$)") → not found (1)
+        # agent-only/stale pgrep call (no "( |$)") → found (0)
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        nohup_called=0
+        nohup() { nohup_called=1; echo "$@" >> "$launched_log"; }
+
+        # macOS runners lack flock; stub it so the lock guard doesn't
+        # short-circuit the test via the function's early `return 0`.
+        flock() { return 0; }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_dedup_001.log" 2>"$warn_log"
+        result=$?
+
+        [ "$result" -eq 0 ]
+        [ ! -f "$launched_log" ]
+        grep -q "stale watcher detected" "$warn_log"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# TC-DEDUP-002 (regression): agent + pane exact match → nothing started
+# (existing early return path, unchanged by the fix).
+# ---------------------------------------------------------------------------
+@test "TC-DEDUP-002: exact agent+pane match still starts nothing" {
+    local launched_log="$TEST_TMP/watcher_launched.log"
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_dedup002"
+
+    (
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane pgrep call → found (0): exact match already running
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 0 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        nohup() { echo "$@" >> "$launched_log"; }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_dedup_002.log"
+        result=$?
+
+        [ "$result" -eq 0 ]
+        [ ! -f "$launched_log" ]
+    )
+}
+
+# ---------------------------------------------------------------------------
+# TC-DEDUP-003 (regression): no existing watcher at all (neither exact nor
+# stale pgrep match) → a new watcher is started.
+# ---------------------------------------------------------------------------
+@test "TC-DEDUP-003: no existing watcher causes new watcher to be started" {
+    local launched_log="$TEST_TMP/watcher_launched.log"
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_dedup003"
+
+    (
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # Neither correct-pane nor stale pgrep call finds anything.
+        pgrep() { return 1; }
+
+        tmux() { echo "codex"; }
+
+        # macOS runners lack flock; stub it so the lock guard doesn't
+        # short-circuit the test via the function's early `return 0`.
+        flock() { return 0; }
+
+        nohup() { echo "launched: $*" >> "$launched_log"; }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_dedup_003.log"
+    )
+
     [ -f "$launched_log" ]
     grep -q "launched:" "$launched_log"
 }
