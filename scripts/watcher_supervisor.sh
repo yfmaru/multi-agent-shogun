@@ -50,7 +50,8 @@ start_watcher_if_missing() {
         fi
 
         if pgrep -f "scripts/inbox_watcher.sh ${agent} " >/dev/null 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] stale watcher detected for ${agent}; starting watcher for expected pane ${pane}" >&2
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] stale watcher detected for ${agent} (pane mismatch with expected ${pane}); not starting a new one to avoid duplicates. Resolve pane mismatch manually." >&2
+            return 0
         fi
 
         cli=$(tmux show-options -p -t "$pane" -v @agent_cli 2>/dev/null || echo "codex")
