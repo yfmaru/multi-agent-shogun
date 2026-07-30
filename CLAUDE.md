@@ -239,11 +239,20 @@ dashboard や報告に「〜待ち」と書く場合は、上記の実測値を�
 間隔・回数は待機対象に応じて調整してよいが、合計が30分を超えぬこと）:
 
 ```bash
+deadline_reached=true
 for _ in $(seq 1 90); do
   # ここで待機対象を1回確認する処理を書く（例: gh pr checks 16）
-  # 条件が満たされたら break
+  # 条件が満たされたら以下を実行してループを抜ける:
+  #   deadline_reached=false
+  #   break
   sleep 20
 done
+
+if [ "$deadline_reached" = true ]; then
+  echo "WAIT-ABORT: <何を待っていたか>が30分経っても成立せず。待機を打ち切る。"
+  # ここで報告YAMLに「何を待ち、なぜ打ち切ったか」を明記し、
+  # バトンを渡してから停止すること（黙って先に進むな）
+fi
 ```
 
 **構造的な抜け道への注意**: 前景Bashは600秒で有界、Monitorは
