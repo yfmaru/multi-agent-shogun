@@ -167,6 +167,10 @@ source_supervisor_functions() {
             echo "codex"
         }
 
+        # macOS runners lack flock; stub it so the lock guard doesn't
+        # short-circuit the test via the function's early `return 0`.
+        flock() { return 0; }
+
         # Override nohup + bash to capture the launch without actually spawning
         nohup() {
             echo "launched: $*" >> "$launched_log"
@@ -217,6 +221,10 @@ source_supervisor_functions() {
 
         nohup_called=0
         nohup() { nohup_called=1; echo "$@" >> "$launched_log"; }
+
+        # macOS runners lack flock; stub it so the lock guard doesn't
+        # short-circuit the test via the function's early `return 0`.
+        flock() { return 0; }
 
         eval "$(
             awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
@@ -283,6 +291,10 @@ source_supervisor_functions() {
         pgrep() { return 1; }
 
         tmux() { echo "codex"; }
+
+        # macOS runners lack flock; stub it so the lock guard doesn't
+        # short-circuit the test via the function's early `return 0`.
+        flock() { return 0; }
 
         nohup() { echo "launched: $*" >> "$launched_log"; }
 
