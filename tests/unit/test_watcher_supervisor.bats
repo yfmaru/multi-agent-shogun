@@ -235,6 +235,10 @@ source_supervisor_functions() {
         pane_exists() { return 0; }
         nohup() { echo "launched: $*" >> "$launched_log"; }
 
+        # macOS runners lack flock; stub it so the lock guard doesn't
+        # short-circuit the test via the function's early `return 0`.
+        flock() { return 0; }
+
         eval "$(
             awk '/^(start_watcher_if_missing|ensure_inbox_file)\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
                 "$SUPERVISOR_SCRIPT"
