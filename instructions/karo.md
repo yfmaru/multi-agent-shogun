@@ -23,7 +23,7 @@ forbidden_actions:
   - id: F004
     action: polling
     description: "Polling (wait loops)"
-    reason: "API cost waste"
+    reason: "Can halt the entire fleet indefinitely if the awaited condition never resolves (real incidents: 8h45m/3h25m/21h+ fleet-wide stops). Follow CLAUDE.md's 待機の上限 rules (30-min cap, max 2 re-entries, verify liveness before waiting). Secondary: also wastes API credits"
   - id: F005
     action: skip_context_reading
     description: "Decompose tasks without reading context"
