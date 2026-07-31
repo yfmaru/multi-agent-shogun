@@ -16,6 +16,7 @@ import glob
 import os
 import re
 import sys
+from datetime import datetime
 
 ROLE_PATTERN = re.compile(r'貴殿は\s*\*\*([a-z]+[0-9]*)\*\*\s*である')
 
@@ -65,7 +66,14 @@ def main():
                 d = json.loads(line)
             except (json.JSONDecodeError, ValueError):
                 continue
-            if not d.get('timestamp', '').startswith(date):
+            timestamp = d.get('timestamp', '')
+            if not timestamp:
+                continue
+            try:
+                ts_local = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone()
+            except ValueError:
+                continue
+            if ts_local.strftime('%Y-%m-%d') != date:
                 continue
             usage = (d.get('message') or {}).get('usage') or {}
             if not usage:

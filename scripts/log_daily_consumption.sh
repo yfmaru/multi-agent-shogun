@@ -14,7 +14,9 @@
 # a manual/karo-or-gunshi-invoked one-shot script, not a daemon.
 #
 # Usage: bash scripts/log_daily_consumption.sh [YYYY-MM-DD] [--force]
-#   YYYY-MM-DD  Date to aggregate (default: today).
+#   YYYY-MM-DD  Date to aggregate (default: yesterday, i.e. the most
+#               recent fully-closed day; today is always in-progress so
+#               its total would be a partial value).
 #   --force     Recompute and overwrite an already-recorded date instead
 #               of skipping it.
 
@@ -34,7 +36,7 @@ for arg in "$@"; do
     *) DATE="$arg" ;;
   esac
 done
-DATE="${DATE:-$(date +%Y-%m-%d)}"
+DATE="${DATE:-$(date -d yesterday +%Y-%m-%d)}"
 
 if [ ! -d "$CLAUDE_PROJECTS_DIR" ]; then
   echo "ABORT: claude projects dir not found: ${CLAUDE_PROJECTS_DIR}" >&2
