@@ -1313,11 +1313,13 @@ YAML
         baton_watchdog_refresh_watcher_snapshot
         check_b4c_once
 
-        sed -i 's/read: false/read: true/' '$FIXTURE_ROOT/queue/inbox/shogun.yaml'
+        sed 's/read: false/read: true/' '$FIXTURE_ROOT/queue/inbox/shogun.yaml' > '$FIXTURE_ROOT/queue/inbox/shogun.yaml.tmp' \
+          && mv '$FIXTURE_ROOT/queue/inbox/shogun.yaml.tmp' '$FIXTURE_ROOT/queue/inbox/shogun.yaml'
         baton_watchdog_refresh_watcher_snapshot
         check_b4c_once
 
-        sed -i 's/read: true/read: false/' '$FIXTURE_ROOT/queue/inbox/shogun.yaml'
+        sed 's/read: true/read: false/' '$FIXTURE_ROOT/queue/inbox/shogun.yaml' > '$FIXTURE_ROOT/queue/inbox/shogun.yaml.tmp' \
+          && mv '$FIXTURE_ROOT/queue/inbox/shogun.yaml.tmp' '$FIXTURE_ROOT/queue/inbox/shogun.yaml'
         baton_watchdog_refresh_watcher_snapshot
         check_b4c_once
     "
