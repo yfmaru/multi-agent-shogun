@@ -40,6 +40,11 @@
 # 限り、既存の clear_command 配送経路（inbox_write.sh → inbox_watcher.sh）
 # へ1回だけ書き込み、文脈をリセットさせる。opt-in（既定 disabled）。
 # 詳細は periodic_clear_* 関数群（check_once 定義の直前）を参照。
+#
+# 【B-4b: 無進捗検知 (cmd_179/T-B) — check_d1_once と同様の独立OR条件】
+# 「バトンを保持したまま止まっている」（未読・稼働タスク数を問わず、
+# 特定エージェントのtask/report/inbox一式が長時間無更新）を検知する。
+# 詳細は check_b4b_once 直前のコメントを参照。
 # ═══════════════════════════════════════════════════════════════
 
 # ─── Testing guard ───
@@ -491,6 +496,171 @@ check_d1_once() {
     fi
 }
 
+# ═══════════════════════════════════════════════════════════════
+# B-4b: 無進捗検知（バトンを保持したまま停止）(cmd_179/T-B)
+#
+# 発端: 足軽7号が使用量制限中に報告執筆で中断し、status:assignedのまま
+# 5時間41分誰にも検知されなかった。既存のB-1〜B-3（check_once）は
+# 「未読合計0・稼働タスク0」を見るため、「タスクを持ったまま止まって
+# いる」（バトンを握ったまま倒れている）状態を検知できない。D-1
+# （check_d1_once）とも独立したOR条件であり、check_once/check_d1_once
+# 本体には一切触れない。
+#
+# 条件はAND（2つのみ。当初案にあった「未読0」条件は誤りと判明し削除
+# 済み——escalation ladder（inbox_watcher.shのnudge→Escape→/clear）には
+# 通知経路が一切無いため、「未読ありならladderに任せる」は実際には
+# 「誰にも任せていない」に等しく、未読が残ったまま止まっているケース
+# （2026-07-31、家老自身が13:31〜17:29の約4時間この状態にあった）が
+# 永久に検知漏れになる）:
+#
+#   (i)  queue/tasks/<agent>.yaml の status が assigned/in_progress、
+#        かつ queue/reports/<agent>_report.yaml が「同一task_id・
+#        status:done」という形の“既に納品済み”の反証を示していない
+#        （＝バトンを保持中）。
+#        【是正】単に status:assigned だけを見ると、仕事を終えたが
+#        自分のtask YAMLのstatus欄を更新し忘れたエージェント（本日
+#        実際に3体発生）に誤発火する。「バトンを保持している」の
+#        正しい定義は「任を負い、かつまだ納めていない」こと。
+#   (ii) 「progress artifact」（queue/tasks/<agent>.yaml・
+#        queue/reports/<agent>_report.yaml・queue/inbox/<agent>.yaml
+#        のmtime最大値）が progress_stall_after_sec（既定5400秒/90分）
+#        以上更新されていない。
+#
+# 対象エージェントは queue/tasks/*.yaml が存在するものに限る
+# （baton_watchdog_count_active_tasksと同じglob）。karo・shogunは
+# queue/tasks/にファイルを持たないため対象外——既知の限界（B-4c等
+# 別課題）。
+#
+# 通知はcheck_d1_onceと同型の二経路化。ただしB-4bはエージェント単位の
+# 検知のため、閾値到達判定・NOTIFIEDガードの双方をエージェントごとの
+# 連想配列で管理する。
+# ═══════════════════════════════════════════════════════════════
+declare -A B4B_CONDITION_SINCE=()  # agent -> 条件(i)(ii)が揃い始めたepoch(0なら未計測)
+declare -A B4B_NOTIFIED=()         # 主経路(将軍inbox)の二重通知防止ガード（agentごと）
+declare -A B4B_NTFY_NOTIFIED=()    # 副経路(ntfy)の二重通知防止ガード（agentごと）
+
+# queue/tasks/*.yaml が存在するエージェント名を1行1件で返す
+# （ファイル名から拡張子を除いたもの）。
+baton_watchdog_list_agents() {
+    local f
+    for f in "$ROOT"/queue/tasks/*.yaml; do
+        [ -f "$f" ] || continue
+        basename "$f" .yaml
+    done
+}
+
+# agent の queue/tasks/<agent>.yaml の task_id を返す（無ければ空文字）。
+baton_watchdog_task_id() {
+    local agent="$1" f
+    f="$ROOT/queue/tasks/${agent}.yaml"
+    [ -f "$f" ] || return 0
+    grep -m1 '^  task_id:' "$f" 2>/dev/null | sed -E "s/^  task_id:[[:space:]]*//; s/^['\"]//; s/['\"]\$//"
+}
+
+# agent の task が assigned/in_progress であれば真。
+baton_watchdog_task_active() {
+    local agent="$1" f
+    f="$ROOT/queue/tasks/${agent}.yaml"
+    [ -f "$f" ] || return 1
+    grep -qE '^  status: (assigned|in_progress)' "$f" 2>/dev/null
+}
+
+# agent の queue/reports/<agent>_report.yaml が「task_idが一致し、かつ
+# status:done」であれば真（＝既に納品済み）。report yaml のフィールドは
+# task yaml と異なりトップレベル（0-indent）である点に注意。
+baton_watchdog_report_delivered() {
+    local agent="$1" task_id="$2" f report_task_id
+    f="$ROOT/queue/reports/${agent}_report.yaml"
+    [ -f "$f" ] || return 1
+    [ -n "$task_id" ] || return 1
+    report_task_id=$(grep -m1 '^task_id:' "$f" 2>/dev/null | sed -E "s/^task_id:[[:space:]]*//; s/^['\"]//; s/['\"]\$//")
+    [ "$report_task_id" = "$task_id" ] || return 1
+    grep -qE '^status: done' "$f" 2>/dev/null
+}
+
+# 条件(i)【是正版】: 「assigned/in_progressであり、かつreportが既に
+# 納品済みという反証を示していない」ことをもって「バトンを保持中」とする。
+baton_watchdog_agent_holds_baton() {
+    local agent="$1" task_id
+    baton_watchdog_task_active "$agent" || return 1
+    task_id=$(baton_watchdog_task_id "$agent")
+    baton_watchdog_report_delivered "$agent" "$task_id" && return 1
+    return 0
+}
+
+# progress artifact（task/report/inboxのmtime最大値、epoch秒）を返す。
+# いずれのファイルも無ければ0を返す（安全側＝進捗ありとみなし発火させない）。
+baton_watchdog_agent_progress_mtime() {
+    local agent="$1" f max=0 m
+    for f in "$ROOT/queue/tasks/${agent}.yaml" "$ROOT/queue/reports/${agent}_report.yaml" "$ROOT/queue/inbox/${agent}.yaml"; do
+        [ -f "$f" ] || continue
+        m=$(stat -c %Y "$f" 2>/dev/null) || continue
+        [ -n "$m" ] && [ "$m" -gt "$max" ] && max=$m
+    done
+    echo "$max"
+}
+
+# B-4bを1回だけ判定する。check_once()・check_d1_once()とは完全に独立した
+# 関数であり、それらを呼ばない・その内部にも触れない。
+check_b4b_once() {
+    local agent now stall_threshold ntfy_threshold
+    local progress_mtime stalled_for elapsed task_id
+
+    if [ "$(baton_watchdog_query enabled)" != "true" ]; then
+        return 0
+    fi
+
+    now=$(date +%s)
+    stall_threshold=$(baton_watchdog_query progress_stall_after_sec)
+    ntfy_threshold=$(baton_watchdog_query baton_b4b_ntfy_after_sec)
+
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+
+        if baton_watchdog_agent_holds_baton "$agent"; then
+            progress_mtime=$(baton_watchdog_agent_progress_mtime "$agent")
+            stalled_for=$((now - progress_mtime))
+
+            if [ "$stalled_for" -ge "$stall_threshold" ]; then
+                if [ "${B4B_CONDITION_SINCE[$agent]:-0}" -eq 0 ]; then
+                    B4B_CONDITION_SINCE[$agent]=$now
+                fi
+                elapsed=$((now - B4B_CONDITION_SINCE[$agent]))
+
+                # 主経路: 将軍inbox通知。既存どおり検知した時点で無条件・
+                # 即座に発火する（progress_stall_after_sec秒分の無更新
+                # 自体が継続の証拠であり、追加の待機は挟まない）。
+                if [ "${B4B_NOTIFIED[$agent]:-0}" -eq 0 ]; then
+                    task_id=$(baton_watchdog_task_id "$agent")
+                    baton_watchdog_notify_shogun "no_progress: agent=${agent} task_id=${task_id} stalled_for=${stalled_for}s (バトン保持のまま${stall_threshold}s+無進捗)"
+                    B4B_NOTIFIED[$agent]=1
+                fi
+
+                # 副経路: ntfy（主のスマホ）。エージェントごとに独立した
+                # 閾値・ガードで管理する。失敗許容——失敗してもログに
+                # 残すのみで将軍inbox通知には無関係。
+                if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "${B4B_NTFY_NOTIFIED[$agent]:-0}" -eq 0 ]; then
+                    if ! branch_policy_notify "no_progress: agent=${agent} stalled_for=${stalled_for}s (${ntfy_threshold}s+検知継続・ntfy)"; then
+                        echo "[$(date)] [baton_watchdog] B-4b ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+                    fi
+                    B4B_NTFY_NOTIFIED[$agent]=1
+                fi
+            else
+                # 条件(ii)が崩れた＝進捗が観測された。次に条件が揃った
+                # 際は新たな継続として独立して計測し直す。
+                B4B_CONDITION_SINCE[$agent]=0
+                B4B_NOTIFIED[$agent]=0
+                B4B_NTFY_NOTIFIED[$agent]=0
+            fi
+        else
+            # 条件(i)が崩れた＝バトンを保持していない（未着手 or 納品済み）。
+            B4B_CONDITION_SINCE[$agent]=0
+            B4B_NOTIFIED[$agent]=0
+            B4B_NTFY_NOTIFIED[$agent]=0
+        fi
+    done < <(baton_watchdog_list_agents)
+}
+
 if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     mkdir -p "$ROOT/logs"
 
@@ -502,6 +672,7 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     if [ "${1:-}" = "--once" ]; then
         check_once
         check_d1_once
+        check_b4b_once
         periodic_clear_check_once
         exit 0
     fi
@@ -509,6 +680,7 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     while true; do
         check_once
         check_d1_once
+        check_b4b_once
         periodic_clear_check_once
         sleep "$(baton_watchdog_query poll_interval_sec)"
     done
