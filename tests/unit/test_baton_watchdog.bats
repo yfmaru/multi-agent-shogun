@@ -145,8 +145,9 @@ teardown() {
 # $5=baton_d1_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定900に委ねる）
 # $6=progress_stall_after_sec（省略時はキー自体を書かず、コード側の既定5400に委ねる）
 # $7=baton_b4b_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定900に委ねる）
+# $8=baton_b4c_stale_after_sec（省略時はキー自体を書かず、コード側の既定5400に委ねる。cmd_180/T-3）
 write_settings() {
-    local ntfy_line="" d1_ntfy_line="" progress_stall_line="" b4b_ntfy_line=""
+    local ntfy_line="" d1_ntfy_line="" progress_stall_line="" b4b_ntfy_line="" b4c_stale_line=""
     if [ -n "${4:-}" ]; then
         ntfy_line="  baton_ntfy_after_sec: $4"
     fi
@@ -159,6 +160,9 @@ write_settings() {
     if [ -n "${7:-}" ]; then
         b4b_ntfy_line="  baton_b4b_ntfy_after_sec: $7"
     fi
+    if [ -n "${8:-}" ]; then
+        b4c_stale_line="  baton_b4c_stale_after_sec: $8"
+    fi
     cat > "$FIXTURE_ROOT/config/settings.yaml" << YAML
 baton_watchdog:
   enabled: $1
@@ -168,6 +172,7 @@ $ntfy_line
 $d1_ntfy_line
 $progress_stall_line
 $b4b_ntfy_line
+$b4c_stale_line
 YAML
 }
 
@@ -579,9 +584,13 @@ YAML
     run bash -c "
         source '$TEST_HARNESS'
         # このテストに限り watcher が生きていることにする
-        # （長いturnを回している間の正常な滞留を模す）。
+        # （長いturnを回している間の正常な滞留を模す）。cmd_180/T-2で
+        # check_d1_once はWATCHER_ALIVE_SNAPSHOTを参照するようになった
+        # ため、pgrepモック差し替え後に明示的にスナップショットを
+        # 更新する（本番のメインループが毎サイクル行うのと同じ手順）。
         pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
         export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
         check_d1_once
     "
     [ "$status" -eq 0 ]
@@ -1001,4 +1010,391 @@ YAML
     grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
     grep -q "no_progress: agent=ashigaru7" "$SHOGUN_NOTIFY_LOG"
     grep -q "subtask_178_pc2_daily_consumption_log_v2" "$SHOGUN_NOTIFY_LOG"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 【cmd_180・自己沈黙の解消】T-1: baton_watchdog_count_unread の
+# 自己給餌排除（2026-07-31 20:52:25、6時間23分の自己沈黙インシデント）
+#
+#   TC-SELF-001: baton_watchdog自身の警報は除外される（昨夜の形そのもの）
+#   TC-SELF-002: watcher_supervisorの警報も同様に除外される
+#   TC-SELF-003【最重要・対照実験】fromがkaro等の真の未読は引き続き数える
+#   TC-SELF-004: fromフィールド欠落の未読は数える（除外せぬ）
+#   TC-SELF-005: 副経路ntfyが実際に到達する（昨夜到達し得なかった経路）
+#   TC-SELF-006: python/yaml失敗時のフォールバックは除外なしのgrep方式へ
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-SELF-001: baton_watchdog自身の警報は自己沈黙を起こさず除外される ---
+
+@test "TC-SELF-001: baton_watchdog's own alert in shogun inbox is excluded from unread count (2026-07-31 20:52 incident shape)" {
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_alert
+    read: false
+    from: baton_watchdog
+    type: baton_alert
+    timestamp: '2026-07-31T20:52:25'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"unread=0"* ]]
+    [[ "$output" == *"baton_condition=true"* ]]
+}
+
+# --- TC-SELF-002: watcher_supervisorの警報も同様に除外される ---
+
+@test "TC-SELF-002: watcher_supervisor's own alert in shogun inbox is also excluded from unread count" {
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_watcher_alert
+    read: false
+    from: watcher_supervisor
+    type: watcher_alert
+    timestamp: '2026-07-31T20:52:25'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"unread=0"* ]]
+    [[ "$output" == *"baton_condition=true"* ]]
+}
+
+# --- TC-SELF-003【最重要の対照実験】真の未読(from: karo)は引き続き数えられる ---
+
+@test "TC-SELF-003: a genuine unread from karo is still counted (intent-preserving control against over-exclusion)" {
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_real
+    read: false
+    from: karo
+    type: task_assigned
+    timestamp: '2026-07-31T20:52:25'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"unread=1"* ]]
+    [[ "$output" == *"baton_condition=false"* ]]
+}
+
+# --- TC-SELF-004: fromフィールド欠落の未読は数える（除外せぬ） ---
+
+@test "TC-SELF-004: a message with no 'from' field is still counted (safe-side; not treated as excluded)" {
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_no_from
+    read: false
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"unread=1"* ]]
+    [[ "$output" == *"baton_condition=false"* ]]
+}
+
+# --- TC-SELF-005: 副経路ntfyが実際に到達する（AC2） ---
+
+@test "TC-SELF-005: secondary ntfy route actually reaches once baton_ntfy_after_sec elapses (the route that never fired all of last night)" {
+    write_settings true 5 60 8   # shogun threshold=5s, ntfy threshold=8s
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_alert
+    read: false
+    from: baton_watchdog
+    type: baton_alert
+    timestamp: '2026-07-31T20:52:25'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "NOTIFY: baton_lost" "$NOTIFY_LOG"
+}
+
+# --- TC-SELF-006: python/yaml失敗時のフォールバック方向（除外なしgrep方式） ---
+
+@test "TC-SELF-006: count_unread falls back to the conservative grep count (no exclusion) when python/yaml is unavailable" {
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_alert
+    read: false
+    from: baton_watchdog
+    type: baton_alert
+    timestamp: '2026-07-31T20:52:25'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        stall_policy_python() { echo '/nonexistent/python3'; }
+        baton_watchdog_count_unread
+    "
+    [ "$status" -eq 0 ]
+    # フォールバックは除外なしのgrep方式へ戻るため、baton_watchdog由来の
+    # 警報も数えられる（unread=0へは倒れない。フォールバック方向を誤ると
+    # ここが0になり、誤って baton_condition が真になる）。
+    [ "$output" = "1" ]
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 【cmd_180】T-2: watcher生死スナップショットの共有（D-1・B-4cの排他性）
+# T-3: B-4c（stale未読 かつ watcher生存）本体
+# T-4: D-1の通知先決定規則（診断した当人へは書かぬ）
+#
+#   TC-B4C-EXCL-001: D-1発火時にB-4cが発火せぬ（dead watcher）
+#   TC-B4C-EXCL-002: B-4c発火時にD-1が発火せぬ（alive watcher）
+#   TC-B4C-EXCL-003【最重要】D-1・B-4c間でpgrep応答が反転しても通知は1件のみ
+#   TC-B4C-LATCH-001: B-4cは診断対象自身(shogun)のinboxへは書かぬ（自己給餌ラッチ防止）
+#   TC-B4C-LATCH-002: 停止解消でガードがリセットされ、再度staleで再通知される
+#   TC-B4C-001: karo（task YAMLを持たぬエージェント）が対象で発火（AC3）
+#   TC-B4C-002: 閾値未満では発火しない
+#   TC-B4C-003: tmuxを一切呼ばない
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-B4C-EXCL-001: D-1発火時にB-4cが発火せぬ（同一のdead-watcher-stale-inbox） ---
+
+@test "TC-B4C-EXCL-001: D-1 fires and B-4c stays silent for the same dead-watcher stale inbox" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_refresh_watcher_snapshot
+        check_d1_once
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "delivery_stall" "$SHOGUN_NOTIFY_LOG")" -eq 1 ]
+    [ "$(grep -c "inbox_stall" "$SHOGUN_NOTIFY_LOG")" -eq 0 ]
+}
+
+# --- TC-B4C-EXCL-002: B-4c発火時にD-1が発火せぬ（同一のalive-watcher-stale-inbox） ---
+
+@test "TC-B4C-EXCL-002: B-4c fires and D-1 stays silent for the same live-watcher stale inbox" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_d1_once
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "delivery_stall" "$SHOGUN_NOTIFY_LOG")" -eq 0 ]
+    [ "$(grep -c "inbox_stall" "$SHOGUN_NOTIFY_LOG")" -eq 1 ]
+}
+
+# --- TC-B4C-EXCL-003【最重要・是正1の固定】D-1・B-4c間でpgrep応答が反転しても通知は1件のみ ---
+
+@test "TC-B4C-EXCL-003: flipping pgrep from dead to alive between the D-1 and B-4c calls still yields exactly one notification (frozen snapshot)" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_refresh_watcher_snapshot
+        check_d1_once
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    local delivery_count inbox_count
+    delivery_count=$(grep -c "delivery_stall" "$SHOGUN_NOTIFY_LOG" || true)
+    inbox_count=$(grep -c "inbox_stall" "$SHOGUN_NOTIFY_LOG" || true)
+    [ "$((delivery_count + inbox_count))" -eq 1 ]
+}
+
+# --- TC-B4C-LATCH-001【是正2の固定】診断対象自身(shogun)のinboxへは書かぬ ---
+
+@test "TC-B4C-LATCH-001: B-4c never writes to shogun's own inbox when shogun is the diagnosed target (self-feeding latch prevention)" {
+    local stale_ts before_count after_count
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+    before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: karo" "$SHOGUN_NOTIFY_LOG"
+    grep -q "inbox_stall: agent=shogun" "$SHOGUN_NOTIFY_LOG"
+
+    after_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+    [ "$before_count" -eq "$after_count" ]
+}
+
+# --- TC-B4C-LATCH-002: 停止解消でガードがリセットされ、再度staleで再通知される ---
+
+@test "TC-B4C-LATCH-002: guard resets once shogun's stale message is read, then re-fires on a renewed stall" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+
+        sed -i 's/read: false/read: true/' '$FIXTURE_ROOT/queue/inbox/shogun.yaml'
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+
+        sed -i 's/read: true/read: false/' '$FIXTURE_ROOT/queue/inbox/shogun.yaml'
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "inbox_stall: agent=shogun" "$SHOGUN_NOTIFY_LOG")" -eq 2 ]
+}
+
+# --- TC-B4C-001【AC3】karo（queue/tasks/*.yamlを持たぬエージェント）が対象で発火 ---
+
+@test "TC-B4C-001: inbox-stall detected for karo (an agent with no queue/tasks/*.yaml, per AC3) when watcher is alive" {
+    write_settings true 5 60 "" "" "" "" 5   # baton_b4c_stale_after_sec=5
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 10 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    grep -q "inbox_stall: agent=karo" "$SHOGUN_NOTIFY_LOG"
+}
+
+# --- TC-B4C-002: 閾値未満では発火しない ---
+
+@test "TC-B4C-002: no notification when stale duration is under the baton_b4c_stale_after_sec threshold" {
+    write_settings true 5 60 "" "" "" "" 6000   # baton_b4c_stale_after_sec=6000
+    local fresh_ts
+    fresh_ts=$(date -d "@$(( $(date +%s) - 10 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_fresh
+    read: false
+    timestamp: '${fresh_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ]
+}
+
+# --- TC-B4C-003: tmuxを一切呼ばない ---
+
+@test "TC-B4C-003: tmux is never called by check_b4c_once even when inbox-stall is detected" {
+    write_settings true 5 60 "" "" "" "" 5
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 10 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    [ ! -s "$MOCK_TMUX_LOG" ]
 }
