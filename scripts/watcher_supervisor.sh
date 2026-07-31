@@ -45,7 +45,7 @@ start_watcher_if_missing() {
 
     (
         flock -n 9 || return 0
-        if pgrep -Ef "scripts/inbox_watcher.sh ${agent} ${pane}( |$)" >/dev/null 2>&1; then
+        if pgrep -f "scripts/inbox_watcher.sh ${agent} ${pane}( |$)" >/dev/null 2>&1; then
             return 0
         fi
 
