@@ -58,7 +58,7 @@ WATCHDOG_SCRIPT="$PROJECT_ROOT/scripts/baton_watchdog.sh"
 setup() {
     TEST_TMPDIR="$(mktemp -d "$BATS_TMPDIR/baton_watchdog_test.XXXXXX")"
     FIXTURE_ROOT="$TEST_TMPDIR/fixture"
-    mkdir -p "$FIXTURE_ROOT/queue/inbox" "$FIXTURE_ROOT/queue/tasks" "$FIXTURE_ROOT/config" "$FIXTURE_ROOT/scripts"
+    mkdir -p "$FIXTURE_ROOT/queue/inbox" "$FIXTURE_ROOT/queue/tasks" "$FIXTURE_ROOT/queue/reports" "$FIXTURE_ROOT/config" "$FIXTURE_ROOT/scripts"
 
     export MOCK_TMUX_LOG="$TEST_TMPDIR/tmux_calls.log"
     export NOTIFY_LOG="$TEST_TMPDIR/notify.log"
@@ -143,13 +143,21 @@ teardown() {
 # $1=enabled(true/false) $2=baton_lost_after_sec $3=poll_interval_sec
 # $4=baton_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定1800に委ねる）
 # $5=baton_d1_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定900に委ねる）
+# $6=progress_stall_after_sec（省略時はキー自体を書かず、コード側の既定5400に委ねる）
+# $7=baton_b4b_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定900に委ねる）
 write_settings() {
-    local ntfy_line="" d1_ntfy_line=""
+    local ntfy_line="" d1_ntfy_line="" progress_stall_line="" b4b_ntfy_line=""
     if [ -n "${4:-}" ]; then
         ntfy_line="  baton_ntfy_after_sec: $4"
     fi
     if [ -n "${5:-}" ]; then
         d1_ntfy_line="  baton_d1_ntfy_after_sec: $5"
+    fi
+    if [ -n "${6:-}" ]; then
+        progress_stall_line="  progress_stall_after_sec: $6"
+    fi
+    if [ -n "${7:-}" ]; then
+        b4b_ntfy_line="  baton_b4b_ntfy_after_sec: $7"
     fi
     cat > "$FIXTURE_ROOT/config/settings.yaml" << YAML
 baton_watchdog:
@@ -158,6 +166,8 @@ baton_watchdog:
   poll_interval_sec: $3
 $ntfy_line
 $d1_ntfy_line
+$progress_stall_line
+$b4b_ntfy_line
 YAML
 }
 
@@ -694,4 +704,301 @@ YAML
     "
     [ "$status" -eq 0 ]
     grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# B-4b: 無進捗検知（バトンを保持したまま停止）(cmd_179/T-B)
+#
+# 発端: 足軽7号が使用量制限中に報告執筆で中断し、status:assignedのまま
+# 5時間41分誰にも検知されなかった。条件はAND: (i) queue/tasks/<agent>.yaml
+# のstatusがassigned/in_progressであり、かつqueue/reports/<agent>_report.yaml
+# が「同一task_id・status:done」という既に納品済みの反証を示していない
+# (＝バトンを保持中)。(ii) task/report/inboxのmtime最大値
+# (progress artifact) が progress_stall_after_sec 秒以上更新されていない。
+# 当初案にあった「未読0」条件(iii)は誤りと判明し削除済み——escalation
+# ladderには通知経路が一切無いため、未読が残ったまま止まっている
+# ケースを永久に見逃す設計になってしまうため。
+#
+#   TC-B4B-001: 条件(i)(ii)がいずれも成立 → 通知される
+#   TC-B4B-002: 条件(i)は成立するが(ii)（mtimeが新しい）が不成立 → 通知されない
+#   TC-B4B-003: task.status=assignedだがreport.task_idが一致し
+#               report.status=doneの場合 → 通知されない（本日実際に3体で
+#               起きた誤発火パターンの回帰固定）
+#   TC-B4B-004: 未読が1件以上ある状態でも(i)(ii)が成立すれば通知される
+#               （削除した条件(iii)の回帰）
+#   TC-B4B-005: tmuxを一切呼ばない
+#   TC-B4B-006: 同一の継続停止に対して二重通知しない（NOTIFIEDフラグ）
+#   TC-B4B-007: 停止が解消されればNOTIFIEDフラグがリセットされ、
+#               再度停止すれば再通知される
+#   TC-NOTIFY-B4B-001〜003: D-1のTC-NOTIFY-D1-001〜003と同型
+#   TC-B4B-REAL-001: 2026-07-31 13:02頃の足軽7号の実データの形
+#                     （task.status=assigned、5時間41分無更新、
+#                     reportは別task_idで不一致）を固定する回帰
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-B4B-001: 条件(i)(ii)がいずれも成立 → 通知される ---
+
+@test "TC-B4B-001: no-progress detected when (i) baton held and (ii) progress stalled past threshold" {
+    write_settings true 5 60 "" "" 5 60   # progress_stall_after_sec=5, baton_b4b_ntfy_after_sec=60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    grep -q "no_progress: agent=ashigaru3" "$SHOGUN_NOTIFY_LOG"
+    grep -q "subtask_test_b4b" "$SHOGUN_NOTIFY_LOG"
+}
+
+# --- TC-B4B-002: 条件(i)は成立するが(ii)（mtimeが新しい）が不成立 → 通知されない ---
+
+@test "TC-B4B-002: no notification when (i) holds but (ii) progress is fresh" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_fresh
+  status: assigned
+YAML
+    # touchせず、作成直後の新しいmtimeのまま（条件(ii)不成立）
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ]
+}
+
+# --- TC-B4B-003: 【回帰・誤発火防止】既に納品済み(report一致・done)なら通知されない ---
+
+@test "TC-B4B-003: no notification when task.status=assigned but the matching report is already done" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru4.yaml" << 'YAML'
+task:
+  task_id: subtask_delivered
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru4.yaml"
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru4_report.yaml" << 'YAML'
+worker_id: ashigaru4
+task_id: subtask_delivered
+status: done
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ]
+}
+
+# --- TC-B4B-004: 【回帰・削除した条件(iii)】未読が残っていても検知される ---
+
+@test "TC-B4B-004: no-progress is still detected even when unread messages remain (removed condition iii regression)" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru5.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_unread
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru5.yaml"
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru5.yaml" << 'YAML'
+messages:
+  - id: msg_unread
+    read: false
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/inbox/ashigaru5.yaml"
+
+    # 前提の健全性: 未読が確かに残っている
+    [ "$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/ashigaru5.yaml")" -eq 1 ]
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru5" "$SHOGUN_NOTIFY_LOG"
+}
+
+# --- TC-B4B-005: 【重要】検知しても tmux を一切呼ばない ---
+
+@test "TC-B4B-005: tmux is never called by check_b4b_once even when no-progress is detected" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_tmux
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    [ ! -s "$MOCK_TMUX_LOG" ]
+}
+
+# --- TC-B4B-006: 同一の継続停止に対して二重通知しない ---
+
+@test "TC-B4B-006: no duplicate notification for the same continued no-progress stop" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_dup
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        check_b4b_once
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "no_progress: agent=ashigaru3" "$SHOGUN_NOTIFY_LOG")" -eq 1 ]
+}
+
+# --- TC-B4B-007: 停止解消でNOTIFIEDがリセットされ、再停止で再通知される ---
+
+@test "TC-B4B-007: NOTIFIED flag resets once the stall resolves, then re-fires on a renewed stall" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_recur
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        # 進捗が観測された体でmtimeを新しくする(=条件(ii)崩れ)
+        touch '$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml'
+        check_b4b_once
+        # 再び古いmtimeに戻す(=条件(ii)再成立。新たな継続として扱われるはず)
+        touch -d '@$(( $(date +%s) - 10000 ))' '$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "no_progress: agent=ashigaru6" "$SHOGUN_NOTIFY_LOG")" -eq 2 ]
+}
+
+# --- TC-NOTIFY-B4B-001: ntfy_topic未設定でも将軍inboxへ無条件に通知される ---
+
+@test "TC-NOTIFY-B4B-001: shogun inbox is notified unconditionally when B-4b condition is met, regardless of ntfy_topic" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_notify1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    grep -q "baton_alert" "$SHOGUN_NOTIFY_LOG"
+    grep -q "baton_watchdog" "$SHOGUN_NOTIFY_LOG"
+}
+
+# --- TC-NOTIFY-B4B-002: ntfyはB-4b専用のbaton_b4b_ntfy_after_sec到達で初めて発火する ---
+
+@test "TC-NOTIFY-B4B-002: ntfy fires only once the B-4b-specific baton_b4b_ntfy_after_sec threshold is reached" {
+    write_settings true 5 60 "" "" 5 8   # progress_stall_after_sec=5, baton_b4b_ntfy_after_sec=8
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_ntfy
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml"
+
+    # 検知直後（B4B_CONDITION_SINCE計測開始直後）: 主経路は即発火するが副経路はまだ
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru7" "$SHOGUN_NOTIFY_LOG"
+    [ ! -s "$NOTIFY_LOG" ]
+
+    # B4B_CONDITION_SINCEを直接過去化し、ntfy閾値(8s)到達後の状態を模す
+    run bash -c "
+        source '$TEST_HARNESS'
+        B4B_CONDITION_SINCE[ashigaru7]=\$(( \$(date +%s) - 10 ))
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "NOTIFY: no_progress: agent=ashigaru7" "$NOTIFY_LOG"
+}
+
+# --- TC-NOTIFY-B4B-003: ntfy失敗はB-4bの将軍inbox通知・処理継続に影響しない ---
+
+@test "TC-NOTIFY-B4B-003: ntfy failure does not affect B-4b shogun inbox notification or check_b4b_once exit status" {
+    write_settings true 5 60 "" "" 5 5   # baton_b4b_ntfy_after_sec=5
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml" << 'YAML'
+task:
+  task_id: subtask_test_b4b_ntfy_fail
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        branch_policy_notify() { return 1; }  # ntfy_topic未設定時のexit 1相当を模擬
+        B4B_CONDITION_SINCE[ashigaru7]=\$(( \$(date +%s) - 10 ))
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru7" "$SHOGUN_NOTIFY_LOG"
+}
+
+# --- TC-B4B-REAL-001: 【acceptance_criteria 2】実データの形の回帰固定 ---
+#
+# 2026-07-31 13:02頃、足軽7号がsubtask_178_pc2_daily_consumption_log_v2の
+# 報告執筆中に使用量制限へ達して中断し、task.status=assignedのまま5時間
+# 41分（20460秒）誰にも検知されなかった。当時のreportは前タスク
+# （subtask_177_prior_task。実際の前タスクIDは異なるが「新task_idとは
+# 不一致」という形が本質）のまま更新されておらず、(i)の判定基準である
+# 「report.task_idが一致しstatus:doneという反証」が成立しなかった。
+# progress_stall_after_secは本番既定値（5400秒）のまま検証する。
+
+@test "TC-B4B-REAL-001: regression fixed to the real 2026-07-31 13:02 ashigaru7 incident shape (5h41m stall, mismatched report task_id)" {
+    write_settings true 5 60 "" "" 5400 900   # 本番既定値のまま
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml" << 'YAML'
+task:
+  task_id: subtask_178_pc2_daily_consumption_log_v2
+  parent_cmd: cmd_178
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 20460 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml"
+
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru7_report.yaml" << 'YAML'
+worker_id: ashigaru7
+task_id: subtask_177_prior_task
+status: done
+YAML
+    touch -d "@$(( $(date +%s) - 20460 ))" "$FIXTURE_ROOT/queue/reports/ashigaru7_report.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
+    grep -q "no_progress: agent=ashigaru7" "$SHOGUN_NOTIFY_LOG"
+    grep -q "subtask_178_pc2_daily_consumption_log_v2" "$SHOGUN_NOTIFY_LOG"
 }
