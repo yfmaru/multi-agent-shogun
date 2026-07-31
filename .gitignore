@@ -126,6 +126,8 @@ scripts/seo_qc.sh
 !scripts/dashboard-viewer.py
 !scripts/mcp_health_check.sh
 !scripts/baton_watchdog.sh
+!scripts/log_daily_consumption.sh
+!scripts/compute_daily_consumption.py
 
 
 # SayTask (sample template only, not actual data)
