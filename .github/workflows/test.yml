@@ -154,7 +154,7 @@ jobs:
             exit 1
           }
 
-          echo "✓ All 6 generated instruction targets are in sync with source templates"
+          echo "✓ All 5 tracked generated instruction targets are in sync with source templates"
 
       - name: Skip build check
         if: steps.check_script.outputs.exists == 'false'
