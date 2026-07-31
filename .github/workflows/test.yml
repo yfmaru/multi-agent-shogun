@@ -145,14 +145,16 @@ jobs:
             exit 0
           fi
 
-          git diff --exit-code instructions/generated/ .opencode/agents/ || {
-            echo "::error::Generated instructions or OpenCode agent files are out of sync!"
+          git diff --exit-code instructions/generated/ .opencode/agents/ \
+            AGENTS.md .github/copilot-instructions.md agents/default/system.md || {
+            echo "::error::Generated instructions/OpenCode agents/AGENTS.md/copilot-instructions.md/system.md are out of sync!"
             echo "::error::Run 'bash scripts/build_instructions.sh' and commit the changes."
-            git diff instructions/generated/ .opencode/agents/
+            git diff instructions/generated/ .opencode/agents/ \
+              AGENTS.md .github/copilot-instructions.md agents/default/system.md
             exit 1
           }
 
-          echo "✓ Generated instructions and OpenCode agents are in sync with source templates"
+          echo "✓ All 5 tracked generated instruction targets are in sync with source templates"
 
       - name: Skip build check
         if: steps.check_script.outputs.exists == 'false'
