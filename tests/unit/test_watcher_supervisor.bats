@@ -8,6 +8,13 @@
 #   T-WS-002: watcher already running for correct pane → no duplicate started
 #   T-WS-003: lockfile path follows pattern /tmp/shogun_watcher_start_{agent}.lock
 #   T-WS-004: no existing watcher → watcher is started
+#   T-WS-005: real (unmocked) pgrep correctly detects an already-running watcher
+#   TC-DEDUP-001..003: agent/pane match combinations do not start duplicates
+#   OBS22-A-001..003 (cmd_178): stale-watcher WARN escalates to a shogun inbox
+#     notification, guarded by a per-agent dedup flag that clears on resolution
+#   QC34-F1-001, QC34-F2-001 (cmd_178 redo): failing inbox_write.sh call and
+#     empty pgrep match for actual_pane extraction must not abort the daemon
+#     under set -euo pipefail (gunshi QC FAIL findings, see gunshi_qc_178_obs22.yaml)
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 SUPERVISOR_SCRIPT="$PROJECT_ROOT/scripts/watcher_supervisor.sh"
@@ -38,10 +45,17 @@ teardown() {
     rm -rf "$TEST_TMP"
     rm -f /tmp/shogun_watcher_start_ashigaru1_*_${$}_dedup*.lock
     rm -f /tmp/shogun_watcher_start_cmd176fake.lock
-    # T-WS-005's decoy self-terminates via `sleep 5`; no kill needed (D006).
-    # Just reap it if it's still around to avoid a zombie.
+    rm -f /tmp/shogun_watcher_obs22_notified_ashigaru1_*_"${$}"_obs22a*
+    # T-WS-005's decoy self-terminates via `sleep 5` (kept alive as a
+    # detection safety margin; no kill needed, D006). Reap it only if it
+    # has already exited (bounded, non-blocking check) — never block the
+    # test suite for the decoy's remaining lifetime (QC29-9: this used to
+    # cost ~5s/run via an unconditional `wait`).
     if [ -n "${decoy_pid:-}" ]; then
-        wait "$decoy_pid" 2>/dev/null || true
+        for _ in $(seq 1 5); do
+            kill -0 "$decoy_pid" 2>/dev/null || { wait "$decoy_pid" 2>/dev/null || true; break; }
+            sleep 0.05
+        done
     fi
 }
 
@@ -217,8 +231,10 @@ source_supervisor_functions() {
 # decoy uses `exec -a "<name>" sleep 5` so its /proc/PID/cmdline becomes
 # exactly "<name> 5" via execve (no leftover shell wrapper text, and no
 # bash tail-call surprises since sleep is the final and only exec'd image),
-# giving pgrep -f a literal, stable match for the full 5s lifetime. It
-# exits on its own; teardown() only `wait`s on it, never kills it.
+# giving pgrep -f a literal, stable match. Its 5s lifetime is kept only as
+# a detection safety margin (QC29-9); the test itself does not wait for
+# that full duration — see the bounded poll below and teardown()'s
+# bounded, non-blocking reap. It exits on its own; never killed (D006).
 # ---------------------------------------------------------------------------
 @test "T-WS-005: real pgrep detects an already-running watcher via exact agent+pane match" {
     local agent="cmd176fake"
@@ -228,8 +244,19 @@ source_supervisor_functions() {
 
     bash -c "exec -a \"scripts/inbox_watcher.sh ${agent} ${pane}\" sleep 5" &
     decoy_pid=$!
-    # Give exec -a a brief moment to land before pgrep looks for it.
-    sleep 0.3
+
+    # QC29-9: bounded polling instead of a fixed `sleep 0.3` guess — proceed
+    # the instant the decoy's argv is actually visible to pgrep, rather than
+    # waiting a fixed duration regardless of how fast (or slow) exec -a lands.
+    local decoy_ready=false
+    for _ in $(seq 1 20); do
+        if pgrep -f "scripts/inbox_watcher.sh ${agent} ${pane}" >/dev/null 2>&1; then
+            decoy_ready=true
+            break
+        fi
+        sleep 0.05
+    done
+    [ "$decoy_ready" = true ]
 
     (
         pane_exists() { return 0; }
@@ -266,6 +293,8 @@ source_supervisor_functions() {
     # colliding with the real, live watcher_supervisor.sh daemon on this host
     # (same isolation approach as T-WS-004).
     local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_dedup001"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    rm -f "$notified_flag"
 
     (
         pane_exists() { return 0; }
@@ -287,6 +316,18 @@ source_supervisor_functions() {
         # short-circuit the test via the function's early `return 0`.
         flock() { return 0; }
 
+        # OBS22-A: this path now also fires a shogun inbox notification —
+        # stub the real `bash scripts/inbox_write.sh ...` call the same way
+        # OBS22-A-00x do, so this pre-existing test doesn't invoke the real
+        # script (which needs a venv unavailable here and would otherwise
+        # retry/sleep for seconds on failure).
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                return 0
+            fi
+            command bash "$@"
+        }
+
         eval "$(
             awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
                 "$SUPERVISOR_SCRIPT"
@@ -299,6 +340,8 @@ source_supervisor_functions() {
         [ ! -f "$launched_log" ]
         grep -q "stale watcher detected" "$warn_log"
     )
+
+    rm -f "$notified_flag"
 }
 
 # ---------------------------------------------------------------------------
@@ -369,4 +412,262 @@ source_supervisor_functions() {
 
     [ -f "$launched_log" ]
     grep -q "launched:" "$launched_log"
+}
+
+# ---------------------------------------------------------------------------
+# OBS22-A-001 (cmd_178): first stale-watcher detection escalates the WARN to
+# a shogun inbox notification (via inbox_write.sh) and creates a dedup flag.
+# ---------------------------------------------------------------------------
+@test "OBS22-A-001: first stale-watcher detection sends shogun inbox notification and creates dedup flag" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_obs22a001"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    rm -f "$notified_flag"
+
+    (
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane pgrep call → not found (1); agent-only/stale pgrep → found (0)
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        flock() { return 0; }
+        nohup() { :; }
+
+        # Intercept the `bash scripts/inbox_write.sh ...` call the same way
+        # other tests intercept `nohup`/`tmux`/`pgrep`.
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_obs22a001.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        grep -q "shogun" "$TEST_TMP/inbox_write_calls.log"
+        grep -q "$agent" "$TEST_TMP/inbox_write_calls.log"
+        [ -f "$notified_flag" ]
+    )
+
+    rm -f "$notified_flag"
+}
+
+# ---------------------------------------------------------------------------
+# OBS22-A-002 (cmd_178): repeated detection of the SAME unresolved mismatch
+# must NOT re-notify (dedup guard) — this is the core of OBS22-A's purpose:
+# without it, every 5s supervisor cycle would re-flood shogun's inbox.
+# ---------------------------------------------------------------------------
+@test "OBS22-A-002: repeated stale-watcher detection with existing flag does not re-notify" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_obs22a002"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    touch "$notified_flag"
+
+    (
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        flock() { return 0; }
+        nohup() { :; }
+
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_obs22a002.log"
+
+        [ ! -f "$TEST_TMP/inbox_write_calls.log" ]
+        [ -f "$notified_flag" ]
+    )
+
+    rm -f "$notified_flag"
+}
+
+# ---------------------------------------------------------------------------
+# OBS22-A-003 (cmd_178): once the mismatch resolves (exact agent+pane match
+# reached), the dedup flag is cleared so a FUTURE mismatch can notify again.
+# ---------------------------------------------------------------------------
+@test "OBS22-A-003: resolved pane match clears the dedup notification flag" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_obs22a003"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    touch "$notified_flag"
+
+    (
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane pgrep call → found (0): exact match already running
+        pgrep() { return 0; }
+
+        flock() { return 0; }
+        nohup() { :; }
+
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_obs22a003.log"
+
+        [ ! -f "$notified_flag" ]
+        [ ! -f "$TEST_TMP/inbox_write_calls.log" ]
+    )
+
+    rm -f "$notified_flag"
+}
+
+# ---------------------------------------------------------------------------
+# QC34-F1-001 (cmd_178 redo, gunshi QC FAIL on subtask_178_obs22_pane_notify):
+# a failing `bash scripts/inbox_write.sh ...` call must NOT abort the
+# supervisor under `set -euo pipefail` — the bare call previously let
+# errexit propagate all the way through start_watcher_if_missing's subshell
+# ( ... ) 9>"$lockfile" into start_all_watchers' loop and main's
+# `while true; do start_all_watchers; sleep 5; done`, killing the entire
+# watcher_supervisor daemon on a single notify failure. The `if`/`else`
+# wrap must swallow the failure, log a WARN, and leave the dedup flag
+# UNSET so the next 5s cycle retries the notification.
+# ---------------------------------------------------------------------------
+@test "QC34-F1-001: failing inbox_write.sh call does not abort under errexit and leaves flag unset" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_qc34f1001"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    rm -f "$notified_flag"
+
+    (
+        set -euo pipefail
+
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane pgrep call → not found (1); agent-only/stale pgrep → found (0)
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        flock() { return 0; }
+        nohup() { :; }
+
+        # Simulate inbox_write.sh failing (e.g. missing venv, network error).
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 1
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_qc34f1001.log" 2>"$TEST_TMP/warn.log"
+
+        # Reaching this line at all proves errexit did not kill the subshell.
+        echo "survived" >> "$TEST_TMP/survived.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        grep -q "failed to notify" "$TEST_TMP/warn.log"
+        [ ! -f "$notified_flag" ]
+    )
+
+    [ -f "$TEST_TMP/survived.log" ]
+    rm -f "$notified_flag"
+}
+
+# ---------------------------------------------------------------------------
+# QC34-F2-001 (cmd_178 redo, gunshi QC FAIL on subtask_178_obs22_pane_notify):
+# an empty `pgrep -af ...` match (no stale process found in the tiny window
+# between the stale-check pgrep and the actual_pane-extraction pgrep, or a
+# SIGPIPE from `| head -n1` under pipefail) must NOT abort the supervisor —
+# `actual_pane` must fall back to "不明" instead of the assignment's failure
+# propagating through errexit and killing the daemon.
+# ---------------------------------------------------------------------------
+@test "QC34-F2-001: empty pgrep match for actual_pane extraction does not abort under errexit" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_qc34f2001"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    rm -f "$notified_flag"
+
+    (
+        set -euo pipefail
+
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane check → not found (1, mismatch persists);
+        # actual_pane extraction (`pgrep -af`) → empty match (1);
+        # stale general check (`pgrep -f`, no -af) → found (0).
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 1 ;;
+                *'-af'*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        flock() { return 0; }
+        nohup() { :; }
+
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_qc34f2001.log"
+
+        # Reaching this line at all proves errexit did not kill the subshell.
+        echo "survived" >> "$TEST_TMP/survived.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        grep -q "actual_pane=不明" "$TEST_TMP/inbox_write_calls.log"
+        [ -f "$notified_flag" ]
+    )
+
+    [ -f "$TEST_TMP/survived.log" ]
+    rm -f "$notified_flag"
 }
