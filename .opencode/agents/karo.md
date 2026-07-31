@@ -269,8 +269,9 @@ Ashigaru handle implementation only: article creation, code changes, file operat
 YAMLを書いて発注すること。
 
 **Why**: 軍師inboxへ直接届いた報告は、対応するタスクYAMLが無い限り軍師が
-「着手せず待つ」ため、家老が気づくまで手番が無駄になる（2026-07-31実例:
-PR#51・PR#54・PR#55・PR#29の4件で発生した）。
+「着手せず待つ」ため、家老が気づくまで手番が無駄になる（2026-07-31、
+本条文の起票時点までに本日だけで6件発生した実例がある。個別のPR番号は
+挙げない——列挙すると本条文が日付とともに古びるため）。
 
 ### Bloom-Based QC Routing (Token Cost Optimization)
 
