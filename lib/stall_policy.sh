@@ -153,3 +153,56 @@ else:
     raise SystemExit(f"unknown baton_watchdog query: {query}")
 PY
 }
+
+# shogun_input_guard_query (cmd_182): thresholds for the shogun-pane nudge
+# defer mechanism (send_wakeup in scripts/inbox_watcher.sh). Deferring —
+# not dropping — a nudge while the lord is actively typing prevents nudge
+# text from corrupting an in-progress keystroke (the "issue 37" →
+# "inbox137" incident). Safe defaults must survive an absent config
+# section or file (cmd_163 BL-3).
+shogun_input_guard_query() {
+    local query="$1"
+    local python_bin
+    python_bin="$(stall_policy_python)"
+
+    "$python_bin" - "$STALL_POLICY_SETTINGS" "$query" <<'PY'
+import sys
+
+try:
+    import yaml
+except Exception as exc:
+    raise SystemExit(f"PyYAML is required to read shogun_input_guard: {exc}")
+
+settings_path, query = sys.argv[1], sys.argv[2]
+
+# Safe defaults (cmd_182). guard_sec=60: the practical boundary between
+# "mid-keystroke pause" and "stepped away" (see gunshi cmd_182 design
+# review). defer_ntfy_after_sec=300: only fall back to ntfy as a rare
+# insurance path if deferral drags on — never the primary delivery path.
+DEFAULT_SHOGUN_INPUT_GUARD = {
+    "shogun_input_guard_sec": 60,
+    "shogun_defer_ntfy_after_sec": 300,
+}
+
+try:
+    with open(settings_path, "r", encoding="utf-8") as fh:
+        settings = yaml.safe_load(fh) or {}
+except FileNotFoundError:
+    settings = {}
+
+policy = settings.get("shogun_input_guard")
+if not isinstance(policy, dict):
+    policy = {}
+
+def policy_get(key):
+    value = policy.get(key)
+    if value is None:
+        return DEFAULT_SHOGUN_INPUT_GUARD[key]
+    return value
+
+if query in ("shogun_input_guard_sec", "shogun_defer_ntfy_after_sec"):
+    print(int(policy_get(query)))
+else:
+    raise SystemExit(f"unknown shogun_input_guard query: {query}")
+PY
+}

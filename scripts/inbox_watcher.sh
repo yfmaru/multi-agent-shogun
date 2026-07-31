@@ -82,11 +82,19 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
     fi
 
     # Source stall_policy query lib (cmd_171). Provides stall_policy_query /
-    # baton_watchdog_query with safe defaults even when the config section
-    # (or config/settings.yaml itself) is absent.
+    # baton_watchdog_query / shogun_input_guard_query with safe defaults
+    # even when the config section (or config/settings.yaml itself) is absent.
     _stall_policy_lib="${SCRIPT_DIR}/lib/stall_policy.sh"
     if [ -f "$_stall_policy_lib" ]; then
         source "$_stall_policy_lib"
+    fi
+
+    # Source branch_policy lib (cmd_182). Provides branch_policy_notify(),
+    # used as a failure-tolerant insurance ntfy when a shogun nudge stays
+    # deferred (human_typing_recently) past shogun_defer_ntfy_after_sec.
+    _branch_policy_lib="${SCRIPT_DIR}/lib/branch_policy.sh"
+    if [ -f "$_branch_policy_lib" ]; then
+        source "$_branch_policy_lib"
     fi
 
     # Detect OS and select file-watching backend
@@ -948,6 +956,39 @@ session_has_client() {
     [ -n "$session_name" ] && [ "$(tmux list-clients -t "$session_name" 2>/dev/null | wc -l)" -gt 0 ]
 }
 
+# ─── Human input-guard detection (cmd_182) ───
+# Function: client_last_activity_epoch
+# Description: Returns the newest #{client_activity} (epoch seconds) among all
+#   tmux clients attached to the session containing PANE_TARGET. This measures
+#   "how recently a human touched the keyboard", not "is a terminal open"
+#   (session_has_client / pane_is_active answer the latter and are always true
+#   for a single-pane session like shogun — see gunshi cmd_182 verification).
+#   If no client is attached, prints nothing (empty string).
+# Arguments: none (uses global PANE_TARGET)
+# Returns: always 0. Newest client_activity epoch on stdout, or empty.
+client_last_activity_epoch() {
+    local session_name
+    session_name=$(timeout 2 tmux display-message -p -t "$PANE_TARGET" '#{session_name}' 2>/dev/null || true)
+    [ -n "$session_name" ] || return 0
+    timeout 2 tmux list-clients -t "$session_name" -F '#{client_activity}' 2>/dev/null | sort -n | tail -1
+}
+
+# Function: human_typing_recently
+# Description: True if a client attached to PANE_TARGET's session has been
+#   active within the last shogun_input_guard_sec seconds. Used to defer
+#   (not drop) shogun nudges so they never interrupt an in-progress keystroke
+#   (cmd_182 — "issue 37" corrupted into "inbox137" by a mid-line nudge).
+# Returns: 0 if a client was active within the guard window, 1 otherwise
+#   (including when no client is attached at all).
+human_typing_recently() {
+    local guard newest now
+    guard=$(shogun_input_guard_query shogun_input_guard_sec 2>/dev/null) || guard=60
+    newest=$(client_last_activity_epoch)
+    [ -n "$newest" ] || return 1
+    now=$(date +%s)
+    [ "$((now - newest))" -lt "$guard" ]
+}
+
 # ─── Send wake-up nudge ───
 # Layered approach:
 #   1. If agent has active inotifywait self-watch → skip (agent wakes itself)
@@ -968,7 +1009,27 @@ send_wakeup() {
         return 0
     fi
 
-    # 優先度2: Agent busy — nudge送信するとEnterが消失するためスキップ
+    # 優先度2 (cmd_182): shogun + 主が直近打鍵中 — send-keysで割り込むと
+    # 入力行が壊れる（"issue 37"→"inbox137"の実例）。破棄ではなく延期。
+    # 未読はここでは消えないため、次サイクルで再評価され、guard秒経てば
+    # 通常どおりsend-keysで届く。agent_is_busy判定より前に置くこと
+    # （shogunのbusy例外を温存しつつ、それより先に人間打鍵を検知するため）。
+    if [ "$AGENT_ID" = "shogun" ] && human_typing_recently; then
+        echo "[$(date)] [DEFER] shogun: 主の打鍵を検知。send-keysを延期しdisplay-messageで通知" >&2
+        timeout 2 tmux display-message -t "$PANE_TARGET" "$nudge" 2>/dev/null || true
+        local defer_ntfy_after
+        defer_ntfy_after=$(shogun_input_guard_query shogun_defer_ntfy_after_sec 2>/dev/null) || defer_ntfy_after=300
+        if [ -n "${FIRST_UNREAD_SEEN:-0}" ] && [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ]; then
+            local defer_elapsed
+            defer_elapsed=$(( $(date +%s) - FIRST_UNREAD_SEEN ))
+            if [ "$defer_elapsed" -ge "$defer_ntfy_after" ]; then
+                type branch_policy_notify &>/dev/null && branch_policy_notify "shogun宛の通知が${defer_elapsed}秒延期中(打鍵検知)" 2>/dev/null || true
+            fi
+        fi
+        return 0     # 破棄ではない。未読は残り、次サイクルで再評価される
+    fi
+
+    # 優先度3: Agent busy — nudge送信するとEnterが消失するためスキップ
     # Claude Code: Stop hook catches unread at turn end. Skip nudge to avoid Enter loss.
     # Exception: shogun — ntfy must be delivered immediately regardless of busy state.
     if agent_is_busy && [[ "$AGENT_ID" != "shogun" ]]; then
@@ -1567,4 +1628,11 @@ fi
 _stall_policy_lib="${SCRIPT_DIR}/lib/stall_policy.sh"
 if [ -f "$_stall_policy_lib" ] && ! type stall_policy_query &>/dev/null; then
     source "$_stall_policy_lib"
+fi
+
+# Same double-source guard for branch_policy_notify() (cmd_182), so it is
+# available in test mode too.
+_branch_policy_lib="${SCRIPT_DIR}/lib/branch_policy.sh"
+if [ -f "$_branch_policy_lib" ] && ! type branch_policy_notify &>/dev/null; then
+    source "$_branch_policy_lib"
 fi

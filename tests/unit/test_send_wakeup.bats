@@ -44,6 +44,11 @@
 #   T-SHOGUN-003: send_wakeup — shogun + active + attached → send-keys (post PR#75)
 #   T-SHOGUN-004: send_wakeup — shogun + active + detached → send-keys fallthrough
 #   T-SHOGUN-005: shogun clear_command does not enqueue auto-recovery
+#   T-SHOGUN-006: send_wakeup — shogun + client typed 5s ago → defer (display-message, no send-keys) (cmd_182)
+#   T-SHOGUN-007: send_wakeup — deferral is not a drop; guard-window elapses → send-keys fires (cmd_182, MUST)
+#   T-SHOGUN-008: send_wakeup — client attached but activity old → send-keys fires (ntfy reply path, PR#75 non-regression, cmd_182, MUST)
+#   T-SHOGUN-009: send_wakeup — non-shogun agent unaffected by recent typing (cmd_182)
+#   T-SHOGUN-010: send_wakeup — no client at all → human_typing_recently false → send-keys fires (cmd_182)
 #   T-BUSY-005: agent_is_busy — returns busy during /clear cooldown (LAST_CLEAR_TS)
 #   T-BUSY-006: agent_is_busy — returns idle after /clear cooldown expires
 #   T-BUSY-007: agent_is_busy — /clear cooldown overrides idle pane
@@ -101,6 +106,7 @@ MOCK
     export MOCK_PANE_CLI=""
     export MOCK_PANE_ACTIVE=""
     export MOCK_LIST_CLIENTS=""
+    export MOCK_CLIENT_ACTIVITY=""
 
     # Test harness: sets up mocks, then sources the REAL inbox_watcher.sh
     # __INBOX_WATCHER_TESTING__=1 skips arg parsing, inotifywait check, and main loop.
@@ -132,6 +138,13 @@ tmux() {
         return 0
     fi
     if echo "\$*" | grep -q "list-clients"; then
+        if echo "\$*" | grep -q "client_activity"; then
+            # cmd_182: client_last_activity_epoch() query — distinct control
+            # variable from MOCK_LIST_CLIENTS (attach-count format) so tests
+            # can set "recent"/"old"/absent independently of attach state.
+            [ -n "\${MOCK_CLIENT_ACTIVITY:-}" ] && echo "\$MOCK_CLIENT_ACTIVITY"
+            return 0
+        fi
         [ -n "\${MOCK_LIST_CLIENTS:-}" ] && echo "\$MOCK_LIST_CLIENTS"
         return 0
     fi
@@ -975,6 +988,7 @@ YAML
     run bash -c '
         MOCK_PANE_ACTIVE="1"
         MOCK_LIST_CLIENTS="/dev/pts/1: mock_session [200x50 xterm-256color]"
+        MOCK_CLIENT_ACTIVITY="100"  # cmd_182: client_activity is sufficiently old (1970) — not typing recently
         source "'"$TEST_HARNESS"'"
         AGENT_ID="shogun"
         send_wakeup 2
@@ -991,6 +1005,7 @@ YAML
     run bash -c '
         MOCK_PANE_ACTIVE="1"
         MOCK_LIST_CLIENTS=""
+        MOCK_CLIENT_ACTIVITY="100"  # cmd_182: client_activity is sufficiently old (1970) — not typing recently
         source "'"$TEST_HARNESS"'"
         AGENT_ID="shogun"
         send_wakeup 2
@@ -1002,6 +1017,106 @@ YAML
 
     # Should have used send-keys
     grep -q "send-keys.*inbox2" "$MOCK_LOG"
+}
+
+# --- T-SHOGUN-006: shogun typed recently → defer (display-message, no send-keys) ---
+
+@test "T-SHOGUN-006: send_wakeup defers to display-message when shogun typed 5s ago" {
+    run bash -c '
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    # Direction A stays closed: no send-keys with the nudge text
+    ! grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    # Notification still surfaces via display-message (no keystrokes, status line only)
+    grep -q "display-message.*inbox2" "$MOCK_LOG"
+    echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-007 (MUST): deferral is not a drop — guard window elapses → send-keys fires ---
+# Fixes the specific regression risk: "defer" silently degrading into "drop".
+
+@test "T-SHOGUN-007: send_wakeup deferral is not a drop — send-keys fires once guard window elapses" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"   # typed 5s ago → defer
+        send_wakeup 2
+
+        echo "=== SPLIT_MARKER ===" >> "'"$MOCK_LOG"'"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 120 ))"  # guard (60s) has elapsed → deliver
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    local before after
+    before="$(sed -n "1,/SPLIT_MARKER/p" "$MOCK_LOG")"
+    after="$(sed -n "/SPLIT_MARKER/,\$p" "$MOCK_LOG")"
+
+    # Before the guard window elapsed: deferred, no send-keys yet
+    ! echo "$before" | grep -q "send-keys.*inbox2"
+    echo "$before" | grep -q "display-message.*inbox2"
+
+    # After the guard window elapsed: the SAME still-unread nudge is now delivered —
+    # this is the one assertion that pins "deferred" apart from "dropped"
+    echo "$after" | grep -q "send-keys.*inbox2"
+}
+
+# --- T-SHOGUN-008 (MUST): client attached but activity old → send-keys fires (ntfy reply path) ---
+# Fixes the PR#75 regression the original (rejected) design would have reintroduced:
+# an attached-but-idle terminal (lord replying via ntfy from his phone) must still be
+# reachable via send-keys — attach state alone must never suppress delivery.
+
+@test "T-SHOGUN-008: send_wakeup delivers via send-keys when client attached but idle (ntfy reply path)" {
+    run bash -c '
+        MOCK_LIST_CLIENTS="/dev/pts/1: mock_session [200x50 xterm-256color]"
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 1200 ))"  # attached, but no keystroke in 20 minutes
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    ! echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-009: non-shogun agent unaffected by recent client activity ---
+
+@test "T-SHOGUN-009: send_wakeup for non-shogun agent ignores recent client activity" {
+    run bash -c '
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="ashigaru3"
+        touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_ashigaru3"  # match agent_is_busy() idle-flag lookup for the overridden AGENT_ID
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    ! echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-010: no client at all → human_typing_recently is false → send-keys fires ---
+
+@test "T-SHOGUN-010: send_wakeup delivers via send-keys when no client is attached at all" {
+    run bash -c '
+        MOCK_LIST_CLIENTS=""
+        MOCK_CLIENT_ACTIVITY=""
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    ! echo "$output" | grep -q "DEFER"
 }
 
 # --- T-BUSY-005: agent_is_busy during /clear cooldown ---
