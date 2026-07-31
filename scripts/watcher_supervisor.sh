@@ -57,9 +57,12 @@ start_watcher_if_missing() {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] stale watcher detected for ${agent} (pane mismatch with expected ${pane}); not starting a new one to avoid duplicates. Resolve pane mismatch manually." >&2
             if [ ! -f "$notified_flag" ]; then
                 local actual_pane
-                actual_pane=$(pgrep -af "scripts/inbox_watcher.sh ${agent} " 2>/dev/null | head -n1 | awk '{print $5}')
-                bash scripts/inbox_write.sh shogun "pane不一致検知: agent=${agent} expected_pane=${pane} actual_pane=${actual_pane:-不明}。inbox_watcherが期待と異なるpaneで稼働中の可能性。要確認。" watcher_alert watcher_supervisor
-                touch "$notified_flag"
+                actual_pane=$(pgrep -af "scripts/inbox_watcher.sh ${agent} " 2>/dev/null | head -n1 | awk '{print $5}') || true
+                if bash scripts/inbox_write.sh shogun "pane不一致検知: agent=${agent} expected_pane=${pane} actual_pane=${actual_pane:-不明}。inbox_watcherが期待と異なるpaneで稼働中の可能性。要確認。" watcher_alert watcher_supervisor; then
+                    touch "$notified_flag"
+                else
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] failed to notify shogun of pane mismatch for ${agent}" >&2
+                fi
             fi
             return 0
         fi

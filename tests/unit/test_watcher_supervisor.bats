@@ -12,6 +12,9 @@
 #   TC-DEDUP-001..003: agent/pane match combinations do not start duplicates
 #   OBS22-A-001..003 (cmd_178): stale-watcher WARN escalates to a shogun inbox
 #     notification, guarded by a per-agent dedup flag that clears on resolution
+#   QC34-F1-001, QC34-F2-001 (cmd_178 redo): failing inbox_write.sh call and
+#     empty pgrep match for actual_pane extraction must not abort the daemon
+#     under set -euo pipefail (gunshi QC FAIL findings, see gunshi_qc_178_obs22.yaml)
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 SUPERVISOR_SCRIPT="$PROJECT_ROOT/scripts/watcher_supervisor.sh"
@@ -545,5 +548,126 @@ source_supervisor_functions() {
         [ ! -f "$TEST_TMP/inbox_write_calls.log" ]
     )
 
+    rm -f "$notified_flag"
+}
+
+# ---------------------------------------------------------------------------
+# QC34-F1-001 (cmd_178 redo, gunshi QC FAIL on subtask_178_obs22_pane_notify):
+# a failing `bash scripts/inbox_write.sh ...` call must NOT abort the
+# supervisor under `set -euo pipefail` — the bare call previously let
+# errexit propagate all the way through start_watcher_if_missing's subshell
+# ( ... ) 9>"$lockfile" into start_all_watchers' loop and main's
+# `while true; do start_all_watchers; sleep 5; done`, killing the entire
+# watcher_supervisor daemon on a single notify failure. The `if`/`else`
+# wrap must swallow the failure, log a WARN, and leave the dedup flag
+# UNSET so the next 5s cycle retries the notification.
+# ---------------------------------------------------------------------------
+@test "QC34-F1-001: failing inbox_write.sh call does not abort under errexit and leaves flag unset" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_qc34f1001"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    rm -f "$notified_flag"
+
+    (
+        set -euo pipefail
+
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane pgrep call → not found (1); agent-only/stale pgrep → found (0)
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        flock() { return 0; }
+        nohup() { :; }
+
+        # Simulate inbox_write.sh failing (e.g. missing venv, network error).
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 1
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_qc34f1001.log" 2>"$TEST_TMP/warn.log"
+
+        # Reaching this line at all proves errexit did not kill the subshell.
+        echo "survived" >> "$TEST_TMP/survived.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        grep -q "failed to notify" "$TEST_TMP/warn.log"
+        [ ! -f "$notified_flag" ]
+    )
+
+    [ -f "$TEST_TMP/survived.log" ]
+    rm -f "$notified_flag"
+}
+
+# ---------------------------------------------------------------------------
+# QC34-F2-001 (cmd_178 redo, gunshi QC FAIL on subtask_178_obs22_pane_notify):
+# an empty `pgrep -af ...` match (no stale process found in the tiny window
+# between the stale-check pgrep and the actual_pane-extraction pgrep, or a
+# SIGPIPE from `| head -n1` under pipefail) must NOT abort the supervisor —
+# `actual_pane` must fall back to "不明" instead of the assignment's failure
+# propagating through errexit and killing the daemon.
+# ---------------------------------------------------------------------------
+@test "QC34-F2-001: empty pgrep match for actual_pane extraction does not abort under errexit" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_qc34f2001"
+    local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    rm -f "$notified_flag"
+
+    (
+        set -euo pipefail
+
+        pane_exists() { return 0; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        # correct-pane check → not found (1, mismatch persists);
+        # actual_pane extraction (`pgrep -af`) → empty match (1);
+        # stale general check (`pgrep -f`, no -af) → found (0).
+        pgrep() {
+            case "$*" in
+                *'( |$)'*) return 1 ;;
+                *'-af'*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        flock() { return 0; }
+        nohup() { :; }
+
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_qc34f2001.log"
+
+        # Reaching this line at all proves errexit did not kill the subshell.
+        echo "survived" >> "$TEST_TMP/survived.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        grep -q "actual_pane=不明" "$TEST_TMP/inbox_write_calls.log"
+        [ -f "$notified_flag" ]
+    )
+
+    [ -f "$TEST_TMP/survived.log" ]
     rm -f "$notified_flag"
 }
