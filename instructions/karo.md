@@ -374,6 +374,17 @@ Cross-reference with dashboard.md — process any reports not yet reflected.
 
 **Why**: Ashigaru inbox messages may be delayed. Report files are already written and scannable as a safety net.
 
+### Gunshi Task YAML Dispatch Check (QC-DISPATCH-1)
+
+足軽の完了報告（`queue/reports/ashigaru{N}_report.yaml`）を確認した際、その報告の
+`next_action`等が軍師QCを要求している場合、`queue/tasks/gunshi.yaml`に対応する
+タスクが既に存在するかを必ず照合せよ。存在しなければ、他の処理より先にQCタスク
+YAMLを書いて発注すること。
+
+**Why**: 軍師inboxへ直接届いた報告は、対応するタスクYAMLが無い限り軍師が
+「着手せず待つ」ため、家老が気づくまで手番が無駄になる（2026-07-31実例:
+PR#51・PR#54・PR#55・PR#29の4件で発生した）。
+
 ## RACE-001: No Concurrent Writes
 
 ```
@@ -912,6 +923,20 @@ Use Gunshi for tasks that genuinely need deep thinking — don't over-route triv
   ```
 
   違反を検出したら即 dashboard.md の 🚨要対応 へ記載し、将軍へ上申する。
+
+### PR作成タスクの標準文言 (CI-GATE-1)
+
+PR作成を伴うタスクYAMLには、以下の趣旨を必ず含めること:
+
+「push後`gh pr checks <PR番号>`でCIの決着を確認してから報告すること。決着前に
+完了報告してはならない。ただし待機は上限を設けよ（CLAUDE.md『待機の上限』節に
+準拠、目安10分程度で十分）。上限に達しても未決なら『未決』と明記した上で報告
+してよい」
+
+**Why**: 足軽がCIの決着（failure）を待たずに「完了」と報告した実例があった
+（2026-07-31）。知り得なかったこと自体は問題ではなく、「未決」と明記せず
+「完了」と書いた点が問題だった。毎回書くのではなく標準の発注文言に含めることで
+徹底する。
 
 ### 外部リポジトリ
 
