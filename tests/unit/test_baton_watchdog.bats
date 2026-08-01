@@ -507,10 +507,14 @@ YAML
     # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
     # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: baton_watchdog（本番同等・機械の書き手の例。QC45-F1是正:
+    # list_stale_inbox_agentsの検知経路であるD-1はfromを問わず発火せねば
+    # ならぬことを、本番と同型のfixtureで確かめる）。
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: baton_watchdog
     timestamp: '${stale_ts}'
 YAML
 
@@ -565,10 +569,12 @@ YAML
     # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
     # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: watcher_supervisor（本番同等・機械の書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: watcher_supervisor
     timestamp: '${stale_ts}'
 YAML
 
@@ -591,10 +597,12 @@ YAML
     # `date "+%Y-%m-%dT%H:%M:%S"` でローカル時刻・naiveの文字列を書く
     # （QC-70：フィクスチャがUTCを書くと本番と乖離し欠陥を見逃す）。
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: ashigaru2（本番同等・エージェントの書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: ashigaru2
     timestamp: '${stale_ts}'
 YAML
 
@@ -678,10 +686,13 @@ YAML
 @test "TC-D1-LATCH-001: D-1 writes to karo (not shogun) when shogun alone is the dead-stale target, and shogun's unread count does not increase" {
     local stale_ts before_count after_count
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: baton_watchdog（本番同等・機械の書き手の例。将軍inboxへの
+    # auto-recovery通知等はまさにこの経路で書かれる）。
     cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: baton_watchdog
     timestamp: '${stale_ts}'
 YAML
     before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
@@ -703,16 +714,20 @@ YAML
 @test "TC-D1-LATCH-002: D-1 writes to karo (not shogun) when shogun is dead-stale together with another agent, and shogun's unread count does not increase" {
     local stale_ts before_count after_count
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # shogun側はfrom: watcher_supervisor（機械）、ashigaru3側はfrom: gunshi
+    # （エージェント）——本番同等のfromを両様含める。
     cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: watcher_supervisor
     timestamp: '${stale_ts}'
 YAML
     cat > "$FIXTURE_ROOT/queue/inbox/ashigaru3.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: gunshi
     timestamp: '${stale_ts}'
 YAML
     before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
@@ -1294,10 +1309,12 @@ YAML
 @test "TC-B4C-EXCL-001: D-1 fires and B-4c stays silent for the same dead-watcher stale inbox" {
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: baton_watchdog（本番同等・機械の書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: baton_watchdog
     timestamp: '${stale_ts}'
 YAML
 
@@ -1317,10 +1334,12 @@ YAML
 @test "TC-B4C-EXCL-002: B-4c fires and D-1 stays silent for the same live-watcher stale inbox" {
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: watcher_supervisor（本番同等・機械の書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: watcher_supervisor
     timestamp: '${stale_ts}'
 YAML
 
@@ -1342,10 +1361,12 @@ YAML
 @test "TC-B4C-EXCL-003: flipping pgrep from dead to alive between the D-1 and B-4c calls still yields exactly one notification (frozen snapshot)" {
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: ashigaru5（本番同等・エージェントの書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: ashigaru5
     timestamp: '${stale_ts}'
 YAML
 
@@ -1369,10 +1390,12 @@ YAML
 @test "TC-B4C-LATCH-001: B-4c never writes to shogun's own inbox when shogun is the diagnosed target (self-feeding latch prevention)" {
     local stale_ts before_count after_count
     stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: baton_watchdog（本番同等・機械の書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: baton_watchdog
     timestamp: '${stale_ts}'
 YAML
     before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
@@ -1397,10 +1420,12 @@ YAML
 @test "TC-B4C-LATCH-002: guard resets once shogun's stale message is read, then re-fires on a renewed stall" {
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: watcher_supervisor（本番同等・機械の書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: watcher_supervisor
     timestamp: '${stale_ts}'
 YAML
 
@@ -1431,10 +1456,12 @@ YAML
     write_settings true 5 60 "" "" "" "" 5   # baton_b4c_stale_after_sec=5
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 10 ))" +"%Y-%m-%dT%H:%M:%S")
+    # from: inbox_watcher（本番同等・機械の書き手の例）
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
+    from: inbox_watcher
     timestamp: '${stale_ts}'
 YAML
 
@@ -2001,8 +2028,9 @@ YAML
 #                   書き込んでもno_progress判定が変わらないことを固定
 #   TC-SF2-001〜004: SF-2（軍師の4通り比較と同型）。from=inbox_watcherが
 #                    本欠陥の直接固定である
-#   TC-SF3-001: SF-3。list_stale_inbox_agentsがcount_unreadと同じ
-#               除外規律を持つことを固定
+#   TC-SF3-001: SF-3是正（QC45-F1）。count_unreadは機械を除外し、
+#               list_stale_inbox_agentsは除外しない——これは意図であり、
+#               問いが違うためであることを固定
 #   TC-ALLOWLIST-001: allowlist方式の要。実在しない架空の機械名でも
 #                      エージェント一覧に無い限り自動的に除外される
 # ═══════════════════════════════════════════════════════════════
@@ -2149,9 +2177,9 @@ YAML
     grep -q "baton_lost" "$SHOGUN_NOTIFY_LOG" || { echo "SF-2 regression: inbox_watcher's write silenced whole-formation baton_lost detection"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
 
-# --- TC-SF3-001: SF-3回帰。list_stale_inbox_agentsがcount_unreadと同じ除外規律を持つ ---
+# --- TC-SF3-001: SF-3是正（QC45-F1）。count_unreadは機械を除外し、list_stale_inbox_agentsは除外しない ---
 
-@test "TC-SF3-001: list_stale_inbox_agents applies the same allowlist exclusion as count_unread (D-1/B-4c vs B-1 parity)" {
+@test "TC-SF3-001: count_unread excludes a machine sender but list_stale_inbox_agents does not (different questions, different rules by design)" {
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
     cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
@@ -2168,10 +2196,13 @@ YAML
         echo \"unread=\$(baton_watchdog_count_unread)\"
     "
     [ "$status" -eq 0 ]
-    # 是正前は list_stale_inbox_agents に除外処理が無く karo が
-    # stale として挙がっていた（count_unread は既に除外していた）。
-    [[ "$output" == *"stale_agents=[]"* ]] || { echo "SF-3 regression: list_stale_inbox_agents did not exclude a machine sender"; echo "$output"; false; }
-    [[ "$output" == *"unread=0"* ]] || { echo "$output"; false; }
+    # count_unreadが問うのは「誰かがバトンを保持しておるか」——機械の
+    # 書き込みは保持の証拠ではないため除外が正しい（unread=0のまま）。
+    # list_stale_inbox_agentsが問うのは「このinboxは読まれずに滞留して
+    # おるか」——書き手が誰かは無関係。machine由来のauto-recovery通知も
+    # 当人が読むべき未読ゆえ、karoがstaleとして挙がる（QC45-F1是正）。
+    [[ "$output" == *"stale_agents=[karo,]"* ]] || { echo "QC45-F1 regression: list_stale_inbox_agents wrongly excluded a machine sender"; echo "$output"; false; }
+    [[ "$output" == *"unread=0"* ]] || { echo "count_unread regression: machine sender should still be excluded here"; echo "$output"; false; }
 }
 
 # --- TC-ALLOWLIST-001: allowlist方式の要。架空の機械名でも自動的に除外される ---

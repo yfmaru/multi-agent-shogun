@@ -454,20 +454,28 @@ BATON_D1_NTFY_NOTIFIED=0         # 副経路（ntfy）の二重通知防止ガ�
 # 読むのは queue/inbox/*.yaml のみ。tmux には一切触れない（TC-D1-005）。
 baton_watchdog_list_stale_inbox_agents() {
     local threshold="${1:-$BATON_D1_STALE_AFTER_SEC}"
-    local python_bin allowed_agents
+    local python_bin
     python_bin="$(stall_policy_python)"
-    allowed_agents="$(agent_registry_agents_joined ",")"
-    "$python_bin" - "$ROOT" "$threshold" "$allowed_agents" <<'PY'
+    "$python_bin" - "$ROOT" "$threshold" <<'PY'
 import glob
 import os
 import sys
 from datetime import datetime, timezone
 
 root, threshold = sys.argv[1], int(sys.argv[2])
-# baton_watchdog_count_unread と同じ allowlist 規律（cmd_187/SF-3是正）。
-# 以前はこの関数だけ除外処理が無く、count_unread との間で規律が
-# 食い違っていた。
-ALLOWED = set(a for a in sys.argv[3].split(",") if a) if len(sys.argv) > 3 else set()
+# この関数は count_unread とは異なり allowlist フィルタを適用しない
+# （cmd_187/QC45-F1是正）。count_unread が問うのは「誰かがバトンを
+# 保持しておるか」——機械の書き込みは保持の証拠ではないため除外が
+# 正しい。list_stale_inbox_agents が問うのは「この inbox は読まれずに
+# 滞留しておるか」——この問いにとって書き手が誰かは無関係。機械が
+# 書いた auto-recovery 通知も、当人が読むべき未読である。
+#
+# ── 未読を数える3関数の問いと規律（対応表） ──────────────
+#   関数                              | 問い                      | 機械書き手
+#   baton_watchdog_count_unread       | 誰かがバトンを保持中か      | 除外する
+#   baton_watchdog_list_stale_inbox_agents | inboxが滞留しているか  | 除外しない
+#   periodic_clear_count_unread       | inboxに未読が残っているか  | 除外しない
+# ─────────────────────────────────────────────────────
 
 try:
     import yaml
@@ -509,9 +517,6 @@ for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
         if not isinstance(msg, dict):
             continue
         if msg.get("read") is not False:
-            continue
-        sender = msg.get("from")
-        if sender is not None and sender not in ALLOWED:
             continue
         dt = parse_ts(msg.get("timestamp"))
         if dt is None:
