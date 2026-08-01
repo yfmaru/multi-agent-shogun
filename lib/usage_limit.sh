@@ -113,8 +113,14 @@ def _epoch(s):
     if not isinstance(s, str) or not s:
         return ''
     try:
-        return str(int(datetime.fromisoformat(
-            s.replace('Z', '+00:00')).timestamp()))
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        # OBS-181-9: fromisoformat silently accepts an offset-less string as
+        # naive, and .timestamp() then interprets it in the LOCAL timezone --
+        # a 9h JST landmine if the API ever drops the +00:00 suffix. Refuse
+        # to guess; treat it the same as an unparseable value.
+        if dt.tzinfo is None:
+            return ''
+        return str(int(dt.timestamp()))
     except Exception:
         return ''
 

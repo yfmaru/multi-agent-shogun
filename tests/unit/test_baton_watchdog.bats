@@ -1507,12 +1507,27 @@ YAML
 #
 # TC-USAGE-WARN-001〜004: 三方への予告・重複防止・枠変化での再発火・
 #                         7日枠は家老へ出ない
-# TC-USAGE-TZ-001〜002:   UTC変換の固定・不正値での空文字フォールバック
+# TC-USAGE-TZ-001〜003:   UTC変換の固定・不正値での空文字フォールバック・
+#                         offset無しnaive文字列での空文字フォールバック
+#                         （TZ-003=OBS-181-9回帰）
 # TC-USAGE-RESUME-001〜005: 正常再開・空振り防止各パターン・同一枠での重複防止
 # TC-USAGE-FETCH-001:     API取得失敗時は何もしない
 # TC-USAGE-TMUX-001:      tmux不使用
 # TC-USAGE-FROM-001:      from=baton_watchdog固定（cmd_180結線）
 # TC-USAGE-ISOLATION-001: 他4関数の状態に影響しない
+#
+# 【cmd_183・軍師QC(gunshi_qc_181_pr41.yaml)発見の追随修正4件】
+#   TC-USAGE-RESUME-006:     OBS-181-6回帰。予告がkaro自身のinboxを実際に
+#                            書き換えても（実物のscripts/inbox_write.sh経由）、
+#                            それを「karoの進捗」と誤認して再開が空振りに
+#                            消えないこと（自己給餌防止。cmd_180 OBS-180-1
+#                            と同型の欠陥、本システムで3度目）
+#   TC-USAGE-RESUME-FLAG-001: finding_3回帰。LIMITS_FLAGGEDがtrue→falseへ
+#                            遷移すれば、reset epochが不変（契約変更等・
+#                            枠の巻き直りを伴わない解除）でも再開が発火する
+#   TC-USAGE-RESUME-7D-001:  OBS-181-7回帰。7日枠の巻き直りによる再開号令も
+#                            5時間枠と同様に家老へ届く（従来コメントの
+#                            「5時間枠のみ」という記述は誤りだった）
 # ═══════════════════════════════════════════════════════════════
 
 # --- TC-USAGE-WARN-001: 三方（将軍inbox・家老inbox・ntfy）への予告 ---
@@ -1839,4 +1854,133 @@ YAML
     [ "$status" -eq 0 ] || { echo "$output"; false; }
     count=$(grep -c "baton_lost" "$SHOGUN_NOTIFY_LOG")
     [ "$count" -eq 1 ] || { echo "expected exactly 1 baton_lost notification (BATON_NOTIFIED must survive an interleaved check_usage_once call), got $count:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-RESUME-006【OBS-181-6回帰・実ファイル書き込み】予告がkaro自身の
+#     inboxを実際に書き換えても、それを「karoの進捗」と誤認して再開が
+#     空振りに消えないこと ---
+#
+# setup()が置く既定のinbox_write.shスタブはログへ1行echoするだけで
+# queue/inbox/*.yamlを一切書かないため、予告がkaro自身のinbox mtimeを
+# 押し上げる本番挙動（自己給餌の引き金）がそのままでは再現できない。
+# このテストに限りTC-D1-008と同じ様式（実物cp + .venvシンボリック
+# リンク）でスタブを実物へ差し替える。
+
+@test "TC-USAGE-RESUME-006: karo's own advance-notice inbox write does not self-feed and silently swallow the resume order (OBS-181-6, real inbox_write.sh)" {
+    cp "$PROJECT_ROOT/scripts/inbox_write.sh" "$FIXTURE_ROOT/scripts/inbox_write.sh"
+    ln -s "$PROJECT_ROOT/.venv" "$FIXTURE_ROOT/.venv"
+
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    # karoにtask YAMLが存在する状態を再現する（本番で偶然存在しない
+    # ために発症していないだけ、という設計上の欠陥そのもの）。
+    cat > "$FIXTURE_ROOT/queue/tasks/karo.yaml" << 'YAML'
+task:
+  task_id: subtask_karo_baseline
+  status: assigned
+YAML
+    sleep 1  # setup()が置いた各progress artifactのmtimeがUSAGE_WARNED_ATより前になるよう猶予
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 90, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 20, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    # 予告がkaroのinboxへ実際に届いていること（自己給餌の引き金となる書き込み自体は発生する）
+    grep -q "usage_warn" "$FIXTURE_ROOT/queue/inbox/karo.yaml" || { echo "expected the usage_warn advance notice to actually land in karo's real inbox:"; cat "$FIXTURE_ROOT/queue/inbox/karo.yaml"; false; }
+    # 【本題】それでもなお再開号令が消えていないこと（是正前はここが0件に消えていた）
+    grep -q "usage_resume" "$FIXTURE_ROOT/queue/inbox/karo.yaml" || { echo "usage_resume order missing from karo's real inbox -- OBS-181-6 self-feed regression:"; cat "$FIXTURE_ROOT/queue/inbox/karo.yaml"; false; }
+}
+
+# --- TC-USAGE-RESUME-FLAG-001【finding_3回帰】LIMITS_FLAGGEDのtrue→false遷移は、
+#     reset epochが不変（契約変更等・枠の巻き直りを伴わない解除）でも再開を発火する ---
+#
+# 本日実データの形（gunshi_qc_181_pr41.yaml finding_3）: 17:05時点→21:10時点で
+# 7D_RESETは不変(08-05→08-05)のままLIMITS_FLAGGEDがtrue→falseへ遷移した。
+# cmd_181の再開関門「reset epochが変わること」単独ではこの解除を検知できない。
+
+@test "TC-USAGE-RESUME-FLAG-001: a LIMITS_FLAGGED true->false transition fires resume even when the reset epoch is unchanged (finding_3, contract-change shape)" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    sleep 1
+
+    local json1 json2
+    # 5時間枠は無関係に保つ（util常に警告閾値未満・reset epoch不変）。
+    # 7日枠のみ: reset epoch不変のままlimits[]がflagged→非flaggedへ遷移。
+    json1='{"five_hour": {"utilization": 10, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 90, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": [{"is_active": true, "severity": "critical"}]}'
+    json2='{"five_hour": {"utilization": 10, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 20, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    grep -q "INBOX_WRITE: karo.*usage_resume.*window=7d" "$SHOGUN_NOTIFY_LOG" || { echo "expected a 7d resume order despite an unchanged reset epoch (contract-change path, finding_3):"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-RESUME-7D-001【OBS-181-7回帰】7日枠の巻き直りによる再開号令も家老へ届く ---
+#
+# 従来のコメントは「再開はこの(5時間)枠のみ」と書いていたが、実装
+# （_usage_window_checkの(c)節）はnotify_karoで門を設けておらず、
+# 7日枠の巻き直りでも家老へ再開号令が届く。これはコメントの誤りであり、
+# 実装側が正しい（現状、7日枠の巻き直りで家老を起こす経路はこれ1本
+# しか無いため）。本テストはその正しい挙動を固定する。
+
+@test "TC-USAGE-RESUME-7D-001: a 7-day window resume order reaches karo inbox too, not just the 5-hour window (OBS-181-7)" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    sleep 1
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 10, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 90, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 10, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 20, "resets_at": "2026-08-12T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    grep -q "INBOX_WRITE: karo.*usage_resume.*window=7d" "$SHOGUN_NOTIFY_LOG" || { echo "expected the 7d resume order to reach karo inbox (comment previously claimed 5h-only, but the implementation never actually gated this):"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-TZ-003【OBS-181-9回帰】offsetの無いnaive文字列は空文字にフォールバックする ---
+#
+# datetime.fromisoformatはoffsetの無い文字列をnaiveとして受理し、
+# .timestamp()はそれをローカル時刻として解釈してしまう。APIがoffsetを
+# 落とした値を返した場合、例外にならず9時間ずれたepochを返す
+# （cmd_181が塞いだ罠が取得側の仕様変更ひとつで裏口から戻る形）。
+
+@test "TC-USAGE-TZ-003: an offset-less (naive) resets_at yields an empty EPOCH instead of silently misinterpreting it as local time (OBS-181-9)" {
+    write_usage_response 84 "2026-07-31T23:10:00" 85 "2026-08-05T07:00:00"
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        bash -c "source '$PROJECT_ROOT/lib/usage_limit.sh'; usage_limit_fetch_raw"
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    printf '%s\n' "$output" | grep -qx '5H_RESET_EPOCH=' || { echo "expected empty 5H_RESET_EPOCH for an offset-less resets_at string, got:"; echo "$output"; false; }
+    printf '%s\n' "$output" | grep -qx '7D_RESET_EPOCH=' || { echo "expected empty 7D_RESET_EPOCH for an offset-less resets_at string, got:"; echo "$output"; false; }
 }
