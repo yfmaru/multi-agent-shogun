@@ -44,6 +44,13 @@
 #   T-SHOGUN-003: send_wakeup — shogun + active + attached → send-keys (post PR#75)
 #   T-SHOGUN-004: send_wakeup — shogun + active + detached → send-keys fallthrough
 #   T-SHOGUN-005: shogun clear_command does not enqueue auto-recovery
+#   T-SHOGUN-006: send_wakeup — shogun + client typed 5s ago → defer (display-message, no send-keys) (cmd_182)
+#   T-SHOGUN-007: send_wakeup — deferral is not a drop; guard-window elapses → send-keys fires (cmd_182, MUST)
+#   T-SHOGUN-008: send_wakeup — client attached but activity old → send-keys fires (ntfy reply path, PR#75 non-regression, cmd_182, MUST)
+#   T-SHOGUN-009: send_wakeup — non-shogun agent unaffected by recent typing (cmd_182)
+#   T-SHOGUN-010: send_wakeup — no client at all → human_typing_recently false → send-keys fires (cmd_182)
+#   T-SHOGUN-011: deferral sets SHOGUN_DEFER_PENDING, reopens should_process_timeout_tick, resets on delivery/unread=0 (cmd_182 QC40-F1, MUST)
+#   T-SHOGUN-012: deferred ntfy (branch_policy_notify) fires only once per defer episode (cmd_182 QC40-F2, MUST)
 #   T-BUSY-005: agent_is_busy — returns busy during /clear cooldown (LAST_CLEAR_TS)
 #   T-BUSY-006: agent_is_busy — returns idle after /clear cooldown expires
 #   T-BUSY-007: agent_is_busy — /clear cooldown overrides idle pane
@@ -101,6 +108,7 @@ MOCK
     export MOCK_PANE_CLI=""
     export MOCK_PANE_ACTIVE=""
     export MOCK_LIST_CLIENTS=""
+    export MOCK_CLIENT_ACTIVITY=""
 
     # Test harness: sets up mocks, then sources the REAL inbox_watcher.sh
     # __INBOX_WATCHER_TESTING__=1 skips arg parsing, inotifywait check, and main loop.
@@ -132,6 +140,13 @@ tmux() {
         return 0
     fi
     if echo "\$*" | grep -q "list-clients"; then
+        if echo "\$*" | grep -q "client_activity"; then
+            # cmd_182: client_last_activity_epoch() query — distinct control
+            # variable from MOCK_LIST_CLIENTS (attach-count format) so tests
+            # can set "recent"/"old"/absent independently of attach state.
+            [ -n "\${MOCK_CLIENT_ACTIVITY:-}" ] && echo "\$MOCK_CLIENT_ACTIVITY"
+            return 0
+        fi
         [ -n "\${MOCK_LIST_CLIENTS:-}" ] && echo "\$MOCK_LIST_CLIENTS"
         return 0
     fi
@@ -975,6 +990,7 @@ YAML
     run bash -c '
         MOCK_PANE_ACTIVE="1"
         MOCK_LIST_CLIENTS="/dev/pts/1: mock_session [200x50 xterm-256color]"
+        MOCK_CLIENT_ACTIVITY="100"  # cmd_182: client_activity is sufficiently old (1970) — not typing recently
         source "'"$TEST_HARNESS"'"
         AGENT_ID="shogun"
         send_wakeup 2
@@ -991,6 +1007,7 @@ YAML
     run bash -c '
         MOCK_PANE_ACTIVE="1"
         MOCK_LIST_CLIENTS=""
+        MOCK_CLIENT_ACTIVITY="100"  # cmd_182: client_activity is sufficiently old (1970) — not typing recently
         source "'"$TEST_HARNESS"'"
         AGENT_ID="shogun"
         send_wakeup 2
@@ -1002,6 +1019,188 @@ YAML
 
     # Should have used send-keys
     grep -q "send-keys.*inbox2" "$MOCK_LOG"
+}
+
+# --- T-SHOGUN-006: shogun typed recently → defer (display-message, no send-keys) ---
+
+@test "T-SHOGUN-006: send_wakeup defers to display-message when shogun typed 5s ago" {
+    run bash -c '
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    # Direction A stays closed: no send-keys with the nudge text
+    ! grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    # Notification still surfaces via display-message (no keystrokes, status line only)
+    grep -q "display-message.*inbox2" "$MOCK_LOG"
+    echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-007 (MUST): deferral is not a drop — guard window elapses → send-keys fires ---
+# Fixes the specific regression risk: "defer" silently degrading into "drop".
+
+@test "T-SHOGUN-007: send_wakeup deferral is not a drop — send-keys fires once guard window elapses" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"   # typed 5s ago → defer
+        send_wakeup 2
+
+        echo "=== SPLIT_MARKER ===" >> "'"$MOCK_LOG"'"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 120 ))"  # guard (60s) has elapsed → deliver
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    local before after
+    before="$(sed -n "1,/SPLIT_MARKER/p" "$MOCK_LOG")"
+    after="$(sed -n "/SPLIT_MARKER/,\$p" "$MOCK_LOG")"
+
+    # Before the guard window elapsed: deferred, no send-keys yet
+    ! echo "$before" | grep -q "send-keys.*inbox2"
+    echo "$before" | grep -q "display-message.*inbox2"
+
+    # After the guard window elapsed: the SAME still-unread nudge is now delivered —
+    # this is the one assertion that pins "deferred" apart from "dropped"
+    echo "$after" | grep -q "send-keys.*inbox2"
+}
+
+# --- T-SHOGUN-008 (MUST): client attached but activity old → send-keys fires (ntfy reply path) ---
+# Fixes the PR#75 regression the original (rejected) design would have reintroduced:
+# an attached-but-idle terminal (lord replying via ntfy from his phone) must still be
+# reachable via send-keys — attach state alone must never suppress delivery.
+
+@test "T-SHOGUN-008: send_wakeup delivers via send-keys when client attached but idle (ntfy reply path)" {
+    run bash -c '
+        MOCK_LIST_CLIENTS="/dev/pts/1: mock_session [200x50 xterm-256color]"
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 1200 ))"  # attached, but no keystroke in 20 minutes
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    ! echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-009: non-shogun agent unaffected by recent client activity ---
+
+@test "T-SHOGUN-009: send_wakeup for non-shogun agent ignores recent client activity" {
+    run bash -c '
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="ashigaru3"
+        touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_ashigaru3"  # match agent_is_busy() idle-flag lookup for the overridden AGENT_ID
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    ! echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-010: no client at all → human_typing_recently is false → send-keys fires ---
+
+@test "T-SHOGUN-010: send_wakeup delivers via send-keys when no client is attached at all" {
+    run bash -c '
+        MOCK_LIST_CLIENTS=""
+        MOCK_CLIENT_ACTIVITY=""
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+        send_wakeup 2
+    '
+    [ "$status" -eq 0 ]
+
+    grep -q "send-keys.*inbox2" "$MOCK_LOG"
+    ! echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-011 (MUST, cmd_182 QC40-F1): deferral re-arms re-evaluation ---
+# shogun's watcher runs with ASW_PROCESS_TIMEOUT=0 (event-driven only), so
+# without SHOGUN_DEFER_PENDING there is no "next cycle" to re-check a
+# deferred nudge. Pins: (a) should_process_timeout_tick() — the extracted
+# main-loop gate — stays closed by default and opens only while a defer is
+# pending; (b) SHOGUN_DEFER_PENDING flips 1 on defer and back to 0 once the
+# nudge actually reaches the pane.
+
+@test "T-SHOGUN-011: deferral sets SHOGUN_DEFER_PENDING and re-opens the timeout gate until delivered" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+
+        ASW_PROCESS_TIMEOUT=0
+        SHOGUN_DEFER_PENDING=0
+        should_process_timeout_tick; echo "TICK_BEFORE_DEFER=$?"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"    # typed 5s ago -> defer
+        send_wakeup 2
+        echo "DEFER_PENDING_AFTER_DEFER=$SHOGUN_DEFER_PENDING"
+        should_process_timeout_tick; echo "TICK_AFTER_DEFER=$?"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 120 ))"  # guard (60s) elapsed -> delivered
+        send_wakeup 2
+        echo "DEFER_PENDING_AFTER_SEND=$SHOGUN_DEFER_PENDING"
+        should_process_timeout_tick; echo "TICK_AFTER_SEND=$?"
+
+        # reset_shogun_defer_state is also the unread=0 reset path (process_unread
+        # calls it once the inbox drains); pin it directly since driving the full
+        # process_unread flow through this harness is not practical.
+        SHOGUN_DEFER_PENDING=1
+        SHOGUN_DEFER_NTFY_SENT=1
+        reset_shogun_defer_state
+        echo "UNREAD_ZERO_RESET=${SHOGUN_DEFER_PENDING}${SHOGUN_DEFER_NTFY_SENT}"
+    '
+    [ "$status" -eq 0 ]
+
+    echo "$output" | grep -q "TICK_BEFORE_DEFER=1" \
+        || { echo "expected timeout gate closed before any defer (event-driven default); output: $output"; false; }
+    echo "$output" | grep -q "DEFER_PENDING_AFTER_DEFER=1" \
+        || { echo "expected SHOGUN_DEFER_PENDING=1 immediately after the defer branch; output: $output"; false; }
+    echo "$output" | grep -q "TICK_AFTER_DEFER=0" \
+        || { echo "expected timeout gate reopened (rc=0) while a defer is pending; output: $output"; false; }
+    echo "$output" | grep -q "DEFER_PENDING_AFTER_SEND=0" \
+        || { echo "expected SHOGUN_DEFER_PENDING reset to 0 once send-keys actually delivered; output: $output"; false; }
+    echo "$output" | grep -q "TICK_AFTER_SEND=1" \
+        || { echo "expected timeout gate closed again after defer resolved; output: $output"; false; }
+    echo "$output" | grep -q "UNREAD_ZERO_RESET=00" \
+        || { echo "expected reset_shogun_defer_state (unread=0 reset path) to clear both flags; output: $output"; false; }
+}
+
+# --- T-SHOGUN-012 (MUST, cmd_182 QC40-F2): deferred ntfy fires once per episode ---
+# Without a one-shot guard, once QC40-F1 reopens the timeout gate the ntfy
+# insurance path would fire every ~30s for as long as the defer continues
+# (a dead path turning into a flood). Pins that 3 send_wakeup calls while
+# still deferred and past the ntfy threshold produce exactly 1 notify call.
+
+@test "T-SHOGUN-012: deferred ntfy notification fires only once per defer episode" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        NOTIFY_LOG="'"$TEST_TMPDIR"'/notify.log"
+        > "$NOTIFY_LOG"
+        # Real network (ntfy) must not be hit in tests — override after sourcing,
+        # same style as test_baton_watchdog.bats.
+        branch_policy_notify() { echo "NOTIFY: $1" >> "$NOTIFY_LOG"; return 0; }
+
+        AGENT_ID="shogun"
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"     # always typed recently -> always defer
+        FIRST_UNREAD_SEEN=$(( $(date +%s) - 400 ))         # past default 300s ntfy threshold
+
+        send_wakeup 2
+        send_wakeup 2
+        send_wakeup 2
+
+        calls=$(grep -c "NOTIFY:" "$NOTIFY_LOG")
+        echo "NOTIFY_CALLS=$calls"
+    '
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "NOTIFY_CALLS=1" \
+        || { echo "expected exactly 1 branch_policy_notify call across 3 deferred send_wakeup calls; output: $output"; false; }
 }
 
 # --- T-BUSY-005: agent_is_busy during /clear cooldown ---

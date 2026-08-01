@@ -82,11 +82,19 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
     fi
 
     # Source stall_policy query lib (cmd_171). Provides stall_policy_query /
-    # baton_watchdog_query with safe defaults even when the config section
-    # (or config/settings.yaml itself) is absent.
+    # baton_watchdog_query / shogun_input_guard_query with safe defaults
+    # even when the config section (or config/settings.yaml itself) is absent.
     _stall_policy_lib="${SCRIPT_DIR}/lib/stall_policy.sh"
     if [ -f "$_stall_policy_lib" ]; then
         source "$_stall_policy_lib"
+    fi
+
+    # Source branch_policy lib (cmd_182). Provides branch_policy_notify(),
+    # used as a failure-tolerant insurance ntfy when a shogun nudge stays
+    # deferred (human_typing_recently) past shogun_defer_ntfy_after_sec.
+    _branch_policy_lib="${SCRIPT_DIR}/lib/branch_policy.sh"
+    if [ -f "$_branch_policy_lib" ]; then
+        source "$_branch_policy_lib"
     fi
 
     # Detect OS and select file-watching backend
@@ -140,6 +148,32 @@ LAST_CLEAR_TS=${LAST_CLEAR_TS:-0}
 ESCALATE_PHASE1=${ESCALATE_PHASE1:-120}
 ESCALATE_PHASE2=${ESCALATE_PHASE2:-240}
 ESCALATE_COOLDOWN=${ESCALATE_COOLDOWN:-300}
+
+# ─── Shogun defer state (cmd_182 QC40-F1/F2) ───
+# shogun's watcher runs with ASW_PROCESS_TIMEOUT=0 (event-driven only, see
+# shutsujin_departure.sh:910-912). When human_typing_recently() defers a
+# send-keys nudge, there is no "next cycle" to re-evaluate unless the main
+# loop's timeout branch is explicitly reopened while a defer is pending.
+SHOGUN_DEFER_PENDING=${SHOGUN_DEFER_PENDING:-0}
+# One-shot guard so the deferred-notify ntfy fires once per defer episode,
+# not every 30s once QC40-F1 reopens the timeout branch.
+SHOGUN_DEFER_NTFY_SENT=${SHOGUN_DEFER_NTFY_SENT:-0}
+
+# Clears shogun-defer state. Call when a nudge actually reaches the pane
+# (send-keys success) or when the inbox goes back to zero unread.
+reset_shogun_defer_state() {
+    SHOGUN_DEFER_PENDING=0
+    SHOGUN_DEFER_NTFY_SENT=0
+}
+
+# QC40-F1: whether the main loop's 30s timeout tick should call
+# process_unread. Normally gated by ASW_PROCESS_TIMEOUT (0 for shogun,
+# event-driven only). While a shogun defer is pending, force it open so
+# the deferred nudge gets re-evaluated instead of waiting forever for the
+# next inbox write event.
+should_process_timeout_tick() {
+    [ "${ASW_PROCESS_TIMEOUT:-1}" = "1" ] || [ "${SHOGUN_DEFER_PENDING:-0}" = "1" ]
+}
 
 # ─── Nudge throttle ───
 # Avoid spamming the same "inboxN" into the pane every timeout tick.
@@ -948,6 +982,39 @@ session_has_client() {
     [ -n "$session_name" ] && [ "$(tmux list-clients -t "$session_name" 2>/dev/null | wc -l)" -gt 0 ]
 }
 
+# ─── Human input-guard detection (cmd_182) ───
+# Function: client_last_activity_epoch
+# Description: Returns the newest #{client_activity} (epoch seconds) among all
+#   tmux clients attached to the session containing PANE_TARGET. This measures
+#   "how recently a human touched the keyboard", not "is a terminal open"
+#   (session_has_client / pane_is_active answer the latter and are always true
+#   for a single-pane session like shogun — see gunshi cmd_182 verification).
+#   If no client is attached, prints nothing (empty string).
+# Arguments: none (uses global PANE_TARGET)
+# Returns: always 0. Newest client_activity epoch on stdout, or empty.
+client_last_activity_epoch() {
+    local session_name
+    session_name=$(timeout 2 tmux display-message -p -t "$PANE_TARGET" '#{session_name}' 2>/dev/null || true)
+    [ -n "$session_name" ] || return 0
+    timeout 2 tmux list-clients -t "$session_name" -F '#{client_activity}' 2>/dev/null | sort -n | tail -1
+}
+
+# Function: human_typing_recently
+# Description: True if a client attached to PANE_TARGET's session has been
+#   active within the last shogun_input_guard_sec seconds. Used to defer
+#   (not drop) shogun nudges so they never interrupt an in-progress keystroke
+#   (cmd_182 — "issue 37" corrupted into "inbox137" by a mid-line nudge).
+# Returns: 0 if a client was active within the guard window, 1 otherwise
+#   (including when no client is attached at all).
+human_typing_recently() {
+    local guard newest now
+    guard=$(shogun_input_guard_query shogun_input_guard_sec 2>/dev/null) || guard=60
+    newest=$(client_last_activity_epoch)
+    [ -n "$newest" ] || return 1
+    now=$(date +%s)
+    [ "$((now - newest))" -lt "$guard" ]
+}
+
 # ─── Send wake-up nudge ───
 # Layered approach:
 #   1. If agent has active inotifywait self-watch → skip (agent wakes itself)
@@ -968,7 +1035,35 @@ send_wakeup() {
         return 0
     fi
 
-    # 優先度2: Agent busy — nudge送信するとEnterが消失するためスキップ
+    # 優先度2 (cmd_182): shogun + 主が直近打鍵中 — send-keysで割り込むと
+    # 入力行が壊れる（"issue 37"→"inbox137"の実例）。破棄ではなく延期。
+    # agent_is_busy判定より前に置くこと（shogunのbusy例外を温存しつつ、
+    # それより先に人間打鍵を検知するため）。
+    # QC40-F1: 将軍のwatcherは ASW_PROCESS_TIMEOUT=0 で走る（event-driven
+    # のみ。shutsujin_departure.sh:910-912）。ゆえに「次サイクル」は
+    # inboxへの書き込みイベント時にしか来ない。延期しただけでは再評価が
+    # 永久に起こらぬため、SHOGUN_DEFER_PENDINGを立てて主ループのtimeout
+    # 分岐を延期中だけ開かせる（should_process_timeout_tick参照）。
+    if [ "$AGENT_ID" = "shogun" ] && human_typing_recently; then
+        echo "[$(date)] [DEFER] shogun: 主の打鍵を検知。send-keysを延期しdisplay-messageで通知" >&2
+        timeout 2 tmux display-message -t "$PANE_TARGET" "$nudge" 2>/dev/null || true
+        SHOGUN_DEFER_PENDING=1
+        local defer_ntfy_after
+        defer_ntfy_after=$(shogun_input_guard_query shogun_defer_ntfy_after_sec 2>/dev/null) || defer_ntfy_after=300
+        if [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ] 2>/dev/null; then
+            local defer_elapsed
+            defer_elapsed=$(( $(date +%s) - FIRST_UNREAD_SEEN ))
+            # QC40-F2: 一度きり旗。無いとF1で再評価が回るようになった途端、
+            # 30秒ごとに主のスマホが鳴り続ける（死んだ経路が洪水に化ける）。
+            if [ "$defer_elapsed" -ge "$defer_ntfy_after" ] && [ "${SHOGUN_DEFER_NTFY_SENT:-0}" -eq 0 ]; then
+                type branch_policy_notify &>/dev/null && branch_policy_notify "shogun宛の通知が${defer_elapsed}秒延期中(打鍵検知)" 2>/dev/null || true
+                SHOGUN_DEFER_NTFY_SENT=1
+            fi
+        fi
+        return 0     # 破棄ではない。未読は残り、SHOGUN_DEFER_PENDING経由で再評価される
+    fi
+
+    # 優先度3: Agent busy — nudge送信するとEnterが消失するためスキップ
     # Claude Code: Stop hook catches unread at turn end. Skip nudge to avoid Enter loss.
     # Exception: shogun — ntfy must be delivered immediately regardless of busy state.
     if agent_is_busy && [[ "$AGENT_ID" != "shogun" ]]; then
@@ -1041,6 +1136,7 @@ send_wakeup() {
         # NOTE: アイドルフラグは削除しない。nudge送信≠エージェント起動確認。
         # フラグを消すと agent_is_busy()=true → 以降のnudge全スキップ → デッドロック。
         # フラグはエージェントが実際に作業開始した時に自然消滅する（stop_hook設計と整合）。
+        reset_shogun_defer_state  # QC40-F1/F2: 実際に届いたので延期状態を解除
         echo "[$(date)] Wake-up sent to $AGENT_ID (${unread_count} unread, attempt $((attempt+1)))" >&2
         return 0
     done
@@ -1232,6 +1328,7 @@ process_unread() {
             echo "[$(date)] All messages read for $AGENT_ID — escalation reset (fast-path)" >&2
         fi
         FIRST_UNREAD_SEEN=0
+        reset_shogun_defer_state  # QC40-F1/F2: 未読0になったので延期状態を解除
         NEW_CONTEXT_SENT=0
         reset_nudge_throttle
         # Ensure idle flag exists (fast-path recovery)
@@ -1442,6 +1539,7 @@ for s in data.get('specials', []):
         FIRST_UNREAD_SEEN=0
         NEW_CONTEXT_SENT=0
         reset_nudge_throttle
+        reset_shogun_defer_state  # QC40-F1/F2: 未読0になったので延期状態を解除
 
         # ─── Stall detection (cmd_171 / T1) ───
         # Must run before the idle-flag touch below: for claude, touching the
@@ -1544,7 +1642,7 @@ while true; do
     sleep 0.3
 
     if [ "$rc" -eq 2 ]; then
-        if [ "${ASW_PROCESS_TIMEOUT:-1}" = "1" ]; then
+        if should_process_timeout_tick; then
             process_unread "timeout"
         fi
     else
@@ -1567,4 +1665,11 @@ fi
 _stall_policy_lib="${SCRIPT_DIR}/lib/stall_policy.sh"
 if [ -f "$_stall_policy_lib" ] && ! type stall_policy_query &>/dev/null; then
     source "$_stall_policy_lib"
+fi
+
+# Same double-source guard for branch_policy_notify() (cmd_182), so it is
+# available in test mode too.
+_branch_policy_lib="${SCRIPT_DIR}/lib/branch_policy.sh"
+if [ -f "$_branch_policy_lib" ] && ! type branch_policy_notify &>/dev/null; then
+    source "$_branch_policy_lib"
 fi
