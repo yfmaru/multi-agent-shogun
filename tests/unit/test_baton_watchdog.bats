@@ -99,6 +99,26 @@ YAML
     export BATON_WATCHDOG_ROOT="$FIXTURE_ROOT"
     export STALL_POLICY_SETTINGS="$FIXTURE_ROOT/config/settings.yaml"
 
+    # --- cmd_181: usage_limit フェイク（本物のAnthropic OAuth usage APIは
+    # 一切叩かない。curl を PATH 先頭の偽物へ差し替える様式は
+    # tests/unit/test_usage_limit.bats が確立した様式を踏襲する）。
+    export USAGE_TEST_BIN="$TEST_TMPDIR/usage_bin"
+    mkdir -p "$USAGE_TEST_BIN"
+    export USAGE_TEST_CREDS="$TEST_TMPDIR/usage_credentials.json"
+    cat > "$USAGE_TEST_CREDS" <<'EOF'
+{"claudeAiOauth": {"accessToken": "dummy-token"}}
+EOF
+    export USAGE_RESPONSE_FILE="$TEST_TMPDIR/usage_response.json"
+    # 既定: 両枠とも閾値未満・空のlimits[]（安全なベースライン）。
+    cat > "$USAGE_RESPONSE_FILE" <<'EOF'
+{"five_hour": {"utilization": 10, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}
+EOF
+    cat > "$USAGE_TEST_BIN/curl" <<CURLSTUB
+#!/usr/bin/env bash
+cat "$USAGE_RESPONSE_FILE"
+CURLSTUB
+    chmod +x "$USAGE_TEST_BIN/curl"
+
     export TEST_HARNESS="$TEST_TMPDIR/test_harness.sh"
     cat > "$TEST_HARNESS" << HARNESS
 #!/bin/bash
@@ -174,6 +194,20 @@ $progress_stall_line
 $b4b_ntfy_line
 $b4c_stale_line
 YAML
+}
+
+# cmd_181: usage API のフェイク応答を書き直す。
+# $1=5H_UTIL $2=5H_RESETS_AT(ISO8601) $3=7D_UTIL $4=7D_RESETS_AT(ISO8601)
+write_usage_response() {
+    cat > "$USAGE_RESPONSE_FILE" <<EOF
+{"five_hour": {"utilization": $1, "resets_at": "$2"}, "seven_day": {"utilization": $3, "resets_at": "$4"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}
+EOF
+}
+
+write_usage_response_broken() {
+    cat > "$USAGE_RESPONSE_FILE" <<'EOF'
+not json
+EOF
 }
 
 # --- TC-BATON-001: 未読0・active0・未完cmdあり が閾値継続 → 検知 ---
@@ -1458,4 +1492,351 @@ YAML
     [ "$status" -eq 0 ]
     grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
     [ ! -s "$MOCK_TMUX_LOG" ]
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_181: 使用量制限 事前予告(a)・猶予(b)・事後自動再開(c)
+#
+# check_once/check_d1_once/check_b4b_once/check_b4c_once とは完全に
+# 独立した機能。前提誤り2件（実装前に是正済み）:
+#   1. resets_at のUTC切り詰め: lib/usage_limit.sh が新たに出力する
+#      5H_RESET_EPOCH/7D_RESET_EPOCH（既にepoch化済み）のみを用いる。
+#   2. 再開の関門は usage_limit_state ではなく、reset epoch そのものの
+#      巻き直り（「制限が近いか」ではなく「枠が実際に終わったか」）。
+#
+# TC-USAGE-WARN-001〜004: 三方への予告・重複防止・枠変化での再発火・
+#                         7日枠は家老へ出ない
+# TC-USAGE-TZ-001〜002:   UTC変換の固定・不正値での空文字フォールバック
+# TC-USAGE-RESUME-001〜005: 正常再開・空振り防止各パターン・同一枠での重複防止
+# TC-USAGE-FETCH-001:     API取得失敗時は何もしない
+# TC-USAGE-TMUX-001:      tmux不使用
+# TC-USAGE-FROM-001:      from=baton_watchdog固定（cmd_180結線）
+# TC-USAGE-ISOLATION-001: 他4関数の状態に影響しない
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-USAGE-WARN-001: 三方（将軍inbox・家老inbox・ntfy）への予告 ---
+
+@test "TC-USAGE-WARN-001: usage_warn fires to shogun inbox, karo inbox, and ntfy when 5H_UTIL crosses usage_warn_pct" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    write_usage_response 85 "2026-08-01T07:20:00+00:00" 10 "2026-08-05T07:00:00+00:00"
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" bash -c "
+        source '$TEST_HARNESS'
+        USAGE_LAST_CHECK_AT=0
+        check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    grep -q "INBOX_WRITE: shogun.*usage_warn.*window=5h" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "INBOX_WRITE: karo.*window=5h" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "usage_warn.*window=5h" "$NOTIFY_LOG" || { cat "$NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-WARN-002: 同一枠では二度目以降は発火せぬ ---
+
+@test "TC-USAGE-WARN-002: no duplicate usage_warn for the same reset window even across 3 cycles" {
+    write_usage_response 85 "2026-08-01T07:20:00+00:00" 10 "2026-08-05T07:00:00+00:00"
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" bash -c "
+        source '$TEST_HARNESS'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    count=$(grep -c "INBOX_WRITE: shogun.*window=5h" "$SHOGUN_NOTIFY_LOG")
+    [ "$count" -eq 1 ] || { echo "expected 1 window=5h notification, got $count:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-WARN-003: reset epochが変われば明示リセット無しで再発火する ---
+
+@test "TC-USAGE-WARN-003: a changed reset epoch re-fires the warning without an explicit reset (OBS-180-1 regression)" {
+    local json1 json2
+    json1='{"five_hour": {"utilization": 85, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 86, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    count=$(grep -c "INBOX_WRITE: shogun.*window=5h" "$SHOGUN_NOTIFY_LOG")
+    [ "$count" -eq 2 ] || { echo "expected 2 window=5h notifications (new epoch = new window), got $count:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-WARN-004: 7日枠の予告は将軍inbox+ntfyのみ・家老inboxには出ぬ ---
+
+@test "TC-USAGE-WARN-004: 7-day window warning reaches shogun inbox and ntfy but never karo inbox" {
+    write_usage_response 10 "2026-08-01T07:20:00+00:00" 90 "2026-08-05T07:00:00+00:00"
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" bash -c "
+        source '$TEST_HARNESS'
+        USAGE_LAST_CHECK_AT=0
+        check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    grep -q "INBOX_WRITE: shogun.*window=7d" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "window=7d" "$NOTIFY_LOG" || { cat "$NOTIFY_LOG"; false; }
+    ! grep -q "INBOX_WRITE: karo.*window=7d" "$SHOGUN_NOTIFY_LOG" || { echo "karo must never receive the 7d warning:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-TZ-001: '+00:00'付きUTC resets_atが正しいepochになる ---
+
+@test "TC-USAGE-TZ-001: resets_at with an explicit +00:00 UTC offset produces the correct epoch (9h JST landmine fixed)" {
+    write_usage_response 84 "2026-07-31T23:10:00.894023+00:00" 85 "2026-08-05T07:00:00.894046+00:00"
+    local expected
+    expected=$(date -u -d "2026-07-31T23:10:00" +%s)
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        bash -c "source '$PROJECT_ROOT/lib/usage_limit.sh'; usage_limit_fetch_raw"
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [[ "$output" == *"5H_RESET_EPOCH=${expected}"* ]] || { echo "expected 5H_RESET_EPOCH=${expected} in:"; echo "$output"; false; }
+}
+
+# --- TC-USAGE-TZ-002: resets_atが不正・欠落ならEPOCHは空文字、check_usage_onceは何も出さぬ ---
+
+@test "TC-USAGE-TZ-002: an invalid/missing resets_at yields an empty EPOCH and check_usage_once takes no action" {
+    write_usage_response 90 "" 90 ""
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        bash -c "source '$PROJECT_ROOT/lib/usage_limit.sh'; usage_limit_fetch_raw"
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [[ "$output" == *$'5H_RESET_EPOCH=\n'* ]] || { echo "expected empty 5H_RESET_EPOCH in:"; echo "$output"; false; }
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" bash -c "
+        source '$TEST_HARNESS'
+        USAGE_LAST_CHECK_AT=0
+        check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { echo "must not notify when reset epoch is unavailable, despite util>=warn_pct:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ ! -s "$NOTIFY_LOG" ]
+}
+
+# --- TC-USAGE-RESUME-001: 正常再開（4条件AND成立） ---
+
+@test "TC-USAGE-RESUME-001: karo inbox receives a resume order once the warned window rolls over with all 4 AND conditions met" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    sleep 1  # progress artifact mtimes (set up in setup()) must predate USAGE_WARNED_AT
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 90, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 20, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    grep -q "INBOX_WRITE: karo.*usage_resume.*window=5h" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "usage_resume.*window=5h" "$NOTIFY_LOG" || { cat "$NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-RESUME-002: 予告以降に誰かが動いていれば空振り防止で再開号令は出ぬ ---
+
+@test "TC-USAGE-RESUME-002: no resume order when any agent's files were touched after the warning (false-alarm prevention)" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    sleep 1
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 90, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 20, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        sleep 1
+        touch '$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml'
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    ! grep -q "usage_resume" "$SHOGUN_NOTIFY_LOG" || { echo "must not resume when someone kept working after the warning:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-RESUME-003: 巻き直っても util が resume 閾値以上なら再開号令は出ぬ ---
+
+@test "TC-USAGE-RESUME-003: no resume order when the new window's utilization is still at/above usage_resume_below_pct" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    sleep 1
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 90, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 55, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    ! grep -q "usage_resume" "$SHOGUN_NOTIFY_LOG" || { echo "must not resume while utilization (55%) is still >= usage_resume_below_pct (50%):"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-RESUME-004: open_cmds=0（仕事が無い）なら再開号令は出ぬ ---
+
+@test "TC-USAGE-RESUME-004: no resume order when there is no open cmd to resume" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: done
+YAML
+    sleep 1
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 90, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 20, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    ! grep -q "usage_resume" "$SHOGUN_NOTIFY_LOG" || { echo "must not resume when open_cmds=0 (nothing to resume):"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-RESUME-005: 同一枠で再開号令は一度だけ ---
+
+@test "TC-USAGE-RESUME-005: resume order fires at most once for the same rolled-over window across 3 cycles" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    sleep 1
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 90, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 20, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    count=$(grep -c "usage_resume.*window=5h" "$SHOGUN_NOTIFY_LOG")
+    [ "$count" -eq 1 ] || { echo "expected exactly 1 resume order, got $count:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-FETCH-001: API取得失敗時は何もしない ---
+
+@test "TC-USAGE-FETCH-001: check_usage_once takes no action and does not fail when the usage API fetch fails" {
+    write_usage_response_broken
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" bash -c "
+        source '$TEST_HARNESS'
+        USAGE_LAST_CHECK_AT=0
+        check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { echo "must not notify on fetch failure:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ ! -s "$NOTIFY_LOG" ]
+    [[ "$output" == *"fetch failed; no action"* ]] || { echo "expected a fetch-failed log line in:"; echo "$output"; false; }
+}
+
+# --- TC-USAGE-TMUX-001: tmuxを一切呼ばない（TC-BATON-006と同型） ---
+
+@test "TC-USAGE-TMUX-001: check_usage_once never calls tmux even when a warning fires" {
+    write_usage_response 85 "2026-08-01T07:20:00+00:00" 10 "2026-08-05T07:00:00+00:00"
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" bash -c "
+        source '$TEST_HARNESS'
+        USAGE_LAST_CHECK_AT=0
+        check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    grep -q "window=5h" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ ! -s "$MOCK_TMUX_LOG" ]
+}
+
+# --- TC-USAGE-FROM-001: 予告・再開いずれもfrom=baton_watchdog固定（cmd_180結線） ---
+
+@test "TC-USAGE-FROM-001: both usage_warn and usage_resume are written with from=baton_watchdog (cmd_180 unread-exclusion wiring)" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    sleep 1
+
+    local json1 json2
+    json1='{"five_hour": {"utilization": 90, "resets_at": "2026-08-01T07:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+    json2='{"five_hour": {"utilization": 20, "resets_at": "2026-08-01T16:20:00+00:00"}, "seven_day": {"utilization": 10, "resets_at": "2026-08-05T07:00:00+00:00"}, "seven_day_sonnet": null, "seven_day_opus": null, "limits": []}'
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" \
+        USAGE_JSON_1="$json1" USAGE_JSON_2="$json2" bash -c "
+        source '$TEST_HARNESS'
+        printf '%s' \"\$USAGE_JSON_1\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+        printf '%s' \"\$USAGE_JSON_2\" > '$USAGE_RESPONSE_FILE'
+        USAGE_LAST_CHECK_AT=0; check_usage_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    # baton_watchdog_notify_shogun (既存ヘルパ) は type=baton_alert 固定で
+    # 呼ばれる。cmd_180結線が求めるのは「from」がbaton_watchdogであること
+    # ——typeそのものではない。
+    grep -q "INBOX_WRITE: shogun.*window=5h.*baton_watchdog$" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "INBOX_WRITE: karo.*usage_warn baton_watchdog" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "INBOX_WRITE: karo.*usage_resume baton_watchdog" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-USAGE-ISOLATION-001: 他4関数の判定結果・状態変数に一切影響せぬ ---
+
+@test "TC-USAGE-ISOLATION-001: check_usage_once does not affect check_once's state or determination" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    write_usage_response 10 "2026-08-01T07:20:00+00:00" 10 "2026-08-05T07:00:00+00:00"
+
+    run env USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" PATH="$USAGE_TEST_BIN:$PATH" bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+        check_usage_once
+        check_once
+    "
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    count=$(grep -c "baton_lost" "$SHOGUN_NOTIFY_LOG")
+    [ "$count" -eq 1 ] || { echo "expected exactly 1 baton_lost notification (BATON_NOTIFIED must survive an interleaved check_usage_once call), got $count:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }

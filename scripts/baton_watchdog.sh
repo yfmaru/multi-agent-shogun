@@ -60,11 +60,18 @@ ROOT="${BATON_WATCHDOG_ROOT:-$SCRIPT_DIR}"
 
 source "$SCRIPT_DIR/lib/stall_policy.sh"
 source "$SCRIPT_DIR/lib/branch_policy.sh"
+source "$SCRIPT_DIR/lib/usage_limit.sh"
 
 # ─── プロセスローカル状態 ───
 BATON_LOST_SINCE=0     # 3条件が揃い始めた epoch（揃っていなければ0）
 BATON_NOTIFIED=0       # 将軍inbox通知を同一継続停止で二重送信しないためのガード
 BATON_NTFY_NOTIFIED=0  # ntfy通知（cmd_172/急報）を同一継続停止で二重送信しないためのガード
+
+# ─── 使用量監視 (cmd_181) プロセスローカル状態 ───
+USAGE_LAST_CHECK_AT=0
+declare -A USAGE_WARNED_WINDOW=()   # label -> 予告済み枠の reset epoch
+declare -A USAGE_WARNED_AT=()       # label -> 予告を出した epoch
+declare -A USAGE_RESUMED_WINDOW=()  # label -> 再開号令済み枠の reset epoch
 
 # ─── periodic /clear (cmd_172/P7) プロセスローカル状態 ───
 # エージェントごとに独立（B-1/B-2/B-3の全体判定とは完全に並存する別機能）。
@@ -899,6 +906,137 @@ check_b4c_once() {
     done < <(baton_watchdog_list_inbox_agents)
 }
 
+# ═══════════════════════════════════════════════════════════════
+# 使用量制限 事前予告(a)・猶予(b)・事後自動再開(c) (cmd_181)
+#
+# check_once/check_d1_once/check_b4b_once/check_b4c_once とは完全に
+# 独立した機能。それらを呼ばず、その内部状態にも触れない。
+#
+# 前提誤り2件（実装前に是正済み）:
+#   1. resets_at のUTC切り詰め対策として lib/usage_limit.sh が新たに
+#      出力する 5H_RESET_EPOCH/7D_RESET_EPOCH（既にepoch化済み）のみを
+#      用いる。bashで文字列を解釈しない。
+#   2. 再開の関門に usage_limit_state は使わない（「制限が近いか」を
+#      答える関数であり「いま塞がれているか」ではない）。関門は
+#      「予告時に記録した reset epoch と、いま取得した reset epoch が
+#      異なること」＝枠そのものの巻き直り。
+#
+# 重複防止は枠の同一性そのものを鍵にする（NOTIFIEDブール＋明示リセット
+# 様式は踏襲しない。cmd_180 OBS-180-1の教訓）:
+#   USAGE_WARNED_WINDOW[label] = <その時の reset epoch>
+# 条件は「いまの reset epoch が記録値と異なる」。新しい枠は必ず新しい
+# epochを持つため、リセット操作なしにラッチが構造的に起こり得ない。
+# ═══════════════════════════════════════════════════════════════
+
+# 全エージェントを通じた「最後に何かが動いた時刻」。B-4bの
+# baton_watchdog_agent_progress_mtime を全エージェントで最大化するだけ。
+baton_watchdog_max_progress_mtime() {
+    local agent m max=0
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+        m=$(baton_watchdog_agent_progress_mtime "$agent")
+        [ -n "$m" ] && [ "$m" -gt "$max" ] && max=$m
+    done < <(baton_watchdog_list_agents)
+    echo "$max"
+}
+
+# check_once / check_d1_once / check_b4b_once / check_b4c_once と
+# 完全に独立。それらを呼ばず、その内部状態にも触れない。
+check_usage_once() {
+    local now interval raw
+    local util5h reset5h util7d reset7d
+    local warn_pct resume_pct
+
+    [ "$(baton_watchdog_query enabled)" = "true" ] || return 0
+
+    now=$(date +%s)
+    interval=$(baton_watchdog_query usage_check_interval_sec)
+    [ $((now - USAGE_LAST_CHECK_AT)) -ge "$interval" ] || return 0
+    USAGE_LAST_CHECK_AT=$now
+
+    raw="$(usage_limit_fetch_raw)" || raw=""
+    # 取得不能なら何もしない。推測で予告も再開も出さぬ
+    # （usage_limit_state が "ok" へ倒れぬのと同じ向き）。
+    [ -n "$raw" ] || {
+        echo "[$(date)] [baton_watchdog/usage] fetch failed; no action"
+        return 0
+    }
+
+    util5h=$(printf '%s' "$raw" | grep '^5H_UTIL='        | cut -d= -f2)
+    reset5h=$(printf '%s' "$raw" | grep '^5H_RESET_EPOCH=' | cut -d= -f2)
+    util7d=$(printf '%s' "$raw" | grep '^7D_UTIL='        | cut -d= -f2)
+    reset7d=$(printf '%s' "$raw" | grep '^7D_RESET_EPOCH=' | cut -d= -f2)
+
+    warn_pct=$(baton_watchdog_query usage_warn_pct)
+    resume_pct=$(baton_watchdog_query usage_resume_below_pct)
+
+    # 5時間枠: 予告は家老へも送る（(b)の本体）。再開もこの枠のみ。
+    _usage_window_check 5h "$util5h" "$reset5h" "$warn_pct" \
+                        "$resume_pct" "$now" true
+    # 7日枠: 予告は将軍inbox+ntfyのみ。家老へは送らぬ
+    #        （数日先の解除に「区切りをつけよ」は助言たり得ぬ）。
+    _usage_window_check 7d "$util7d" "$reset7d" "$warn_pct" \
+                        "$resume_pct" "$now" false
+
+    echo "[$(date)] [baton_watchdog/usage] 5h_util=${util5h:-?} 7d_util=${util7d:-?}"
+}
+
+# label util reset_epoch warn_pct resume_pct now notify_karo(true|false)
+_usage_window_check() {
+    local label="$1" util="$2" reset="$3" warn_pct="$4"
+    local resume_pct="$5" now="$6" notify_karo="$7"
+    local open_cmds max_mtime msg
+
+    # epoch が取れなければこの枠は判定しない（推測しない）
+    [[ "$reset" =~ ^[0-9]+$ ]] || return 0
+    [[ "$util"  =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+
+    # ── (a) 予告 ──────────────────────────────
+    # 鍵は枠の同一性（reset epoch）。新しい枠は必ず新しい値を
+    # 持つゆえ、明示リセットが要らぬ＝ラッチし得ぬ（OBS-180-1）。
+    if awk -v u="$util" -v t="$warn_pct" 'BEGIN{exit !(u>=t)}' \
+       && [ "${USAGE_WARNED_WINDOW[$label]:-0}" != "$reset" ]; then
+        msg="usage_warn: window=${label} util=${util}% reset=$(date -d "@$reset" '+%m/%d %H:%M %Z')"
+        baton_watchdog_notify_shogun "$msg"
+        if [ "$notify_karo" = "true" ]; then
+            bash "$ROOT/scripts/inbox_write.sh" karo \
+              "${msg}。着手中タスクの task YAML と報告YAML を今のうちに書き切らせよ。新規の大きな発注は解除後に回せ。" \
+              usage_warn baton_watchdog
+        fi
+        # 副経路。失敗許容——ログに残すのみで主経路に影響させぬ。
+        branch_policy_notify "$msg" || \
+          echo "[$(date)] [baton_watchdog/usage] ntfy failed; inbox notification unaffected" >&2
+        USAGE_WARNED_WINDOW[$label]=$reset
+        USAGE_WARNED_AT[$label]=$now
+    fi
+
+    # ── (c) 再開 ──────────────────────────────
+    # 予告を出した枠が巻き直った＝ reset epoch が変わったこと
+    # そのものが解除の直接証拠（閾値の当て推量を要さぬ）。
+    [ -n "${USAGE_WARNED_AT[$label]:-}" ] || return 0
+    [ "${USAGE_WARNED_WINDOW[$label]:-0}" != "$reset" ] || return 0
+    [ "${USAGE_RESUMED_WINDOW[$label]:-0}" != "$reset" ] || return 0
+
+    # 裏取り: 新しい枠に余裕があること
+    awk -v u="$util" -v t="$resume_pct" 'BEGIN{exit !(u<t)}' || return 0
+    # 仕事があること
+    open_cmds=$(baton_watchdog_count_open_cmds)
+    [ "${open_cmds:-0}" -gt 0 ] || return 0
+    # 【空振り防止の核】予告以降、誰一人動いておらぬこと
+    max_mtime=$(baton_watchdog_max_progress_mtime)
+    [ "${max_mtime:-0}" -lt "${USAGE_WARNED_AT[$label]}" ] || {
+        # 動いておる＝乗り切った。起こす必要は無い。
+        USAGE_RESUMED_WINDOW[$label]=$reset
+        return 0
+    }
+
+    msg="usage_resume: window=${label} 解除確認(util=${util}%) open_cmds=${open_cmds}。queue/ のYAMLから状態を再構築し作業を再開せよ。"
+    bash "$ROOT/scripts/inbox_write.sh" karo "$msg" usage_resume baton_watchdog
+    branch_policy_notify "$msg" || \
+      echo "[$(date)] [baton_watchdog/usage] resume ntfy failed" >&2
+    USAGE_RESUMED_WINDOW[$label]=$reset
+}
+
 if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     mkdir -p "$ROOT/logs"
 
@@ -914,6 +1052,7 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
         check_b4b_once
         check_b4c_once
         periodic_clear_check_once
+        check_usage_once
         exit 0
     fi
 
@@ -924,6 +1063,7 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
         check_b4b_once
         check_b4c_once
         periodic_clear_check_once
+        check_usage_once
         sleep "$(baton_watchdog_query poll_interval_sec)"
     done
 fi
