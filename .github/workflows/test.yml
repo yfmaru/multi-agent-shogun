@@ -191,6 +191,17 @@ jobs:
             echo "::warning::scripts/ directory not found"
           fi
 
+      - name: Check cross-platform shell script pitfalls
+        run: |
+          # (a) flock使用箇所にcommand -v flockガードが無い（macOS等util-linux非搭載環境で落ちる）
+          for f in $(grep -rl '\bflock\b' scripts/ lib/ 2>/dev/null); do
+            grep -q 'command -v flock' "$f" || echo "::warning file=$f::flock使用箇所にcommand -v flockガードが無い"
+          done
+          # (b) 未brace変数が非ASCII文字に直接隣接（変数展開の意図せぬ誤混入）
+          grep -rPn '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' scripts/ lib/ 2>/dev/null \
+            | while IFS= read -r hit; do echo "::warning::未brace変数が非ASCII文字に直接隣接: $hit"; done
+          true
+
   e2e-tests:
     name: E2E Tests (Mock CLI)
     runs-on: ubuntu-latest
