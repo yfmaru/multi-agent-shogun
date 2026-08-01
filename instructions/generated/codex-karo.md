@@ -276,6 +276,36 @@ task:
   timestamp: "2026-01-25T12:00:00"
 ```
 
+## Modal Escape Hatch（判断詰まり時の逃げ道・必須）
+
+**家老が書く全てのashigaru向けタスクYAMLには、以下の趣旨の一節を厳守事項として必ず含める:**
+
+```
+■ 【最重要・判断に詰まったら人に問うな】
+CI未決・仕様の曖昧さ・想定外のエラー等、判断に詰まる場面が
+生じたら、AskUserQuestion等のモーダルを絶対に開くな。人へ
+直接問うのはF002違反であり、かつclaude足軽のモーダルは
+inbox_watcher.sh:1078のEscape抑止により梯子で原理的に開け
+られない——一度モーダルへ流れると主のお手を煩わせるまで
+永久に固まる。代わりに以下を実行せよ:
+  bash scripts/inbox_write.sh karo "<詰まった内容を具体的に>"
+  report_received <自分のagent_id>
+で家老へ上げ、その後は新たな入力を待たず作業を停止せよ
+（報告YAMLにも同じ内容を書いておくこと）。「分からないから
+止まる」ことは失敗ではない。「止まらずに人へ直接問う」ことが
+失敗である。
+```
+
+<!-- なぜ本節が必須か: 報告用の禁止事項に「モーダルは開くな。報告YAMLに
+書いて停止せよ」とだけ書いても、タスク途中（最終報告より前）に判断が
+詰まった場面での具体的な行動（何を・どこへ書くか）が示されず不十分
+だった。2026-08-01、claude足軽が判断に詰まってAskUserQuestionモーダル
+を開き固まる事故が2件発生（足軽1号05:06、足軽5号21:19）。次に本節を
+読む家老が同じ理由で省略しないよう、背景をここに残す。 -->
+
+この節は「Task Design: Five Questions」節・「Task YAML Format」節と同様、
+**カジュアルに省略してはならない必須節**である。
+
 ## echo_message Rule
 
 echo_message field is OPTIONAL.
@@ -385,6 +415,12 @@ When ashigaru reports task completion, Karo may perform mechanical completion ch
 | done_keywords.txt consistency | Read + compare |
 
 These are L1-L2 traffic-control checks. If correctness, risk, adoption, or cause must be judged, delegate to Gunshi.
+
+### Modal Escape Hatch Check (Gunshi QC Gate)
+
+タスクYAMLに『判断に詰まった時の逃げ道（inbox_writeでのエスカレーション）』
+（Modal Escape Hatch節参照）が明記されているか。欠けている場合は、実装の
+出来に関わらずFAILとし、家老へタスクYAMLの是正を求めよ。
 
 ### Complex QC → Delegate to Gunshi
 
