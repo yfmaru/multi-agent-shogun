@@ -28,6 +28,13 @@
 #   TC-TCOMP-010 回帰: descriptionのblock scalar内の「status:」相当行は
 #                書き換わらない。書き換わるのはtask:直下の1行のみ
 #   TC-TCOMP-011 --status blockedでも同じ規律で動く
+#
+# TC-TCOMP-012/013 は queue/reports/gunshi_report.yaml の QC49-F1/F2
+# （PR#49差し戻し）の固定。是正前・是正後の双方で走らせ、是正前では
+# 検知できないこと（＝真の回帰テストであること）を軍師が実測確認済み。
+#
+#   TC-TCOMP-012 ロック競合時、保持者側のロックを壊さない(QC49-F1)
+#   TC-TCOMP-013 _release_lock定義前に落ちてもBACKUPが残らない(QC49-F2)
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 
@@ -202,4 +209,31 @@ run_tc() {
     [ "$status" -eq 0 ] || { echo "output: $output"; false; }
     grep -qE '^  status: blocked$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
     [ "$(wc -l < "$INBOX_LOG")" -eq 1 ] || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-012: lock contention does not destroy the holder's lock (QC49-F1 fix)" {
+    write_task assigned
+    write_report done
+    # 別プロセスがロックを保持中であることを模す（mkdirの原子性を先取り）
+    mkdir "${TASK_FILE}.lock.d"
+    run_tc --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
+    [ "$status" -eq 2 ] || { echo "output: $output"; false; }
+    [ -d "${TASK_FILE}.lock.d" ] || { echo "REGRESSION: 保持者のlock.dが消えた（QC49-F1）"; false; }
+    grep -qE '^  status: assigned$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+}
+
+@test "TC-TCOMP-013: crash before _release_lock is defined still cleans up BACKUP (QC49-F2 fix)" {
+    write_task assigned
+    write_report done
+    # LOCK_DIR代入の直前でfalseを挟み、_release_lock定義前の異常終了を再現する
+    local crash_script="$FIXTURE_ROOT/scripts/task_complete_crash.sh"
+    awk '{ if ($0 == "LOCK_DIR=\"${TASK_FILE}.lock.d\"") print "false"; print }' \
+        "$FIXTURE_ROOT/scripts/task_complete.sh" > "$crash_script"
+    chmod +x "$crash_script"
+    run bash "$crash_script" --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
+    [ "$status" -ne 127 ] || { echo "output: $output (exit 127 = _release_lockがcommand not foundでtrap中断)"; false; }
+    shopt -s nullglob
+    local leftovers=("$FIXTURE_ROOT"/queue/tasks/*.bak.*)
+    shopt -u nullglob
+    [ "${#leftovers[@]}" -eq 0 ] || { echo "REGRESSION: BACKUPが残存: ${leftovers[*]}"; false; }
 }
