@@ -634,6 +634,65 @@ YAML
     grep -q "delivery_stall" "$FIXTURE_ROOT/queue/inbox/shogun.yaml"
 }
 
+# --- TC-D1-LATCH-001【QC39-F2の固定】診断対象がshogun単独のとき、D-1はkaro宛に書き、将軍inboxの未読を増やさぬ ---
+
+@test "TC-D1-LATCH-001: D-1 writes to karo (not shogun) when shogun alone is the dead-stale target, and shogun's unread count does not increase" {
+    local stale_ts before_count after_count
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+    before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: karo" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "delivery_stall" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    after_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+    [ "$before_count" -eq "$after_count" ] || { echo "shogun unread count changed: before=$before_count after=$after_count"; false; }
+}
+
+# --- TC-D1-LATCH-002【QC39-F1の直接固定・是正前に確実に落ちること確認済み】診断対象がshogun+ashigaru3の2名のとき、D-1はkaro宛に書き、将軍inboxの未読を増やさぬ ---
+
+@test "TC-D1-LATCH-002: D-1 writes to karo (not shogun) when shogun is dead-stale together with another agent, and shogun's unread count does not increase" {
+    local stale_ts before_count after_count
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru3.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+    before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    # dead_stale_agents = [ashigaru3, shogun]（要素数2）。QC39-F1是正前の
+    # 「shogunが単独のときだけ」判定は当たらず、将軍inboxへ誤って書かれる
+    # （＝本テストは是正前のコードに対して確実に落ちる）。
+    grep -q "INBOX_WRITE: karo" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "delivery_stall" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    after_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+    [ "$before_count" -eq "$after_count" ] || { echo "shogun unread count changed: before=$before_count after=$after_count"; false; }
+}
+
 # ═══════════════════════════════════════════════════════════════
 # 【M-2是正・軍師発見】check_d1_once の通知経路二重化（cmd_172）
 # ═══════════════════════════════════════════════════════════════

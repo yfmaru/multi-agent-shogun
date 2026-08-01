@@ -569,11 +569,24 @@ check_d1_once() {
         elapsed=$((now - BATON_D1_CONDITION_SINCE))
 
         # 通知先の決定規則（診断した当人へは書かぬ・cmd_180/T-4）:
-        # dead_stale_agentsがshogunのみの場合、将軍inboxへ書くとその通知
-        # 自身が将軍inboxの新たなstale未読になり、BATON_D1_NOTIFIED
+        # dead_stale_agentsにshogunが含まれる場合、将軍inboxへ書くとその
+        # 通知自身が将軍inboxの新たなstale未読になり、BATON_D1_NOTIFIED
         # （グローバルスカラ）が永久に1のまま張り付く（軍師OBS-180-1）。
-        # その場合に限りkaro宛へ切り替える。それ以外は従来どおり将軍inbox。
-        if [ "${#dead_stale_agents[@]}" -eq 1 ] && [ "${dead_stale_agents[0]}" = "shogun" ]; then
+        # 単独か否かは無関係——含まれてさえいれば起きる（軍師QC39-F1・
+        # 是正前は「shogun単独」の場合しか救っておらず、shogunが他の者と
+        # 並んで診断対象に入ると将軍inboxへ書いてしまい病が再発した）。
+        # ゆえにkaro宛へ切り替える。それ以外は従来どおり将軍inbox。
+        #
+        # 【残余・塞げていない一点】shogunとkaroが同時に診断対象となる
+        # 場合、inbox経路はどちらへ書いても診断対象自身であり原理的に
+        # 自己給餌になる。本PRの射程では塞げない。ただし副経路ntfy
+        # （baton_d1_ntfy_after_sec、既定900秒）は独立した閾値・独立した
+        # ガードで動くため、900秒継続すれば必ず1回は主のスマホへ届く。
+        # 「主へは届く。番犬の再武装（inbox経路によるkaro/shogunの覚醒）
+        # だけが失われる」という限定的な残余であり、これを「塞いだ」と
+        # 記録してはならない（CLAUDE.md「ACが原理的に充足不能と判明した
+        # 場合」節と同じ規律）。
+        if [[ " ${dead_stale_agents[*]} " == *" shogun "* ]]; then
             notify_target=karo
         else
             notify_target=shogun
