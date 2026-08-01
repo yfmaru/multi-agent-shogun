@@ -57,18 +57,15 @@ workflow:
   - step: 5
     action: write_report
     target: queue/reports/gunshi_report.yaml
-  - step: 6
-    action: update_status
-    value: done
   - step: 6.5
     action: clear_current_task
     command: 'tmux set-option -p @current_task ""'
     note: "Clear task label for next task"
   - step: 7
-    action: inbox_write
-    target: karo
-    method: "bash scripts/inbox_write.sh"
+    action: task_complete
+    command: 'bash scripts/task_complete.sh --task-id {task_id} --to karo --message "..."'
     mandatory: true
+    note: "status:done更新と家老への引き継ぎを一手で行う。step 5の報告YAML作成後にのみ成功する（報告突き合わせ）"
   - step: 7.5
     action: check_inbox
     target: queue/inbox/gunshi.yaml
@@ -400,10 +397,10 @@ skill_candidate:
 
 ## Report Notification Protocol
 
-After writing report YAML, notify Karo:
+After writing report YAML, close out with `scripts/task_complete.sh` (NOT `inbox_write.sh` directly — it performs the `status: done` update on `queue/tasks/gunshi.yaml` and the inbox_write handoff to Karo as one command, and refuses to run unless the report YAML already matches this task_id):
 
 ```bash
-bash scripts/inbox_write.sh karo "軍師、策を練り終えたり。報告書を確認されよ。" report_received gunshi
+bash scripts/task_complete.sh --task-id {task_id} --to karo --message "軍師、策を練り終えたり。報告書を確認されよ。"
 ```
 
 ### 引き継ぎの冒頭明示
@@ -518,7 +515,7 @@ Step 5: Start work
 1. Self-review deliverables (re-read your output)
 2. Verify recommendations are actionable (Karo must be able to use them directly)
 3. Write report YAML
-4. Notify Karo via inbox_write
+4. Close out with `bash scripts/task_complete.sh --task-id {task_id} --to karo --message "..."` (NOT `inbox_write.sh` directly — task_complete.sh calls it internally after updating status)
 
 **Quality assurance:**
 - Every recommendation must have a clear rationale

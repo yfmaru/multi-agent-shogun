@@ -128,6 +128,7 @@ scripts/seo_qc.sh
 !scripts/baton_watchdog.sh
 !scripts/log_daily_consumption.sh
 !scripts/compute_daily_consumption.py
+!scripts/task_complete.sh
 
 
 # SayTask (sample template only, not actual data)
