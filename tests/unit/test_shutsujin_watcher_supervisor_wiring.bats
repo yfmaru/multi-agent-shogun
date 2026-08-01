@@ -21,7 +21,7 @@ SCRIPT_PATH="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)/shutsujin_dep
 
 @test "T-SDW-003: existing per-agent inbox_watcher startup block (STEP 6.6) is untouched" {
     grep -q "STEP 6.6: inbox_watcher起動（全エージェント）" "$SCRIPT_PATH"
-    grep -q 'scripts/inbox_watcher.sh" shogun "shogun:main"' "$SCRIPT_PATH"
+    grep -q 'scripts/inbox_watcher.sh" shogun "shogun:main.0"' "$SCRIPT_PATH"
 }
 
 @test "T-SDW-004: shutsujin_departure.sh has no syntax errors" {
