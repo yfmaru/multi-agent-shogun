@@ -2280,6 +2280,7 @@ task:
   task_id: subtask_183_usage_limit_selffeed_fix
   status: assigned
 YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml"
     cat > "$FIXTURE_ROOT/queue/reports/ashigaru7_report.yaml" << 'YAML'
 worker_id: ashigaru7
 task_id: subtask_183_usage_limit_selffeed_fix
@@ -2313,6 +2314,7 @@ task:
   task_id: subtask_183_usage_limit_selffeed_fix
   status: assigned
 YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml"
     cat > "$FIXTURE_ROOT/queue/reports/ashigaru7_report.yaml" << 'YAML'
 worker_id: ashigaru7
 task_id: subtask_183_usage_limit_selffeed_fix

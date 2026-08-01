@@ -750,7 +750,8 @@ baton_watchdog_report_delivered() {
     t="$ROOT/queue/tasks/${agent}.yaml"
     report_mtime=$(baton_watchdog_file_mtime "$f") || return 1
     task_mtime=$(baton_watchdog_file_mtime "$t") || return 1
-    [ "$task_mtime" -le "$report_mtime" ] || return 1
+    # 【QC48-F1是正】同秒は秒粒度statでは順序不明ゆえ納品と認めぬ（fail-high）。
+    [ "$task_mtime" -lt "$report_mtime" ] || return 1
     return 0
 }
 
