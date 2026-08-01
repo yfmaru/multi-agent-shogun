@@ -153,13 +153,13 @@ PY
 }
 
 baton_watchdog_count_active_tasks() {
-    local active=0 f
-    for f in "$ROOT"/queue/tasks/*.yaml; do
-        [ -f "$f" ] || continue
-        if grep -qE '^  status: (assigned|in_progress)' "$f" 2>/dev/null; then
+    local active=0 agent
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+        if baton_watchdog_agent_holds_baton "$agent"; then
             active=$((active + 1))
         fi
-    done
+    done < <(baton_watchdog_list_agents)
     echo "$active"
 }
 
@@ -721,17 +721,38 @@ baton_watchdog_task_active() {
     grep -qE '^  status: (assigned|in_progress)' "$f" 2>/dev/null
 }
 
+# ファイル1件のmtime（epoch秒）を返す。取得できなければ非0で終了する
+# （呼び出し元は `|| return 1` 等で「取れなかった」を伝播させること）。
+# 【cmd_188/③】report_delivered と agent_progress_mtime の両方が
+# 同じ2ファイル（task/report）のmtimeを見るため、statの呼び出しを
+# ここへ括り出し、片方だけ直る分岐が生まれないようにする。
+baton_watchdog_file_mtime() {
+    stat -c %Y "$1" 2>/dev/null
+}
+
 # agent の queue/reports/<agent>_report.yaml が「task_idが一致し、かつ
 # status:done」であれば真（＝既に納品済み）。report yaml のフィールドは
 # task yaml と異なりトップレベル（0-indent）である点に注意。
 baton_watchdog_report_delivered() {
-    local agent="$1" task_id="$2" f report_task_id
+    local agent="$1" task_id="$2" f t report_task_id report_mtime task_mtime
     f="$ROOT/queue/reports/${agent}_report.yaml"
     [ -f "$f" ] || return 1
     [ -n "$task_id" ] || return 1
     report_task_id=$(grep -m1 '^task_id:' "$f" 2>/dev/null | sed -E "s/^task_id:[[:space:]]*//; s/^['\"]//; s/['\"]\$//")
     [ "$report_task_id" = "$task_id" ] || return 1
-    grep -qE '^status: done' "$f" 2>/dev/null
+    grep -qE '^status: done' "$f" 2>/dev/null || return 1
+
+    # 【cmd_188】同一task_idで差し戻された場合、報告は前回分の古い証拠
+    # である。task YAMLが報告より後に書き換えられておれば、その報告を
+    # 納品の証拠として採らない。statが取れなければreturn 1（＝納品と
+    # 認めない＝activeに数える。迷ったら多く数える——count_activeが
+    # 多い方へ倒れるとB-1は黙る〔誤発火せぬ〕。少なく倒れると早鳴きする）。
+    t="$ROOT/queue/tasks/${agent}.yaml"
+    report_mtime=$(baton_watchdog_file_mtime "$f") || return 1
+    task_mtime=$(baton_watchdog_file_mtime "$t") || return 1
+    # 【QC48-F1是正】同秒は秒粒度statでは順序不明ゆえ納品と認めぬ（fail-high）。
+    [ "$task_mtime" -lt "$report_mtime" ] || return 1
+    return 0
 }
 
 # 条件(i)【是正版】: 「assigned/in_progressであり、かつreportが既に
@@ -760,7 +781,7 @@ baton_watchdog_agent_progress_mtime() {
     local agent="$1" f max=0 m
     for f in "$ROOT/queue/tasks/${agent}.yaml" "$ROOT/queue/reports/${agent}_report.yaml"; do
         [ -f "$f" ] || continue
-        m=$(stat -c %Y "$f" 2>/dev/null) || continue
+        m=$(baton_watchdog_file_mtime "$f") || continue
         [ -n "$m" ] && [ "$m" -gt "$max" ] && max=$m
     done
     echo "$max"

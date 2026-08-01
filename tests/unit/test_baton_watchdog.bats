@@ -2229,3 +2229,292 @@ YAML
     [ "$status" -eq 0 ]
     grep -q "baton_lost" "$SHOGUN_NOTIFY_LOG" || { echo "allowlist regression: an unrecognized machine sender was treated as a genuine unread"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_188後半: count_active_tasksをholds_baton基準へ統一
+# （軍師設計 queue/reports/gunshi_188_design.yaml design_back_half節）
+#
+# 【方向A】吠えるべき時に吠える（2026-08-01の実データ形）
+#   TC-ACTIVE-REAL-001/002: 成果物着地済み・report doneなのにtask
+#     YAMLがassignedのままの実例2件（足軽3号・7号）が、それぞれ
+#     count_active_tasksから正しく除外されること
+#   TC-ACTIVE-REAL-003: 上記2件が同時に在る状態でcheck_onceを回すと、
+#     7/31にactive固定でB-1が黙っていた状態が解消されること
+#
+# 【方向B】吠えてはならぬ時に吠えない（誤検知側・fail-high側）
+#   TC-ACTIVE-FP-001〜006: 各種の「納品と誤認してはならぬ」形
+#   TC-ACTIVE-FP-007: 差し戻し形でcheck_onceが早鳴きしないこと
+#
+# TC-B4B-008: 差し戻し形（FP-003と同じmtime順）で無進捗が閾値を
+#   越えたとき、B-4bは②の条項の影響を受けず正しく吠えること
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-ACTIVE-REAL-001: 足軽3号の形（2026-08-01実例） ---
+
+@test "TC-ACTIVE-REAL-001: count_active_tasks excludes an agent whose stale-assigned task has a fresher matching done report (ashigaru3, 2026-08-01 incident shape)" {
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_185_issue_58_qc_fix_v2
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml"
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru3_report.yaml" << 'YAML'
+worker_id: ashigaru3
+task_id: subtask_185_issue_58_qc_fix_v2
+status: done
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 0 ] || { echo "expected active=0 but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-REAL-002: 足軽7号の形（2026-08-01実例） ---
+
+@test "TC-ACTIVE-REAL-002: count_active_tasks excludes an agent whose assigned task has a matching done report (ashigaru7, cmd_183 incident shape)" {
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml" << 'YAML'
+task:
+  task_id: subtask_183_usage_limit_selffeed_fix
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml"
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru7_report.yaml" << 'YAML'
+worker_id: ashigaru7
+task_id: subtask_183_usage_limit_selffeed_fix
+status: done
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 0 ] || { echo "expected active=0 but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-REAL-003: 上記2件同時+閾値越しのcheck_once → 検知が復活すること ---
+
+@test "TC-ACTIVE-REAL-003: check_once detects baton_lost once both real-incident agents are correctly excluded from active" {
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_185_issue_58_qc_fix_v2
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml"
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru3_report.yaml" << 'YAML'
+worker_id: ashigaru3
+task_id: subtask_185_issue_58_qc_fix_v2
+status: done
+YAML
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml" << 'YAML'
+task:
+  task_id: subtask_183_usage_limit_selffeed_fix
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru7.yaml"
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru7_report.yaml" << 'YAML'
+worker_id: ashigaru7
+task_id: subtask_183_usage_limit_selffeed_fix
+status: done
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"baton_condition=true"* ]] || { echo "expected baton_condition=true; got: $output"; false; }
+    [ "$(grep -c 'INBOX_WRITE: shogun' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { echo "expected exactly 1 shogun inbox notification"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-ACTIVE-FP-001: 報告ファイル無し → active=1（納品と誤認しない） ---
+
+@test "TC-ACTIVE-FP-001: an assigned task with no matching report file still counts as active" {
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_fp1
+  status: assigned
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ] || { echo "expected active=1 but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-FP-002: 報告のtask_idが別物 → active=1 ---
+
+@test "TC-ACTIVE-FP-002: a report whose task_id does not match the current task is not treated as delivery, still counts as active" {
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_fp2_v2
+  status: assigned
+YAML
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml" << 'YAML'
+worker_id: ashigaru2
+task_id: subtask_fp2
+status: done
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ] || { echo "expected active=1 but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-FP-003【要】: 同一task_idの差し戻し → 古い報告を証拠に採らない ---
+
+@test "TC-ACTIVE-FP-003: a same-task_id redo makes the report stale evidence — task YAML touched after the report keeps the agent active" {
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml" << 'YAML'
+worker_id: ashigaru2
+task_id: subtask_fp3
+status: done
+YAML
+    touch -d "@$(( $(date +%s) - 1000 ))" "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_fp3
+  status: assigned
+YAML
+    # task YAMLは報告より後(=差し戻し)。デフォルトのmtime(=今)で十分新しい。
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ] || { echo "expected active=1 (redo report must not be accepted as delivery evidence) but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-FP-004: 報告のstatusがdone以外(blocked) → active=1 ---
+
+@test "TC-ACTIVE-FP-004: a report with status other than done (blocked) is not treated as delivery, still counts as active" {
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_fp4
+  status: assigned
+YAML
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml" << 'YAML'
+worker_id: ashigaru2
+task_id: subtask_fp4
+status: blocked
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ] || { echo "expected active=1 but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-FP-005: 報告YAMLが壊れている/読めない → active=1（fail-high） ---
+
+@test "TC-ACTIVE-FP-005: a malformed/unparsable report is not treated as delivery, still counts as active (fail-high)" {
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_fp5
+  status: assigned
+YAML
+    printf 'this is not a valid report\nno task_id line at all\n\x00\x01binary garbage' > "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ] || { echo "expected active=1 (fail-high on unparsable report) but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-FP-006: task status:in_progress + 報告一致done(mtime古) → active=0 ---
+
+@test "TC-ACTIVE-FP-006: an in_progress task with a matching done report (older task mtime) is excluded from active, same discipline as assigned" {
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml" << 'YAML'
+worker_id: ashigaru2
+task_id: subtask_fp6
+status: done
+YAML
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_fp6
+  status: in_progress
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_active_tasks
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 0 ] || { echo "expected active=0 but got: $output"; false; }
+}
+
+# --- TC-ACTIVE-FP-007: 差し戻し形でcheck_onceを閾値越しに回す → 早鳴きしないこと ---
+
+@test "TC-ACTIVE-FP-007: check_once does not fire (baton_condition=false) when a redo keeps an agent counted as active (no early-crow)" {
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml" << 'YAML'
+worker_id: ashigaru2
+task_id: subtask_fp7
+status: done
+YAML
+    touch -d "@$(( $(date +%s) - 1000 ))" "$FIXTURE_ROOT/queue/reports/ashigaru2_report.yaml"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_fp7
+  status: assigned
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"baton_condition=false"* ]] || { echo "expected baton_condition=false; got: $output"; false; }
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { echo "expected zero shogun notifications; got:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-B4B-008: 差し戻し形(FP-003と同型)+無進捗閾値越え → B-4bは吠える ---
+
+@test "TC-B4B-008: B-4b still fires no_progress for a same-task_id redo whose stale-relative report would otherwise look like delivery" {
+    write_settings true 5 60 "" "" 5 60   # progress_stall_after_sec=5
+    cat > "$FIXTURE_ROOT/queue/reports/ashigaru3_report.yaml" << 'YAML'
+worker_id: ashigaru3
+task_id: subtask_b4b008
+status: done
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/reports/ashigaru3_report.yaml"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml" << 'YAML'
+task:
+  task_id: subtask_b4b008
+  status: assigned
+YAML
+    # task YAMLは報告より後(=差し戻し)だが、なお進捗停滞閾値は越えている
+    touch -d "@$(( $(date +%s) - 9000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru3.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru3" "$SHOGUN_NOTIFY_LOG" || { echo "expected B-4b to fire for the redo shape (report_delivered's mtime条項 must not suppress B-4b's own detection)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "subtask_b4b008" "$SHOGUN_NOTIFY_LOG"
+}
