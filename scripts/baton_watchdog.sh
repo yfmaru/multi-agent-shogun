@@ -61,6 +61,7 @@ ROOT="${BATON_WATCHDOG_ROOT:-$SCRIPT_DIR}"
 source "$SCRIPT_DIR/lib/stall_policy.sh"
 source "$SCRIPT_DIR/lib/branch_policy.sh"
 source "$SCRIPT_DIR/lib/usage_limit.sh"
+source "$SCRIPT_DIR/lib/agent_registry.sh"
 
 # ─── プロセスローカル状態 ───
 BATON_LOST_SINCE=0     # 3条件が揃い始めた epoch（揃っていなければ0）
@@ -80,17 +81,22 @@ declare -A PERIODIC_CLEAR_IDLE_SINCE=()  # agent -> idle条件が揃い始めた
 declare -A PERIODIC_CLEAR_SENT=()        # agent -> 同一idle windowで送信済みか(1/0)
 
 # queue/inbox/*.yaml の read:false 件数を数える。ただし
-# from が {baton_watchdog, watcher_supervisor} と完全一致する行（＝番犬
-# 自身の警報。「誰かが保持しておるか」という問いにとって証拠でなくノイズ）
-# は除外する（cmd_180/T-1・軍師検証1）。from 欠落は除外せぬ（数える）。
+# from が agent_registry_agents()（正規エージェント一覧・shogun/karo/
+# ashigaru1-7/gunshi）に含まれない行（＝番犬・inbox_watcher・
+# watcher_supervisor等、機械の書き手からの発信。「誰かが保持しておるか」
+# という問いにとって証拠でなくノイズ）は除外する（cmd_180/T-1・軍師検証1
+# を起点に、cmd_187/SF-2・SF-3でdenylistからallowlistへ設計転換——
+# 新しい機械の書き手が増えてもコード変更が要らぬ形にした）。
+# from 欠落は除外せぬ（数える。安全側）。
 # python/yaml が使えない場合は現行 grep 方式（除外なし）へフォールバックする。
 # unread=0 に倒すと誤って baton_condition が真になり誤発火するため、
 # フォールバックは「除外をやめる」方向にする（3-b。D-1側と倒す向きが逆）。
 baton_watchdog_count_unread() {
-    local python_bin unread
+    local python_bin unread allowed_agents
     python_bin="$(stall_policy_python)"
+    allowed_agents="$(agent_registry_agents_joined ",")"
 
-    if [ -n "$python_bin" ] && unread=$("$python_bin" - "$ROOT" 2>/dev/null <<'PY'
+    if [ -n "$python_bin" ] && unread=$("$python_bin" - "$ROOT" "$allowed_agents" 2>/dev/null <<'PY'
 import glob
 import os
 import sys
@@ -101,7 +107,12 @@ except Exception:
     sys.exit(1)
 
 root = sys.argv[1]
-EXCLUDE = {"baton_watchdog", "watcher_supervisor"}
+# allowlist: 正規エージェント一覧（agent_registry_agents()）に含まれる
+# 送信者だけを「保持・応答しうる主体からの発信」として数える。
+# denylist（機械の書き手名を列挙して除外）ではなく allowlist を採る理由は
+# PR本文・タスクYAML（cmd_187）を参照——新しい機械の書き手が増えても
+# コード変更が要らない。fromが欠落したメッセージは安全側（除外せぬ）とする。
+ALLOWED = set(a for a in sys.argv[2].split(",") if a) if len(sys.argv) > 2 else set()
 
 total = 0
 for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
@@ -120,7 +131,8 @@ for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
             continue
         if msg.get("read") is not False:
             continue
-        if msg.get("from") in EXCLUDE:
+        sender = msg.get("from")
+        if sender is not None and sender not in ALLOWED:
             continue
         total += 1
 
@@ -442,15 +454,20 @@ BATON_D1_NTFY_NOTIFIED=0         # 副経路（ntfy）の二重通知防止ガ�
 # 読むのは queue/inbox/*.yaml のみ。tmux には一切触れない（TC-D1-005）。
 baton_watchdog_list_stale_inbox_agents() {
     local threshold="${1:-$BATON_D1_STALE_AFTER_SEC}"
-    local python_bin
+    local python_bin allowed_agents
     python_bin="$(stall_policy_python)"
-    "$python_bin" - "$ROOT" "$threshold" <<'PY'
+    allowed_agents="$(agent_registry_agents_joined ",")"
+    "$python_bin" - "$ROOT" "$threshold" "$allowed_agents" <<'PY'
 import glob
 import os
 import sys
 from datetime import datetime, timezone
 
 root, threshold = sys.argv[1], int(sys.argv[2])
+# baton_watchdog_count_unread と同じ allowlist 規律（cmd_187/SF-3是正）。
+# 以前はこの関数だけ除外処理が無く、count_unread との間で規律が
+# 食い違っていた。
+ALLOWED = set(a for a in sys.argv[3].split(",") if a) if len(sys.argv) > 3 else set()
 
 try:
     import yaml
@@ -492,6 +509,9 @@ for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
         if not isinstance(msg, dict):
             continue
         if msg.get("read") is not False:
+            continue
+        sender = msg.get("from")
+        if sender is not None and sender not in ALLOWED:
             continue
         dt = parse_ts(msg.get("timestamp"))
         if dt is None:
@@ -719,11 +739,21 @@ baton_watchdog_agent_holds_baton() {
     return 0
 }
 
-# progress artifact（task/report/inboxのmtime最大値、epoch秒）を返す。
+# progress artifact（task/reportのmtime最大値、epoch秒）を返す。
 # いずれのファイルも無ければ0を返す（安全側＝進捗ありとみなし発火させない）。
+#
+# 【cmd_187/SF-1是正】以前はinboxのmtimeも含めていたが、inboxは
+# 「当人が書くもの」ではなく「他人（家老・番犬・inbox_watcher等）が
+# 当人へ書くもの」であるため、他者が1件書くだけで当人が一文字も
+# 動いていなくとも stalled_for が0へ巻き戻る欠陥があった（軍師の
+# A/B実測：queue/reports/gunshi_183_self_feed_audit.yaml SF-1）。
+# read: true への更新時刻のみを進捗と認める代替案（read_at方式）も
+# 検討したが、新規タイムスタンプ基盤が要り全エージェントの既読処理を
+# 横断して変更する必要があるため見送り、inboxを進捗根拠から完全に
+# 除外する単純な方式を採った（トレードオフの詳細はPR本文を参照）。
 baton_watchdog_agent_progress_mtime() {
     local agent="$1" f max=0 m
-    for f in "$ROOT/queue/tasks/${agent}.yaml" "$ROOT/queue/reports/${agent}_report.yaml" "$ROOT/queue/inbox/${agent}.yaml"; do
+    for f in "$ROOT/queue/tasks/${agent}.yaml" "$ROOT/queue/reports/${agent}_report.yaml"; do
         [ -f "$f" ] || continue
         m=$(stat -c %Y "$f" 2>/dev/null) || continue
         [ -n "$m" ] && [ "$m" -gt "$max" ] && max=$m

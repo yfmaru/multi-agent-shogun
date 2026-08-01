@@ -124,6 +124,11 @@ CURLSTUB
 #!/bin/bash
 export BATON_WATCHDOG_ROOT="$FIXTURE_ROOT"
 export STALL_POLICY_SETTINGS="$FIXTURE_ROOT/config/settings.yaml"
+# cmd_187: allowlistの母集合を実リポジトリのconfig/settings.yamlから
+# 独立させる（cli.agentsが未定義のフィクスチャなのでagent_registry_agents()
+# は既定の10エージェント一覧 shogun/karo/ashigaru1-7/gunshi にフォール
+# バックする。決定的・本番設定から隔離されたテストにするため）。
+export AGENT_REGISTRY_SETTINGS="$FIXTURE_ROOT/config/settings.yaml"
 
 # tmux は絶対に呼ばれてはならない。呼ばれたら記録するだけの「失敗モック」。
 tmux() {
@@ -1983,4 +1988,213 @@ YAML
     [ "$status" -eq 0 ] || { echo "$output"; false; }
     printf '%s\n' "$output" | grep -qx '5H_RESET_EPOCH=' || { echo "expected empty 5H_RESET_EPOCH for an offset-less resets_at string, got:"; echo "$output"; false; }
     printf '%s\n' "$output" | grep -qx '7D_RESET_EPOCH=' || { echo "expected empty 7D_RESET_EPOCH for an offset-less resets_at string, got:"; echo "$output"; false; }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 【cmd_187】「救出行為が検知を沈黙させる」構造の是正（SF-1/SF-2/SF-3）
+# 軍師の横断調査（queue/reports/gunshi_183_self_feed_audit.yaml）が
+# 発見した3件の同型欠陥の回帰固定。allowlist方式（agent_registry_agents()
+# に含まれる送信者のみを「保持・応答しうる主体からの発信」として数える）
+# への設計転換の効果を、denylist時代には検出できなかった形で固定する。
+#
+#   TC-SF1-001/002: SF-1（軍師のA/B実験と同型）。他者(karo)がinboxへ
+#                   書き込んでもno_progress判定が変わらないことを固定
+#   TC-SF2-001〜004: SF-2（軍師の4通り比較と同型）。from=inbox_watcherが
+#                    本欠陥の直接固定である
+#   TC-SF3-001: SF-3。list_stale_inbox_agentsがcount_unreadと同じ
+#               除外規律を持つことを固定
+#   TC-ALLOWLIST-001: allowlist方式の要。実在しない架空の機械名でも
+#                      エージェント一覧に無い限り自動的に除外される
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-SF1-001/002: SF-1回帰（軍師のA/B実験と同型） ---
+# 差は「karoが当該エージェントのinboxへ1件書くか否か」ただ1点。
+# 当人(ashigaru6)は両caseで一切動いていない。
+
+@test "TC-SF1-001 (CASE=no_inbound): no_progress fires when task is stale and no one wrote to the agent's inbox" {
+    write_settings true 5 60 "" "" 5 60   # progress_stall_after_sec=5
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml" << 'YAML'
+task:
+  task_id: subtask_sf1_no_inbound
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru6" "$SHOGUN_NOTIFY_LOG"
+}
+
+@test "TC-SF1-002 (CASE=with_inbound) 【SF-1本欠陥の直接固定】: no_progress still fires even after karo writes a fresh message to the same agent's inbox" {
+    write_settings true 5 60 "" "" 5 60
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml" << 'YAML'
+task:
+  task_id: subtask_sf1_with_inbound
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 10000 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru6.yaml"
+
+    # karoが当該エージェント(ashigaru6)のinboxへ1件書く（mtimeは「今」になる）。
+    # 是正前はこの1件がprogress_mtimeを巻き戻し、no_progressが0件になっていた
+    # （gunshi_183_self_feed_audit.yaml SF-1実測と同型）。
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru6.yaml" << 'YAML'
+messages:
+  - id: msg_from_karo
+    read: false
+    from: karo
+    timestamp: '2026-08-01T22:00:00'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru6" "$SHOGUN_NOTIFY_LOG" || { echo "SF-1 regression: inbox write reset the progress timer"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-SF2-001〜004: SF-2回帰（軍師の4通り比較と同型） ---
+# 同一条件（active=0・open_cmds=1・BATON_LOST_SINCE=1000秒前）で、
+# 足軽1号のinboxに置く未読1件のfromだけを変える。機械の書き手からの
+# 発信はいずれも除外され、baton_lost判定は変わらない（常に発火する）。
+# 特にfrom=inbox_watcherは本欠陥（SF-2）の直接固定である——是正前は
+# denylistにinbox_watcherが含まれず、この1件だけが全軍規模の
+# baton_lost検知を沈黙させていた。
+
+@test "TC-SF2-001 (CASE=from=none): baseline control, no extra unread message → baton_lost fires" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 1000 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost" "$SHOGUN_NOTIFY_LOG"
+}
+
+@test "TC-SF2-002 (CASE=from=baton_watchdog): machine sender excluded → baton_lost still fires" {
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru1.yaml" << 'YAML'
+messages:
+  - id: msg_1
+    read: false
+    from: baton_watchdog
+    timestamp: '2026-08-01T22:00:00'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 1000 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost" "$SHOGUN_NOTIFY_LOG"
+}
+
+@test "TC-SF2-003 (CASE=from=watcher_supervisor): machine sender excluded → baton_lost still fires" {
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru1.yaml" << 'YAML'
+messages:
+  - id: msg_1
+    read: false
+    from: watcher_supervisor
+    timestamp: '2026-08-01T22:00:00'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 1000 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost" "$SHOGUN_NOTIFY_LOG"
+}
+
+@test "TC-SF2-004 (CASE=from=inbox_watcher) 【SF-2本欠陥の直接固定】: inbox_watcher's auto-recovery write no longer silences baton_lost across the whole formation" {
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru1.yaml" << 'YAML'
+messages:
+  - id: msg_1
+    read: false
+    from: inbox_watcher
+    timestamp: '2026-08-01T22:00:00'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 1000 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost" "$SHOGUN_NOTIFY_LOG" || { echo "SF-2 regression: inbox_watcher's write silenced whole-formation baton_lost detection"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-SF3-001: SF-3回帰。list_stale_inbox_agentsがcount_unreadと同じ除外規律を持つ ---
+
+@test "TC-SF3-001: list_stale_inbox_agents applies the same allowlist exclusion as count_unread (D-1/B-4c vs B-1 parity)" {
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: inbox_watcher
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        echo \"stale_agents=[\$(baton_watchdog_list_stale_inbox_agents | tr '\n' ',')]\"
+        echo \"unread=\$(baton_watchdog_count_unread)\"
+    "
+    [ "$status" -eq 0 ]
+    # 是正前は list_stale_inbox_agents に除外処理が無く karo が
+    # stale として挙がっていた（count_unread は既に除外していた）。
+    [[ "$output" == *"stale_agents=[]"* ]] || { echo "SF-3 regression: list_stale_inbox_agents did not exclude a machine sender"; echo "$output"; false; }
+    [[ "$output" == *"unread=0"* ]] || { echo "$output"; false; }
+}
+
+# --- TC-ALLOWLIST-001: allowlist方式の要。架空の機械名でも自動的に除外される ---
+
+@test "TC-ALLOWLIST-001: an unrecognized future machine sender (not in agent_registry_agents()) is excluded automatically, without any code change" {
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru1.yaml" << 'YAML'
+messages:
+  - id: msg_1
+    read: false
+    from: some_future_daemon
+    timestamp: '2026-08-01T22:00:00'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 1000 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost" "$SHOGUN_NOTIFY_LOG" || { echo "allowlist regression: an unrecognized machine sender was treated as a genuine unread"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }

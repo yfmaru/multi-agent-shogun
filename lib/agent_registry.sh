@@ -88,6 +88,24 @@ agent_registry_agents() {
     printf '%s\n' "${parsed[@]}"
 }
 
+# agent_registry_agents() の結果を単一行・区切り文字結合の文字列として
+# 返す。python heredoc の引数のように、配列をそのまま渡せない呼び出し先
+# （scripts/baton_watchdog.sh の allowlist フィルタ等）向けのヘルパー。
+# 既定の区切り文字はカンマ（エージェント名に含まれ得ない文字）。
+agent_registry_agents_joined() {
+    local sep="${1:-,}"
+    local agent out=""
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+        if [ -z "$out" ]; then
+            out="$agent"
+        else
+            out="${out}${sep}${agent}"
+        fi
+    done < <(agent_registry_agents)
+    printf '%s\n' "$out"
+}
+
 agent_registry_multiagent_agents() {
     local agent
     while IFS= read -r agent; do
