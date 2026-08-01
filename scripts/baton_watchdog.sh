@@ -71,14 +71,65 @@ BATON_NTFY_NOTIFIED=0  # ntfy通知（cmd_172/急報）を同一継続停止で�
 declare -A PERIODIC_CLEAR_IDLE_SINCE=()  # agent -> idle条件が揃い始めた epoch（0なら未計測）
 declare -A PERIODIC_CLEAR_SENT=()        # agent -> 同一idle windowで送信済みか(1/0)
 
+# queue/inbox/*.yaml の read:false 件数を数える。ただし
+# from が {baton_watchdog, watcher_supervisor} と完全一致する行（＝番犬
+# 自身の警報。「誰かが保持しておるか」という問いにとって証拠でなくノイズ）
+# は除外する（cmd_180/T-1・軍師検証1）。from 欠落は除外せぬ（数える）。
+# python/yaml が使えない場合は現行 grep 方式（除外なし）へフォールバックする。
+# unread=0 に倒すと誤って baton_condition が真になり誤発火するため、
+# フォールバックは「除外をやめる」方向にする（3-b。D-1側と倒す向きが逆）。
 baton_watchdog_count_unread() {
-    local unread=0 f n
+    local python_bin unread
+    python_bin="$(stall_policy_python)"
+
+    if [ -n "$python_bin" ] && unread=$("$python_bin" - "$ROOT" 2>/dev/null <<'PY'
+import glob
+import os
+import sys
+
+try:
+    import yaml
+except Exception:
+    sys.exit(1)
+
+root = sys.argv[1]
+EXCLUDE = {"baton_watchdog", "watcher_supervisor"}
+
+total = 0
+for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        continue
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("read") is not False:
+            continue
+        if msg.get("from") in EXCLUDE:
+            continue
+        total += 1
+
+print(total)
+PY
+    ) && [[ "$unread" =~ ^[0-9]+$ ]]; then
+        echo "$unread"
+        return 0
+    fi
+
+    local total=0 f n
     for f in "$ROOT"/queue/inbox/*.yaml; do
         [ -f "$f" ] || continue
         n=$(grep -c 'read: false' "$f" 2>/dev/null || true)
-        unread=$((unread + ${n:-0}))
+        total=$((total + ${n:-0}))
     done
-    echo "$unread"
+    echo "$total"
 }
 
 baton_watchdog_count_active_tasks() {
@@ -265,7 +316,17 @@ periodic_clear_check_once() {
 # 一切依存しない。ファイル書き込みのみ・tmux不使用（既存の不変条件のまま）。
 baton_watchdog_notify_shogun() {
     local message="$1"
-    bash "$ROOT/scripts/inbox_write.sh" shogun "$message" baton_alert baton_watchdog
+    baton_watchdog_notify_inbox shogun "$message"
+}
+
+# 任意の宛先へ番犬警報を書く（cmd_180/T-3・T-4）。「番犬は、停滞を診断
+# した当人のinboxへ通知を書いてはならない」という原則（軍師
+# principle_never_write_to_the_diagnosed）の実装土台。自らの通知が
+# 対象自身の新たな未読になり、条件が崩れず通知ガードが永久に1のまま
+# 張り付く（一度吠えたきり永久に黙る）ことを構造的に防ぐ。
+baton_watchdog_notify_inbox() {
+    local target="$1" message="$2"
+    bash "$ROOT/scripts/inbox_write.sh" "$target" "$message" baton_alert baton_watchdog
 }
 
 # 1回だけ判定する。メインループ・--once どちらからも呼ばれる。
@@ -372,9 +433,10 @@ BATON_D1_NTFY_NOTIFIED=0         # 副経路（ntfy）の二重通知防止ガ�
 #   ローカル時刻・オフセット表記なしのnaive文字列を書くため）。
 # 読むのは queue/inbox/*.yaml のみ。tmux には一切触れない（TC-D1-005）。
 baton_watchdog_list_stale_inbox_agents() {
+    local threshold="${1:-$BATON_D1_STALE_AFTER_SEC}"
     local python_bin
     python_bin="$(stall_policy_python)"
-    "$python_bin" - "$ROOT" "$BATON_D1_STALE_AFTER_SEC" <<'PY'
+    "$python_bin" - "$ROOT" "$threshold" <<'PY'
 import glob
 import os
 import sys
@@ -442,6 +504,41 @@ baton_watchdog_watcher_alive() {
     pgrep -f "scripts/inbox_watcher.sh ${agent} " >/dev/null 2>&1
 }
 
+# queue/inbox/*.yaml が存在するエージェント名を1行1件で返す
+# （ファイル名から拡張子を除いたもの）。karo/shogunを含む点で
+# baton_watchdog_list_agents（queue/tasks/*.yaml ベース。B-4b専用）とは
+# 別物であり、混ぜてはならない（B-4bがtask YAMLを持たぬkaro/shogunを
+# 拾おうとして崩れる。軍師検証2 q3）。B-4c対象列挙・
+# WATCHER_ALIVE_SNAPSHOT更新対象列挙の双方で使う。
+baton_watchdog_list_inbox_agents() {
+    local f
+    for f in "$ROOT"/queue/inbox/*.yaml; do
+        [ -f "$f" ] || continue
+        basename "$f" .yaml
+    done
+}
+
+# ─── watcher生死スナップショット（cmd_180/T-2） ───
+# D-1・B-4cが別々のタイミングでpgrepを叩くと、その間にwatcher_supervisorが
+# 死んだwatcherを再起動した場合、両方が発火し得る（軍師検証2・是正1）。
+# サイクル冒頭（メインループ・--once分岐の先頭、check_onceより前）で
+# 生死を1度だけ測り凍結することで、同一サイクル内ではD-1・B-4cが必ず
+# 同じ値を参照するようにする。
+declare -A WATCHER_ALIVE_SNAPSHOT=()
+
+baton_watchdog_refresh_watcher_snapshot() {
+    local agent
+    WATCHER_ALIVE_SNAPSHOT=()
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+        if baton_watchdog_watcher_alive "$agent"; then
+            WATCHER_ALIVE_SNAPSHOT[$agent]=1
+        else
+            WATCHER_ALIVE_SNAPSHOT[$agent]=0
+        fi
+    done < <(baton_watchdog_list_inbox_agents)
+}
+
 # D-1を1回だけ判定する。check_once()（B-1〜B-3）とは完全に独立した関数であり、
 # check_once() を呼ばない・その内部にも触れない。
 #
@@ -449,7 +546,8 @@ baton_watchdog_watcher_alive() {
 #            (ii) その agent の inbox_watcher.sh プロセスが生きていない
 check_d1_once() {
     local agent dead_stale_count=0
-    local now elapsed ntfy_threshold
+    local now elapsed ntfy_threshold notify_target
+    local -a dead_stale_agents=()
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -457,8 +555,9 @@ check_d1_once() {
 
     while IFS= read -r agent; do
         [ -n "$agent" ] || continue
-        if ! baton_watchdog_watcher_alive "$agent"; then
+        if [ "${WATCHER_ALIVE_SNAPSHOT[$agent]:-0}" -eq 0 ]; then
             dead_stale_count=$((dead_stale_count + 1))
+            dead_stale_agents+=("$agent")
         fi
     done < <(baton_watchdog_list_stale_inbox_agents)
 
@@ -469,12 +568,36 @@ check_d1_once() {
         fi
         elapsed=$((now - BATON_D1_CONDITION_SINCE))
 
-        # 主経路: 将軍inbox通知。既存どおり、検知した時点で無条件・即座に
-        # 発火する（メッセージ自身が既にBATON_D1_STALE_AFTER_SEC秒分stale
-        # であることが継続の証拠であり、追加の待機は挟まない）。
+        # 通知先の決定規則（診断した当人へは書かぬ・cmd_180/T-4）:
+        # dead_stale_agentsにshogunが含まれる場合、将軍inboxへ書くとその
+        # 通知自身が将軍inboxの新たなstale未読になり、BATON_D1_NOTIFIED
+        # （グローバルスカラ）が永久に1のまま張り付く（軍師OBS-180-1）。
+        # 単独か否かは無関係——含まれてさえいれば起きる（軍師QC39-F1・
+        # 是正前は「shogun単独」の場合しか救っておらず、shogunが他の者と
+        # 並んで診断対象に入ると将軍inboxへ書いてしまい病が再発した）。
+        # ゆえにkaro宛へ切り替える。それ以外は従来どおり将軍inbox。
+        #
+        # 【残余・塞げていない一点】shogunとkaroが同時に診断対象となる
+        # 場合、inbox経路はどちらへ書いても診断対象自身であり原理的に
+        # 自己給餌になる。本PRの射程では塞げない。ただし副経路ntfy
+        # （baton_d1_ntfy_after_sec、既定900秒）は独立した閾値・独立した
+        # ガードで動くため、900秒継続すれば必ず1回は主のスマホへ届く。
+        # 「主へは届く。番犬の再武装（inbox経路によるkaro/shogunの覚醒）
+        # だけが失われる」という限定的な残余であり、これを「塞いだ」と
+        # 記録してはならない（CLAUDE.md「ACが原理的に充足不能と判明した
+        # 場合」節と同じ規律）。
+        if [[ " ${dead_stale_agents[*]} " == *" shogun "* ]]; then
+            notify_target=karo
+        else
+            notify_target=shogun
+        fi
+
+        # 主経路: 通知先inbox書き込み。既存どおり、検知した時点で無条件・
+        # 即座に発火する（メッセージ自身が既にBATON_D1_STALE_AFTER_SEC秒分
+        # staleであることが継続の証拠であり、追加の待機は挟まない）。
         # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
         if [ "$BATON_D1_NOTIFIED" -eq 0 ]; then
-            baton_watchdog_notify_shogun "delivery_stall: dead_watcher_stale_inboxes=${dead_stale_count} (${BATON_D1_STALE_AFTER_SEC}s+未読放置 かつ watcherプロセス不在。配送機構死亡の疑い)"
+            baton_watchdog_notify_inbox "$notify_target" "delivery_stall: dead_watcher_stale_inboxes=${dead_stale_count} (${BATON_D1_STALE_AFTER_SEC}s+未読放置 かつ watcherプロセス不在。配送機構死亡の疑い)"
             BATON_D1_NOTIFIED=1
         fi
 
@@ -661,6 +784,121 @@ check_b4b_once() {
     done < <(baton_watchdog_list_agents)
 }
 
+# ═══════════════════════════════════════════════════════════════
+# B-4c: stale未読 かつ watcher生存 検知（cmd_180/T-3）
+#
+# 発端: 2026-07-31 20:52:25 からの6時間23分の自己沈黙インシデント。
+# 既存のB-1〜B-3（check_once）・D-1（check_d1_once・watcher死亡が前提）
+# のいずれも、「watcherは生きているが、対象がinboxを読んでいない」形の
+# 停止を検知できない。B-4cはこれを埋める独立したOR条件である。
+#
+# 条件はAND:
+#   (i)  stale未読が baton_b4c_stale_after_sec（既定5400秒/90分）以上
+#   (ii) WATCHER_ALIVE_SNAPSHOT[agent] == 1（サイクル冒頭で凍結した値を
+#        読む。D-1と別々にpgrepを叩くと、その間にwatcher_supervisorが
+#        死んだwatcherを再起動した場合に両方が発火し得るため。
+#        軍師検証2・是正1）
+#
+# 対象エージェント列挙は baton_watchdog_list_stale_inbox_agents を
+# 閾値パラメタ化して流用する（D-1が使うものと同一関数。D-1の無引数
+# 呼び出しは挙動不変。軍師検証2 q3）。
+#
+# 【最重要・自己給餌ラッチの防止】通知先は「番犬は、停滞を診断した
+# 当人のinboxへ通知を書いてはならない」原則（軍師
+# principle_never_write_to_the_diagnosed）に従う。将軍inboxへ書くと、
+# その通知自身が将軍inboxの新たなstale未読になり、B4C_NOTIFIED[shogun]
+# が永久に1のまま張り付く（一度吠えたきり永久に黙る＝本cmdが塞ごうと
+# している当の病そのもの）ため:
+#   対象がshogun          → 主経路はkaroのinboxへ
+#   対象がkaro            → 主経路はshogunのinboxへ
+#   対象がそれ以外(足軽/軍師) → 従来どおりshogunのinboxへ
+#   副経路(ntfy)          → 対象を問わず常に試みる（失敗許容）
+# ntfyの副経路閾値はB-4bのbaton_b4b_ntfy_after_secを流用する（B-4cは
+# 「90分無進捗」という尺度をB-4bと共有する設計であり、専用キーは新設しない）。
+#
+# 【既知の残余・軍師OBS-180-3】B-4cが将軍を検知できるのは「将軍宛に
+# 未読が在る」時に限る。将軍inboxへ書く者はbaton_watchdogと
+# watcher_supervisorの2者のみであり、平時は将軍宛の未読が発生しない。
+# 「番犬が吠える理由も無いまま将軍が居らぬ」形は依然として検知できない。
+#
+# check_once/check_d1_once/check_b4b_once本体には一切触れない。
+# ═══════════════════════════════════════════════════════════════
+declare -A B4C_CONDITION_SINCE=()  # agent -> 条件(i)(ii)が揃い始めたepoch(0なら未計測)
+declare -A B4C_NOTIFIED=()         # 主経路の二重通知防止ガード（agentごと）
+declare -A B4C_NTFY_NOTIFIED=()    # 副経路(ntfy)の二重通知防止ガード（agentごと）
+
+# 診断した当人のinboxへは書かぬ、という原則に基づき通知先を決める
+# （cmd_180・軍師 principle_never_write_to_the_diagnosed。T-3/T-4共通）。
+baton_watchdog_notify_target_for() {
+    local agent="$1"
+    case "$agent" in
+        shogun) echo karo ;;
+        karo)   echo shogun ;;
+        *)      echo shogun ;;
+    esac
+}
+
+# B-4cを1回だけ判定する。check_once()・check_d1_once()・check_b4b_once()
+# とは完全に独立した関数であり、それらを呼ばない・その内部にも触れない。
+check_b4c_once() {
+    local agent now stale_threshold ntfy_threshold notify_target
+    local elapsed stale_agent
+    local -A stale_agent_set=()
+
+    if [ "$(baton_watchdog_query enabled)" != "true" ]; then
+        return 0
+    fi
+
+    now=$(date +%s)
+    stale_threshold=$(baton_watchdog_query baton_b4c_stale_after_sec)
+    ntfy_threshold=$(baton_watchdog_query baton_b4b_ntfy_after_sec)
+
+    while IFS= read -r stale_agent; do
+        [ -n "$stale_agent" ] || continue
+        stale_agent_set[$stale_agent]=1
+    done < <(baton_watchdog_list_stale_inbox_agents "$stale_threshold")
+
+    # 全inboxエージェントを固定の母集合として毎回走査する（B-4bと同じ
+    # 規律）。stale集合のみを走査すると、staleから外れたエージェントの
+    # ガードが二度とリセットされず、再武装（TC-B4C-LATCH-002）が壊れる。
+    while IFS= read -r agent; do
+        [ -n "$agent" ] || continue
+
+        if [ "${stale_agent_set[$agent]:-0}" = "1" ] && [ "${WATCHER_ALIVE_SNAPSHOT[$agent]:-0}" -eq 1 ]; then
+            if [ "${B4C_CONDITION_SINCE[$agent]:-0}" -eq 0 ]; then
+                B4C_CONDITION_SINCE[$agent]=$now
+            fi
+            elapsed=$((now - B4C_CONDITION_SINCE[$agent]))
+
+            notify_target=$(baton_watchdog_notify_target_for "$agent")
+
+            # 主経路: 検知した時点で無条件・即座に発火する（stale未読
+            # 自体が継続の証拠であり、追加の待機は挟まない）。
+            if [ "${B4C_NOTIFIED[$agent]:-0}" -eq 0 ]; then
+                baton_watchdog_notify_inbox "$notify_target" "inbox_stall: agent=${agent} (${stale_threshold}s+未読放置 かつ watcherプロセス生存。読まれていない疑い)"
+                B4C_NOTIFIED[$agent]=1
+            fi
+
+            # 副経路: ntfy（主のスマホ）。エージェントごとに独立した
+            # 閾値・ガードで管理する。失敗許容——失敗してもログに残す
+            # のみで主経路の通知には無関係。
+            if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "${B4C_NTFY_NOTIFIED[$agent]:-0}" -eq 0 ]; then
+                if ! branch_policy_notify "inbox_stall: agent=${agent} (${ntfy_threshold}s+検知継続・ntfy)"; then
+                    echo "[$(date)] [baton_watchdog] B-4c ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+                fi
+                B4C_NTFY_NOTIFIED[$agent]=1
+            fi
+        else
+            # 条件(i)(ii)いずれかが崩れた＝watcherが死んでいる（D-1の
+            # 担当領域）か、もはやstaleでない。次に条件が揃った際は
+            # 新たな継続として独立して計測し直す。
+            B4C_CONDITION_SINCE[$agent]=0
+            B4C_NOTIFIED[$agent]=0
+            B4C_NTFY_NOTIFIED[$agent]=0
+        fi
+    done < <(baton_watchdog_list_inbox_agents)
+}
+
 if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     mkdir -p "$ROOT/logs"
 
@@ -670,17 +908,21 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
     fi
 
     if [ "${1:-}" = "--once" ]; then
+        baton_watchdog_refresh_watcher_snapshot
         check_once
         check_d1_once
         check_b4b_once
+        check_b4c_once
         periodic_clear_check_once
         exit 0
     fi
 
     while true; do
+        baton_watchdog_refresh_watcher_snapshot
         check_once
         check_d1_once
         check_b4b_once
+        check_b4c_once
         periodic_clear_check_once
         sleep "$(baton_watchdog_query poll_interval_sec)"
     done
