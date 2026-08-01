@@ -49,6 +49,8 @@
 #   T-SHOGUN-008: send_wakeup — client attached but activity old → send-keys fires (ntfy reply path, PR#75 non-regression, cmd_182, MUST)
 #   T-SHOGUN-009: send_wakeup — non-shogun agent unaffected by recent typing (cmd_182)
 #   T-SHOGUN-010: send_wakeup — no client at all → human_typing_recently false → send-keys fires (cmd_182)
+#   T-SHOGUN-011: deferral sets SHOGUN_DEFER_PENDING, reopens should_process_timeout_tick, resets on delivery/unread=0 (cmd_182 QC40-F1, MUST)
+#   T-SHOGUN-012: deferred ntfy (branch_policy_notify) fires only once per defer episode (cmd_182 QC40-F2, MUST)
 #   T-BUSY-005: agent_is_busy — returns busy during /clear cooldown (LAST_CLEAR_TS)
 #   T-BUSY-006: agent_is_busy — returns idle after /clear cooldown expires
 #   T-BUSY-007: agent_is_busy — /clear cooldown overrides idle pane
@@ -1117,6 +1119,88 @@ YAML
 
     grep -q "send-keys.*inbox2" "$MOCK_LOG"
     ! echo "$output" | grep -q "DEFER"
+}
+
+# --- T-SHOGUN-011 (MUST, cmd_182 QC40-F1): deferral re-arms re-evaluation ---
+# shogun's watcher runs with ASW_PROCESS_TIMEOUT=0 (event-driven only), so
+# without SHOGUN_DEFER_PENDING there is no "next cycle" to re-check a
+# deferred nudge. Pins: (a) should_process_timeout_tick() — the extracted
+# main-loop gate — stays closed by default and opens only while a defer is
+# pending; (b) SHOGUN_DEFER_PENDING flips 1 on defer and back to 0 once the
+# nudge actually reaches the pane.
+
+@test "T-SHOGUN-011: deferral sets SHOGUN_DEFER_PENDING and re-opens the timeout gate until delivered" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        AGENT_ID="shogun"
+
+        ASW_PROCESS_TIMEOUT=0
+        SHOGUN_DEFER_PENDING=0
+        should_process_timeout_tick; echo "TICK_BEFORE_DEFER=$?"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"    # typed 5s ago -> defer
+        send_wakeup 2
+        echo "DEFER_PENDING_AFTER_DEFER=$SHOGUN_DEFER_PENDING"
+        should_process_timeout_tick; echo "TICK_AFTER_DEFER=$?"
+
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 120 ))"  # guard (60s) elapsed -> delivered
+        send_wakeup 2
+        echo "DEFER_PENDING_AFTER_SEND=$SHOGUN_DEFER_PENDING"
+        should_process_timeout_tick; echo "TICK_AFTER_SEND=$?"
+
+        # reset_shogun_defer_state is also the unread=0 reset path (process_unread
+        # calls it once the inbox drains); pin it directly since driving the full
+        # process_unread flow through this harness is not practical.
+        SHOGUN_DEFER_PENDING=1
+        SHOGUN_DEFER_NTFY_SENT=1
+        reset_shogun_defer_state
+        echo "UNREAD_ZERO_RESET=${SHOGUN_DEFER_PENDING}${SHOGUN_DEFER_NTFY_SENT}"
+    '
+    [ "$status" -eq 0 ]
+
+    echo "$output" | grep -q "TICK_BEFORE_DEFER=1" \
+        || { echo "expected timeout gate closed before any defer (event-driven default); output: $output"; false; }
+    echo "$output" | grep -q "DEFER_PENDING_AFTER_DEFER=1" \
+        || { echo "expected SHOGUN_DEFER_PENDING=1 immediately after the defer branch; output: $output"; false; }
+    echo "$output" | grep -q "TICK_AFTER_DEFER=0" \
+        || { echo "expected timeout gate reopened (rc=0) while a defer is pending; output: $output"; false; }
+    echo "$output" | grep -q "DEFER_PENDING_AFTER_SEND=0" \
+        || { echo "expected SHOGUN_DEFER_PENDING reset to 0 once send-keys actually delivered; output: $output"; false; }
+    echo "$output" | grep -q "TICK_AFTER_SEND=1" \
+        || { echo "expected timeout gate closed again after defer resolved; output: $output"; false; }
+    echo "$output" | grep -q "UNREAD_ZERO_RESET=00" \
+        || { echo "expected reset_shogun_defer_state (unread=0 reset path) to clear both flags; output: $output"; false; }
+}
+
+# --- T-SHOGUN-012 (MUST, cmd_182 QC40-F2): deferred ntfy fires once per episode ---
+# Without a one-shot guard, once QC40-F1 reopens the timeout gate the ntfy
+# insurance path would fire every ~30s for as long as the defer continues
+# (a dead path turning into a flood). Pins that 3 send_wakeup calls while
+# still deferred and past the ntfy threshold produce exactly 1 notify call.
+
+@test "T-SHOGUN-012: deferred ntfy notification fires only once per defer episode" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        NOTIFY_LOG="'"$TEST_TMPDIR"'/notify.log"
+        > "$NOTIFY_LOG"
+        # Real network (ntfy) must not be hit in tests — override after sourcing,
+        # same style as test_baton_watchdog.bats.
+        branch_policy_notify() { echo "NOTIFY: $1" >> "$NOTIFY_LOG"; return 0; }
+
+        AGENT_ID="shogun"
+        MOCK_CLIENT_ACTIVITY="$(( $(date +%s) - 5 ))"     # always typed recently -> always defer
+        FIRST_UNREAD_SEEN=$(( $(date +%s) - 400 ))         # past default 300s ntfy threshold
+
+        send_wakeup 2
+        send_wakeup 2
+        send_wakeup 2
+
+        calls=$(grep -c "NOTIFY:" "$NOTIFY_LOG")
+        echo "NOTIFY_CALLS=$calls"
+    '
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "NOTIFY_CALLS=1" \
+        || { echo "expected exactly 1 branch_policy_notify call across 3 deferred send_wakeup calls; output: $output"; false; }
 }
 
 # --- T-BUSY-005: agent_is_busy during /clear cooldown ---
