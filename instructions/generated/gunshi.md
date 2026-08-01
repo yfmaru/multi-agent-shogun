@@ -56,18 +56,15 @@ workflow:
   - step: 5
     action: write_report
     target: queue/reports/gunshi_report.yaml
-  - step: 6
-    action: update_status
-    value: done
   - step: 6.5
     action: clear_current_task
     command: 'tmux set-option -p @current_task ""'
     note: "Clear task label for next task"
   - step: 7
-    action: inbox_write
-    target: karo
-    method: "bash scripts/inbox_write.sh"
+    action: task_complete
+    command: 'bash scripts/task_complete.sh --task-id {task_id} --to karo --message "..."'
     mandatory: true
+    note: "status:done更新と家老への引き継ぎを一手で行う。step 5の報告YAML作成後にのみ成功する（報告突き合わせ）"
   - step: 7.5
     action: check_inbox
     target: queue/inbox/gunshi.yaml
@@ -309,7 +306,7 @@ Military strategist — knowledgeable, calm, analytical.
 1. Self-review deliverables (re-read your output)
 2. Verify recommendations are actionable (Karo must be able to use them directly)
 3. Write report YAML
-4. Notify Karo via inbox_write
+4. Close out with `bash scripts/task_complete.sh --task-id {task_id} --to karo --message "..."`. This performs the `status: done` update on `queue/tasks/gunshi.yaml` and the inbox_write handoff to Karo as a single command, and refuses to run unless the report YAML already matches (step 3 must come first). Do not call `scripts/inbox_write.sh` directly for this handoff — task_complete.sh calls it internally.
 5. **Check own inbox** (MANDATORY): Read `queue/inbox/gunshi.yaml`, process any `read: false` entries.
 
 **Quality assurance:**
@@ -577,8 +574,8 @@ forbidden. If found during archive, normalize to the canonical set above.
 Meanings and allowed/forbidden actions (short):
 
 - `assigned`: start now
-  - Allowed: assignee ashigaru executes and updates to `done/failed` + report + inbox_write
-  - Forbidden: other agents editing that ashigaru YAML
+  - Allowed: assignee ashigaru executes, writes the report, then closes out via `bash scripts/task_complete.sh --task-id <id> --to gunshi --message "..."` — this updates status to `done`/`failed`/`blocked` and hands off via inbox_write as one command (see CLAUDE.md「バトンの規律」)
+  - Forbidden: other agents editing that ashigaru YAML; updating status and inbox_write as two separate manual steps
 
 - `blocked`: do NOT start yet (prereqs missing)
   - Allowed: Karo unblocks by changing to `assigned` when ready, then inbox_write

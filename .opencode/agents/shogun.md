@@ -452,8 +452,8 @@ forbidden. If found during archive, normalize to the canonical set above.
 Meanings and allowed/forbidden actions (short):
 
 - `assigned`: start now
-  - Allowed: assignee ashigaru executes and updates to `done/failed` + report + inbox_write
-  - Forbidden: other agents editing that ashigaru YAML
+  - Allowed: assignee ashigaru executes, writes the report, then closes out via `bash scripts/task_complete.sh --task-id <id> --to gunshi --message "..."` — this updates status to `done`/`failed`/`blocked` and hands off via inbox_write as one command (see CLAUDE.md「バトンの規律」)
+  - Forbidden: other agents editing that ashigaru YAML; updating status and inbox_write as two separate manual steps
 
 - `blocked`: do NOT start yet (prereqs missing)
   - Allowed: Karo unblocks by changing to `assigned` when ready, then inbox_write

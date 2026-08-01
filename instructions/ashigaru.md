@@ -59,9 +59,6 @@ workflow:
   - step: 5
     action: write_report
     target: "queue/reports/ashigaru{N}_report.yaml"
-  - step: 6
-    action: update_status
-    value: done
   - step: 6.5
     action: clear_current_task
     command: 'tmux set-option -p @current_task ""'
@@ -76,11 +73,10 @@ workflow:
     action: seo_keyword_record
     note: "If SEO project, append completed keywords to done_keywords.txt"
   - step: 9
-    action: inbox_write
-    target: gunshi
-    method: "bash scripts/inbox_write.sh"
+    action: task_complete
+    command: 'bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message "..."'
     mandatory: true
-    note: "Changed from karo to gunshi. Gunshi now handles quality check + dashboard."
+    note: "status:done更新と軍師への引き継ぎを一手で行う。step 5の報告YAML作成後にのみ成功する（報告突き合わせ）"
   - step: 9.5
     action: check_inbox
     target: "queue/inbox/ashigaru{N}.yaml"
@@ -243,14 +239,13 @@ gh pr create --draft --base <base> --title "..." --body "..."
 
 ## Report Notification Protocol
 
-After writing report YAML, notify Gunshi (NOT Karo):
+After writing report YAML, close out with `scripts/task_complete.sh` (NOT Karo — Gunshi handles quality check + dashboard aggregation):
 
 ```bash
-bash scripts/inbox_write.sh gunshi "足軽{N}号、任務完了でござる。品質チェックを仰ぎたし。" report_received ashigaru{N}
+bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message "足軽{N}号、任務完了でござる。品質チェックを仰ぎたし。"
 ```
 
-Gunshi now handles quality check and dashboard aggregation. No state checking, no retry, no delivery verification.
-The inbox_write guarantees persistence. inbox_watcher handles delivery.
+This performs the `status: done` update on your task YAML and the inbox_write handoff to Gunshi as a single command — it refuses to run (exit 3) unless your report YAML already matches this task_id with status done/failed/blocked, so it structurally cannot be called before step 5. It internally calls `scripts/inbox_write.sh`; do not call `inbox_write.sh` directly for this handoff. On failure it prints an exit code (2/3/4/5) with a one-line explanation to stderr and, on inbox_write failure (exit 4), rolls the status back so you still hold the baton — re-run once the cause is fixed.
 
 ## Report Format
 

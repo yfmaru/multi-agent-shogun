@@ -58,9 +58,6 @@ workflow:
   - step: 5
     action: write_report
     target: "queue/reports/ashigaru{N}_report.yaml"
-  - step: 6
-    action: update_status
-    value: done
   - step: 6.5
     action: clear_current_task
     command: 'tmux set-option -p @current_task ""'
@@ -75,11 +72,10 @@ workflow:
     action: seo_keyword_record
     note: "If SEO project, append completed keywords to done_keywords.txt"
   - step: 9
-    action: inbox_write
-    target: gunshi
-    method: "bash scripts/inbox_write.sh"
+    action: task_complete
+    command: 'bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message "..."'
     mandatory: true
-    note: "Changed from karo to gunshi. Gunshi now handles quality check + dashboard."
+    note: "status:done更新と軍師への引き継ぎを一手で行う。step 5の報告YAML作成後にのみ成功する（報告突き合わせ）"
   - step: 9.5
     action: check_inbox
     target: "queue/inbox/ashigaru{N}.yaml"
@@ -214,9 +210,9 @@ Act without waiting for Karo's instruction:
 1. Self-review deliverables (re-read your output)
 2. **Purpose validation**: Read `parent_cmd` in `queue/shogun_to_karo.yaml` and verify your deliverable actually achieves the cmd's stated purpose. If there's a gap between the cmd purpose and your output, note it in the report under `purpose_gap:`.
 3. Write report YAML
-4. Notify Gunshi via inbox_write (NOT Karo directly)
+4. Close out with `bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message "..."` (NOT Karo directly). This performs the `status: done` update and the inbox_write handoff to Gunshi as a single command, and refuses to run unless your report YAML already matches (step 3 must come first). Do not call `scripts/inbox_write.sh` directly for this handoff — task_complete.sh calls it internally.
 5. **Check own inbox** (MANDATORY): Read `queue/inbox/ashigaru{N}.yaml`, process any `read: false` entries. This catches redo instructions that arrived during task execution. Skip = stuck idle until the next nudge escalation or task reassignment.
-6. (No delivery verification needed — inbox_write guarantees persistence)
+6. (No delivery verification needed — task_complete.sh rolls status back and reports a retryable exit code if inbox_write fails)
 
 **Quality assurance:**
 - After modifying files → verify with Read
@@ -519,8 +515,8 @@ forbidden. If found during archive, normalize to the canonical set above.
 Meanings and allowed/forbidden actions (short):
 
 - `assigned`: start now
-  - Allowed: assignee ashigaru executes and updates to `done/failed` + report + inbox_write
-  - Forbidden: other agents editing that ashigaru YAML
+  - Allowed: assignee ashigaru executes, writes the report, then closes out via `bash scripts/task_complete.sh --task-id <id> --to gunshi --message "..."` — this updates status to `done`/`failed`/`blocked` and hands off via inbox_write as one command (see CLAUDE.md「バトンの規律」)
+  - Forbidden: other agents editing that ashigaru YAML; updating status and inbox_write as two separate manual steps
 
 - `blocked`: do NOT start yet (prereqs missing)
   - Allowed: Karo unblocks by changing to `assigned` when ready, then inbox_write
