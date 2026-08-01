@@ -72,6 +72,7 @@ USAGE_LAST_CHECK_AT=0
 declare -A USAGE_WARNED_WINDOW=()   # label -> 予告済み枠の reset epoch
 declare -A USAGE_WARNED_AT=()       # label -> 予告を出した epoch
 declare -A USAGE_RESUMED_WINDOW=()  # label -> 再開号令済み枠の reset epoch
+declare -A USAGE_WARNED_FLAGGED=()  # label -> 予告時点のLIMITS_FLAGGED値（finding_3の契約変更検知に使用）
 
 # ─── periodic /clear (cmd_172/P7) プロセスローカル状態 ───
 # エージェントごとに独立（B-1/B-2/B-3の全体判定とは完全に並存する別機能）。
@@ -934,6 +935,11 @@ baton_watchdog_max_progress_mtime() {
     local agent m max=0
     while IFS= read -r agent; do
         [ -n "$agent" ] || continue
+        # 番犬自身の通知先は「進捗」と数えぬ。予告(usage_warn)が
+        # karoのinboxを書き換えると、そのmtimeが「karoの進捗」として
+        # 拾われ、再開条件(iv)（予告以降誰も動いていない）が永久に
+        # 偽になる自己給餌を起こす（cmd_180 OBS-180-1と同型。OBS-181-6）。
+        case "$agent" in karo|shogun) continue ;; esac
         m=$(baton_watchdog_agent_progress_mtime "$agent")
         [ -n "$m" ] && [ "$m" -gt "$max" ] && max=$m
     done < <(baton_watchdog_list_agents)
@@ -944,7 +950,7 @@ baton_watchdog_max_progress_mtime() {
 # 完全に独立。それらを呼ばず、その内部状態にも触れない。
 check_usage_once() {
     local now interval raw
-    local util5h reset5h util7d reset7d
+    local util5h reset5h util7d reset7d flagged
     local warn_pct resume_pct
 
     [ "$(baton_watchdog_query enabled)" = "true" ] || return 0
@@ -966,26 +972,33 @@ check_usage_once() {
     reset5h=$(printf '%s' "$raw" | grep '^5H_RESET_EPOCH=' | cut -d= -f2)
     util7d=$(printf '%s' "$raw" | grep '^7D_UTIL='        | cut -d= -f2)
     reset7d=$(printf '%s' "$raw" | grep '^7D_RESET_EPOCH=' | cut -d= -f2)
+    flagged=$(printf '%s' "$raw" | grep '^LIMITS_FLAGGED=' | cut -d= -f2)
 
     warn_pct=$(baton_watchdog_query usage_warn_pct)
     resume_pct=$(baton_watchdog_query usage_resume_below_pct)
 
-    # 5時間枠: 予告は家老へも送る（(b)の本体）。再開もこの枠のみ。
+    # 5時間枠: 予告は家老へも送る（(b)の本体）。
     _usage_window_check 5h "$util5h" "$reset5h" "$warn_pct" \
-                        "$resume_pct" "$now" true
-    # 7日枠: 予告は将軍inbox+ntfyのみ。家老へは送らぬ
+                        "$resume_pct" "$now" true "$flagged"
+    # 7日枠: 予告(a)は将軍inbox+ntfyのみで家老へは送らぬ
     #        （数日先の解除に「区切りをつけよ」は助言たり得ぬ）。
+    # 【OBS-181-7】ただし notify_karo は予告(a)専用のフラグであり、
+    # 再開(c)には適用されない——_usage_window_check の(c)節に見る
+    # 通り、再開通知は枠を問わず常に家老へ届く。これは正しい挙動
+    # である: 現状、7日枠の巻き直りで家老を起こす経路はこの再開(c)
+    # 1本しか無いため、5時間枠に合わせて塞ぐとまさに要る時に効かなく
+    # なる。
     _usage_window_check 7d "$util7d" "$reset7d" "$warn_pct" \
-                        "$resume_pct" "$now" false
+                        "$resume_pct" "$now" false "$flagged"
 
     echo "[$(date)] [baton_watchdog/usage] 5h_util=${util5h:-?} 7d_util=${util7d:-?}"
 }
 
-# label util reset_epoch warn_pct resume_pct now notify_karo(true|false)
+# label util reset_epoch warn_pct resume_pct now notify_karo(true|false) flagged
 _usage_window_check() {
     local label="$1" util="$2" reset="$3" warn_pct="$4"
-    local resume_pct="$5" now="$6" notify_karo="$7"
-    local open_cmds max_mtime msg
+    local resume_pct="$5" now="$6" notify_karo="$7" flagged="${8:-}"
+    local open_cmds max_mtime msg gate_open
 
     # epoch が取れなければこの枠は判定しない（推測しない）
     [[ "$reset" =~ ^[0-9]+$ ]] || return 0
@@ -1008,16 +1021,32 @@ _usage_window_check() {
           echo "[$(date)] [baton_watchdog/usage] ntfy failed; inbox notification unaffected" >&2
         USAGE_WARNED_WINDOW[$label]=$reset
         USAGE_WARNED_AT[$label]=$now
+        USAGE_WARNED_FLAGGED[$label]="$flagged"
     fi
 
     # ── (c) 再開 ──────────────────────────────
-    # 予告を出した枠が巻き直った＝ reset epoch が変わったこと
-    # そのものが解除の直接証拠（閾値の当て推量を要さぬ）。
+    # 関門はORの二経路（finding_3）:
+    #   (i)  予告を出した枠が巻き直った＝ reset epoch が変わったこと
+    #        そのものが解除の直接証拠（閾値の当て推量を要さぬ）。
+    #   (ii) LIMITS_FLAGGEDが予告時のtrueから今回falseへ落ちたこと。
+    #        契約変更・上限緩和など、枠の巻き直りを伴わない解除
+    #        （本日実データで reset epoch 不変のまま true→false 遷移
+    #        を確認済み。(i)のみでは検知できない）。
+    # ラッチ防止は従来どおり USAGE_RESUMED_WINDOW を鍵に保つ——(ii)
+    # 経路でも reset epoch は変わらぬため、そのまま同じ鍵で機能する。
     [ -n "${USAGE_WARNED_AT[$label]:-}" ] || return 0
-    [ "${USAGE_WARNED_WINDOW[$label]:-0}" != "$reset" ] || return 0
     [ "${USAGE_RESUMED_WINDOW[$label]:-0}" != "$reset" ] || return 0
 
-    # 裏取り: 新しい枠に余裕があること
+    gate_open=false
+    if [ "${USAGE_WARNED_WINDOW[$label]:-0}" != "$reset" ]; then
+        gate_open=true
+    elif [ "${USAGE_WARNED_FLAGGED[$label]:-false}" = "true" ] \
+         && [ "$flagged" = "false" ]; then
+        gate_open=true
+    fi
+    [ "$gate_open" = "true" ] || return 0
+
+    # 裏取り: 新しい枠に余裕があること（(i)(ii)いずれの経路でも必須）
     awk -v u="$util" -v t="$resume_pct" 'BEGIN{exit !(u<t)}' || return 0
     # 仕事があること
     open_cmds=$(baton_watchdog_count_open_cmds)
