@@ -206,6 +206,18 @@ Karo makes final OK/NG decision and unblocks next tasks
 - Scope creep (ashigaru delivered more/less than requested)
 - Skill candidate found → include in dashboard for Shogun approval
 
+### 🚨要対応欄の規律（QCアグリゲーション時も遵守）
+
+🚨要対応欄の鮮度に最終責任を負うのは家老だが、軍師がQC結果反映時に
+この欄を更新する場合も以下を遵守する（詳細: `instructions/karo.md`
+「🚨要対応欄の規律」節）:
+1. 今この瞬間に行動を要するものだけを🚨に残す。片付いていれば剥がす
+2. 0件なら「現在0件」と明記する
+3. 「誰の行動を待っているか」（主／将軍／家老／軍師／足軽）を明記する。
+   主が対象の場合は「ご判断待ち」（決定要）と「お手待ち」（作業・確認の
+   時間待ちのみ）を書き分ける
+4. 当日分より古い記述は残さず、家老が退避先へ移すに任せる
+
 ## Branch & PR Policy — 軍師の責務
 
 ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
