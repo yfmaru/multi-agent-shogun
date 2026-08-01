@@ -90,8 +90,30 @@ fi
 BACKUP="$(mktemp)"
 cp "$TASK_FILE" "$BACKUP"
 
-exec 201>"${TASK_FILE}.lock"
-flock -w 5 201 || die 2 "task YAMLのロックを取れぬ"
+# flockはmacOS(util-linux非搭載)に無いため、mkdirの原子性を第一の排他機構とする
+# （inbox_write.shと同じ様式）。flockが使える環境ではさらに二重に確保する。
+LOCK_DIR="${TASK_FILE}.lock.d"
+_acquire_lock() {
+    local i=0
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+        [ $i -ge 50 ] && return 1  # 5s timeout
+    done
+    if command -v flock &>/dev/null; then
+        exec 201>"${TASK_FILE}.lock"
+        flock -w 5 201 || { rmdir "$LOCK_DIR" 2>/dev/null; return 1; }
+    fi
+    return 0
+}
+_release_lock() {
+    if command -v flock &>/dev/null; then
+        exec 201>&- 2>/dev/null || true
+    fi
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+_acquire_lock || die 2 "task YAMLのロックを取れぬ"
+trap _release_lock EXIT
 
 tmp="$(mktemp)"
 awk -v st="$STATUS" -v ts="$(date -Iseconds)" '
