@@ -134,6 +134,6 @@ if bash "$ROOT/scripts/inbox_write.sh" "$TO" "$MESSAGE" "$TYPE" "$AGENT"; then
 fi
 
 if cp "$BACKUP" "$TASK_FILE"; then
-    die 4 "inbox_writeに失敗。statusを$cur_statusへ巻き戻した。バトンは貴殿が保持しておる。原因を除いて同じ命令を再実行せよ"
+    die 4 "inbox_writeに失敗。statusを${cur_status}へ巻き戻した。バトンは貴殿が保持しておる。原因を除いて同じ命令を再実行せよ"
 fi
 die 5 "inbox_write失敗・巻き戻しも失敗。手で直せ: ${TASK_FILE}のstatusを${cur_status}へ戻し、${TO}へinbox_writeせよ"
