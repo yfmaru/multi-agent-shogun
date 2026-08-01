@@ -87,8 +87,12 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 # --- M1..M3 可逆側 ---
-BACKUP="$(mktemp)"
+# BACKUPも書き込み先と同じディレクトリに置く（mvの原子性理由は下記tmp参照）
+BACKUP="$(mktemp "${TASK_FILE}.bak.XXXXXX")"
 cp "$TASK_FILE" "$BACKUP"
+# BACKUP代入の後にtrapを設定（先だとBACKUPが空文字列になる）。
+# _release_lockは未定義でもtrap登録時点では問題ない（実行時に解決される）
+trap '_release_lock; rm -f "$BACKUP"' EXIT
 
 # flockはmacOS(util-linux非搭載)に無いため、mkdirの原子性を第一の排他機構とする
 # （inbox_write.shと同じ様式）。flockが使える環境ではさらに二重に確保する。
@@ -113,9 +117,11 @@ _release_lock() {
     rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 _acquire_lock || die 2 "task YAMLのロックを取れぬ"
-trap _release_lock EXIT
 
-tmp="$(mktemp)"
+# 書き込み先と同じディレクトリに置く: mktempの既定(/tmp)は別デバイスの
+# ことがあり、その場合mvがrename(2)にならずcopy+unlinkとなって
+# 書き換え中にファイルが一瞬消える窓が生じる（inbox_write.shと同じ様式）
+tmp="$(mktemp "${TASK_FILE}.XXXXXX")"
 awk -v st="$STATUS" -v ts="$(date -Iseconds)" '
   !done_st && /^  status: / { print "  status: " st; print "  completed_at: \"" ts "\""; done_st=1; next }
   /^  completed_at: / && done_st { next }
