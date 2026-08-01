@@ -64,6 +64,7 @@ usage_limit_fetch_raw() {
 
     "$python_bin" -c "
 import json, subprocess, sys
+from datetime import datetime
 
 try:
     with open('${USAGE_LIMIT_CREDS}') as f:
@@ -108,6 +109,15 @@ limits_flagged = any(
     for item in limits
 )
 
+def _epoch(s):
+    if not isinstance(s, str) or not s:
+        return ''
+    try:
+        return str(int(datetime.fromisoformat(
+            s.replace('Z', '+00:00')).timestamp()))
+    except Exception:
+        return ''
+
 print(f'5H_UTIL={fh.get(\"utilization\", \"?\")}')
 print(f'5H_RESET={fh.get(\"resets_at\", \"?\")[:16]}')
 print(f'7D_UTIL={sd.get(\"utilization\", \"?\")}')
@@ -116,6 +126,8 @@ print(f'7D_SONNET={ss.get(\"utilization\", \"-\")}')
 print(f'7D_OPUS={so.get(\"utilization\", \"-\")}')
 print(f'EXTRA={ex.get(\"is_enabled\", False)}')
 print(f'LIMITS_FLAGGED={\"true\" if limits_flagged else \"false\"}')
+print(f'5H_RESET_EPOCH={_epoch(fh.get(\"resets_at\"))}')
+print(f'7D_RESET_EPOCH={_epoch(sd.get(\"resets_at\"))}')
 " 2>/dev/null
 }
 
