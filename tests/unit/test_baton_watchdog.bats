@@ -60,9 +60,16 @@
 #   TC-BATON-AW-001: 印付きcmdが1件だけ開いている → 通常閾値では発報せぬ
 #   TC-BATON-AW-002: 同上＋印なしcmdが1件ある → 発報する（除外は引き算であって停止ではない）
 #   TC-BATON-AW-003: 印付き1件のみが安全網閾値を超えて滞留 → 発火し文面にhuman-held相当とcmd_idを含む
+#                    （cmd_197/OBS-61-1是正: awaiting_sinceタイムスタンプから滞留時間を導く）
 #   TC-BATON-AW-004: 印の値がlord以外（例: yes・空文字） → 除外せぬ（allowlist方向の確認）
 #   TC-BATON-AW-005: awaitingフィールドが無い既存形 → 従来どおり数える
 #   TC-BATON-AW-006: 毎サイクルのログ行にopen_cmds_machine/awaiting_lordが現れる
+#   TC-BATON-AW-007（cmd_197/OBS-61-1是正の核心）: プロセスローカルの計時起点を
+#                    明示的にリセットしても、awaiting_sinceが古ければ安全網が発火する
+#                    （＝番犬プロセスの入れ替えをまたいでも滞留の記憶は失われない）
+#   TC-BATON-AW-008: awaiting_sinceを持たぬ旧形式の印は、検知した瞬間から
+#                    計時を開始する(その旨をログに残す)。黙って安全網が
+#                    無効になるのを避けるための後方互換フォールバック
 #   TC-BATON-REG-001: usage_resumeが使う無引数呼び出しの戻り値が従来と一致する（将軍指定・最重要）
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
@@ -485,8 +492,65 @@ YAML
 
 # --- TC-BATON-AW-003: 印付き1件のみが安全網閾値を超えて滞留 → 発火しhuman-held相当の文言を含む ---
 
-@test "TC-BATON-AW-003: the 24h safety net fires for a lone awaiting-marked cmd even though the normal path stays silent" {
+@test "TC-BATON-AW-003: the 24h safety net fires for a lone awaiting-marked cmd based on its own awaiting_since timestamp, not the watchdog process's uptime" {
     write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 90000 )) '+%Y-%m-%dT%H:%M:%S')"  # default threshold=86400s, 90000s elapsed
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        # cmd_197/OBS-61-1是正: プロセスがこの瞬間にソースされたばかりで
+        # BATON_HELD_SINCEが既定値0のままでも(=プロセスローカルの計時には
+        # 一切触れない)、awaiting_sinceが古ければ発火することを確かめる。
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    # 通常経路は依然として沈黙している（機械側の除外が効いたまま）
+    ! grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-BATON-AW-007: 是正の核心——プロセス再起動をまたいでも滞留時間が失われない ---
+
+@test "TC-BATON-AW-007: the safety net survives a watchdog process restart (an explicitly reset process-local timer is ignored when awaiting_since is present)" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 90000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        # 番犬プロセスがこの直前に入れ替わったばかりであることを明示的に
+        # 模す(プロセスローカルの滞留起点=1秒前)。是正前のコードはこの
+        # 値で計時するため発火せぬはずだが、印付きcmdがある場合は
+        # awaiting_sinceから導くためBATON_HELD_SINCEの値とは無関係に
+        # 発火することを確かめる(OBS-61-1・cmd_197是正の核心)。
+        BATON_HELD_SINCE=\$(( \$(date +%s) - 1 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-BATON-AW-008: awaiting_sinceを持たぬ旧形式の印は検知時点から計時開始する ---
+
+@test "TC-BATON-AW-008: a legacy awaiting:lord marker without awaiting_since starts the safety-net timer at first detection, logs it, and later fires" {
+    write_settings true 5 60 "" "" "" "" "" shogun 86400 2   # baton_lost_human_held_after_sec=2s
     cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
 commands:
   - id: cmd_192
@@ -496,14 +560,18 @@ YAML
 
     run bash -c "
         source '$TEST_HARNESS'
-        BATON_HELD_SINCE=\$(( \$(date +%s) - 90000 ))  # default threshold=86400s, 90000s elapsed
+        check_once
+        if [ \"\$BATON_HELD_NOTIFIED\" -ne 0 ]; then
+            echo 'unexpectedly notified on first detection'
+            exit 1
+        fi
+        sleep 3
         check_once
     "
     [ "$status" -eq 0 ]
+    echo "$output" | grep -q "awaiting_since無し(旧形式の印)。安全網の計時をこの検知時点から開始する" || { echo "$output"; false; }
     grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
     grep -q "cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
-    # 通常経路は依然として沈黙している（機械側の除外が効いたまま）
-    ! grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
 
 # --- TC-BATON-AW-004: 印の値がlord以外なら除外せぬ（allowlist方向の確認）---
