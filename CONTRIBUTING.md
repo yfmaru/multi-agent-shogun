@@ -343,6 +343,60 @@ teardown() {
 
 4. **E2E tests**: Only Karo can execute E2E tests (requires multi-agent control)
 
+### Known Pitfalls
+
+Two environment-specific traps found while writing bats tests that touch
+`/proc` or process hierarchy (`tests/unit/test_task_complete.bats`,
+cmd_190, 2026-08-02). Both showed the hardest-to-notice symptom: **green
+locally, red only on CI.**
+
+1. **bash's tail-call `exec` optimization shifts `$PPID` up one level**
+   - **Trigger**: In a bats test that runs `bash -c "..."` and inspects
+     `$PPID` from inside the invoked script, if the last command in the
+     `bash -c` string is the target script itself, bash replaces the
+     subshell process with that command via `exec` instead of forking a
+     new process for it. The target script's `$PPID` then points to the
+     *grandparent* shell instead of the `bash -c` subshell the test
+     expected.
+   - **Symptom**: Assertions based on `$PPID`/`/proc/$PPID/cmdline`
+     intermittently see the wrong parent process, because whether the
+     optimization kicks in depends on what follows the target command in
+     the string — this can differ across shells/environments, so it
+     tends to pass locally and fail only on CI (or vice versa).
+   - **Workaround**: Append a no-op command after the target invocation
+     inside the `bash -c` string (e.g. `; :`) so the target is no longer
+     the tail call and bash forks a real subprocess for it instead of
+     replacing the subshell.
+   - **Source**: `tests/unit/test_task_complete.bats:295-298`
+     (TC-TCOMP-EXP-001/002), found by ashigaru7 during cmd_190
+     (`task_complete.sh` `--message-file` work), PR #56, endorsed by
+     gunshi QC (`queue/reports/gunshi_qc_190_pr56.yaml`).
+
+2. **`unshare -rm` is rejected on ubuntu-latest (GitHub Actions)**
+   - **Trigger**: A bats test that uses an unprivileged user+mount
+     namespace (`unshare -rm`) to simulate an unusual `/proc` state (e.g.
+     `/proc` unreadable/replaced) for the process under test.
+   - **Symptom**: The command works locally (including on macOS, where
+     `/proc` doesn't exist at all so the scenario is moot) but on
+     `ubuntu-latest` in GitHub Actions, `unshare -rm` itself is refused
+     because of AppArmor's unprivileged userns restriction — the test
+     that relies on it fails to even set up its precondition. This is
+     the same "green locally, red only on CI" shape: nothing about the
+     target code changed, only the CI runner's AppArmor policy blocks the
+     setup step.
+   - **Workaround**: Detect the restriction (`command -v unshare
+     >/dev/null 2>&1 && unshare -rm -- true >/dev/null 2>&1`) and `skip`
+     the test with a `"(CI environment)"`-tagged reason when it fails,
+     per the existing SKIP=FAIL-exempt convention
+     (`tests/unit/test_cli_adapter.bats:690`). Don't let the test error
+     out — and don't drop coverage entirely either: keep the scenario
+     exercised wherever it *can* run (e.g. macOS's natural absence of
+     `/proc` covers the same code path by a different route).
+   - **Source**: `tests/unit/test_task_complete.bats:336-355`
+     (TC-TCOMP-EXP-004), found by ashigaru7 during cmd_190
+     (`task_complete.sh` `--message-file` work), PR #56, endorsed by
+     gunshi QC (`queue/reports/gunshi_qc_190_pr56.yaml`).
+
 ---
 
 ## Pull Request Guidelines
