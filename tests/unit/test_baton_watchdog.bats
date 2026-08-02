@@ -70,6 +70,9 @@
 #   TC-BATON-AW-008: awaiting_sinceを持たぬ旧形式の印は、検知した瞬間から
 #                    計時を開始する(その旨をログに残す)。黙って安全網が
 #                    無効になるのを避けるための後方互換フォールバック
+#   TC-BATON-AW-009（cmd_197/QC62-F1是正）: 引用符無しawaiting_since（YAMLが
+#                    datetime型として解釈する値）でもparse_tsが解析でき、
+#                    OBS-61-1と同じフォールバックへ黙って落ちない
 #   TC-BATON-REG-001: usage_resumeが使う無引数呼び出しの戻り値が従来と一致する（将軍指定・最重要）
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
@@ -572,6 +575,39 @@ YAML
     echo "$output" | grep -q "awaiting_since無し(旧形式の印)。安全網の計時をこの検知時点から開始する" || { echo "$output"; false; }
     grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
     grep -q "cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-BATON-AW-009: 引用符無しawaiting_since（YAMLがdatetime型として解釈する値）
+#     でもparse_tsが正しく解析し、安全網が発火する（cmd_197/QC62-F1是正） ---
+
+@test "TC-BATON-AW-009: an unquoted awaiting_since (parsed by YAML as a native datetime, not str) still fires the safety net based on its own timestamp" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 90000 )) '+%Y-%m-%dT%H:%M:%S')"  # default threshold=86400s, 90000s elapsed
+    # 【QC62-F1の核心】ここではあえて引用符を付けない。PyYAMLはISO8601風の
+    # 引用符無し値をstrではなくdatetime型として自動解釈する。是正前の
+    # parse_tsはisinstance(value, str)を先頭で要求するためdatetime型は
+    # Noneに落ち、OBS-61-1と同じ「awaiting_since無し」フォールバック扱い
+    # になっていた（=このテストは是正前は最初のcheck_once一回では発火せず
+    # 失敗した。是正後は文字列経由と同じくその場でawaiting_sinceから直接
+    # 発火する）。
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+    awaiting_since: $since
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    # 旧形式フォールバック(=is-a-bug症状)のログ行が出ていないことも確かめる
+    ! echo "$output" | grep -q "awaiting_since無し(旧形式の印)" || { echo "$output"; false; }
 }
 
 # --- TC-BATON-AW-004: 印の値がlord以外なら除外せぬ（allowlist方向の確認）---
