@@ -347,8 +347,9 @@ teardown() {
 
 Two environment-specific traps found while writing bats tests that touch
 `/proc` or process hierarchy (`tests/unit/test_task_complete.bats`,
-cmd_190, 2026-08-02). Both showed the hardest-to-notice symptom: **green
-locally, red only on CI.**
+cmd_190, 2026-08-02). Trap 2 showed the hardest-to-notice symptom:
+**green locally, red only on CI.** Trap 1 was caught locally during
+implementation, before it ever reached CI.
 
 1. **bash's tail-call `exec` optimization shifts `$PPID` up one level**
    - **Trigger**: In a bats test that runs `bash -c "..."` and inspects
