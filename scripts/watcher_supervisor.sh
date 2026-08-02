@@ -31,6 +31,45 @@ pane_exists() {
     tmux list-panes -a -F "#{session_name}:#{window_name}.#{pane_index}" 2>/dev/null | grep -qx "$pane"
 }
 
+# cmd_186/issue#27: 常駐daemonのログには自前のローテーションが一切無く、
+# pane不一致WARN連発バグ（cmd_176是正前）で watcher_supervisor.log が
+# 実測28MB・14.9万行まで無制限に膨張した実例がある。バグ自体は是正済みだが、
+# 同種の再発（WARN/ERRを吐き続ける別バグ）に備え、サイズ上限を機械的に
+# 掛ける。in-place truncate（`: > file`）を用いるのは、これらのログが
+# 起動時に `>> file` (O_APPEND) でリダイレクトされたまま常駐daemonに
+# 掴まれ続けているため——rename/mv方式だと旧inodeを書き続ける古いfdと
+# 新ファイルが乖離し、以後の追記がどこにも見えなくなる（copytruncateが
+# 必要な所以と同じ理由）。truncateはO_APPEND fdのオフセットを内部的に
+# 巻き戻さないが、次回writeはカーネルがEOFへ再シークするため安全に追記が
+# 続く。
+rotate_log_if_large() {
+    local log_file="$1"
+    local max_bytes="${WATCHER_LOG_ROTATE_MAX_BYTES:-10485760}"
+    local keep_lines="${WATCHER_LOG_ROTATE_KEEP_LINES:-5000}"
+    local size
+
+    [ -f "$log_file" ] || return 0
+    size=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
+    [ "$size" -gt "$max_bytes" ] || return 0
+
+    local tail_content
+    tail_content=$(tail -n "$keep_lines" "$log_file")
+    : > "$log_file"
+    {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [watcher_supervisor/log_rotate] rotated ${log_file} in place: previous size ${size} bytes exceeded ${max_bytes} bytes cap; kept last ${keep_lines} lines"
+        printf '%s\n' "$tail_content"
+    } >> "$log_file"
+}
+
+rotate_all_managed_logs() {
+    rotate_log_if_large "logs/watcher_supervisor.log"
+
+    local agent pane log_file
+    while IFS=$'\t' read -r agent pane log_file; do
+        rotate_log_if_large "$log_file"
+    done < <(watcher_specs)
+}
+
 start_watcher_if_missing() {
     local agent="$1"
     local pane="$2"
@@ -129,5 +168,6 @@ fi
 
 while true; do
     start_all_watchers
+    rotate_all_managed_logs
     sleep 5
 done
