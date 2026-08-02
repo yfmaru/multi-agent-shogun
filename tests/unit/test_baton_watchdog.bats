@@ -171,8 +171,14 @@ teardown() {
 # $6=progress_stall_after_sec（省略時はキー自体を書かず、コード側の既定5400に委ねる）
 # $7=baton_b4b_ntfy_after_sec（省略時はキー自体を書かず、コード側の既定900に委ねる）
 # $8=baton_b4c_stale_after_sec（省略時はキー自体を書かず、コード側の既定5400に委ねる。cmd_180/T-3）
+# $9=baton_b4c_machine_exempt_agents（省略時はキー自体を書かず、コード側の既定["shogun"]に委ねる。
+#    カンマ区切りで渡す。空文字列 "" を明示的に渡すと空リスト（除外なし）を書く——
+#    「キー省略」と「意図的な空リスト」を区別するため、他の引数と違い
+#    呼び出し側は明示的にこの区別を要求される。cmd_189）
+# $10=baton_b4c_machine_stale_after_sec（省略時はキー自体を書かず、コード側の既定86400に委ねる。cmd_189）
 write_settings() {
     local ntfy_line="" d1_ntfy_line="" progress_stall_line="" b4b_ntfy_line="" b4c_stale_line=""
+    local machine_exempt_block="" machine_stale_line=""
     if [ -n "${4:-}" ]; then
         ntfy_line="  baton_ntfy_after_sec: $4"
     fi
@@ -188,6 +194,22 @@ write_settings() {
     if [ -n "${8:-}" ]; then
         b4c_stale_line="  baton_b4c_stale_after_sec: $8"
     fi
+    if [ "${9+set}" = "set" ]; then
+        if [ -z "$9" ]; then
+            machine_exempt_block="  baton_b4c_machine_exempt_agents: []"
+        else
+            machine_exempt_block="  baton_b4c_machine_exempt_agents:"
+            local a
+            IFS=',' read -ra __agents <<< "$9"
+            for a in "${__agents[@]}"; do
+                machine_exempt_block="$machine_exempt_block
+    - $a"
+            done
+        fi
+    fi
+    if [ -n "${10:-}" ]; then
+        machine_stale_line="  baton_b4c_machine_stale_after_sec: ${10}"
+    fi
     cat > "$FIXTURE_ROOT/config/settings.yaml" << YAML
 baton_watchdog:
   enabled: $1
@@ -198,6 +220,8 @@ $d1_ntfy_line
 $progress_stall_line
 $b4b_ntfy_line
 $b4c_stale_line
+$machine_exempt_block
+$machine_stale_line
 YAML
 }
 
@@ -1390,12 +1414,17 @@ YAML
 @test "TC-B4C-LATCH-001: B-4c never writes to shogun's own inbox when shogun is the diagnosed target (self-feeding latch prevention)" {
     local stale_ts before_count after_count
     stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
-    # from: baton_watchdog（本番同等・機械の書き手の例）
+    # from: karo（cmd_189是正後・エージェント由来に差し替え）。
+    # 既定 baton_b4c_machine_exempt_agents=["shogun"] により、shogun宛の
+    # 機械由来(from: baton_watchdog等)の未読は通常閾値(5400s)では数えず
+    # 24時間安全網のみで発火するようになった（TC-B4C-EXEMPT-001参照）。
+    # 本テストの主張（自己給餌ラッチ防止）は送信者に依存しないため、
+    # エージェント由来にしても主張は保たれる。
     cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
-    from: baton_watchdog
+    from: karo
     timestamp: '${stale_ts}'
 YAML
     before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
@@ -1420,12 +1449,14 @@ YAML
 @test "TC-B4C-LATCH-002: guard resets once shogun's stale message is read, then re-fires on a renewed stall" {
     local stale_ts
     stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
-    # from: watcher_supervisor（本番同等・機械の書き手の例）
+    # from: karo（cmd_189是正後・エージェント由来に差し替え）。理由は
+    # TC-B4C-LATCH-001と同じ（既定の機械由来除外により、機械由来のままでは
+    # 24時間安全網に達するまで本設計後は発火せず本テストが落ちるため）。
     cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
 messages:
   - id: msg_stale
     read: false
-    from: watcher_supervisor
+    from: karo
     timestamp: '${stale_ts}'
 YAML
 
@@ -1524,6 +1555,256 @@ YAML
     [ "$status" -eq 0 ]
     grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
     [ ! -s "$MOCK_TMUX_LOG" ]
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_189: B-4c限定・対象名指しによる機械由来除外（軍師design_189・採用Option 2+3）
+#
+# list_stale_inbox_agents に省略可能な第2・第3引数を追加し、呼び出し側
+# （check_b4c_once）のみが将軍(shogun)を名指しして、機械由来
+# （agent_registry_agentsに非該当のfrom）の未読を通常閾値では数えず、
+# 24時間(baton_b4c_machine_stale_after_sec)の安全網のみで発火させる。
+# check_d1_once は無引数呼び出しのまま一文字も変えていない
+# （非退行はTC-D1-EXEMPT-001・既存TC-D1-LATCH-001/002が担保）。
+#
+#   TC-B4C-EXEMPT-001: shogun・機械由来・6000s stale → 発火せぬ（本cmdの核）
+#   TC-B4C-EXEMPT-002: shogun・エージェント由来(karo)・6000s stale
+#                      → 従来どおり発火（丸ごと除外との違いを固定）
+#   TC-B4C-EXEMPT-003: 非exempt(ashigaru3)・機械由来・stale → 従来どおり発火
+#   TC-B4C-EXEMPT-004: shogun・from欠落・stale → 発火（安全側。countと同じ向き）
+#   TC-B4C-EXEMPT-005: baton_b4c_machine_exempt_agents: [] → shogunでも
+#                      機械由来で発火（巻き戻し弁）
+#   TC-B4C-EXEMPT-006: 安全網の境界（86400s+で発火・86400s未満で発火せぬ）
+#   TC-B4C-EXEMPT-007: 機械由来stale＋エージェント由来freshが同居 → 発火せぬ
+#   TC-D1-EXEMPT-001【非退行の明示的な番人】: D-1はwatcher死亡時、shogunの
+#                    機械由来staleでも従来どおり発火する（除外が漏れていない）
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-B4C-EXEMPT-001: shogunの機械由来staleは24h安全網に達するまで発火せぬ ---
+
+@test "TC-B4C-EXEMPT-001: machine-origin stale shogun inbox stays silent under the 24h safety net" {
+    write_settings true 5 60 "" "" "" "" 5400 shogun 86400
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: baton_watchdog
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-B4C-EXEMPT-002: shogunでもエージェント由来なら従来どおり通常閾値で発火 ---
+
+@test "TC-B4C-EXEMPT-002: agent-origin stale shogun inbox still fires at the normal threshold" {
+    write_settings true 5 60 "" "" "" "" 5400 shogun 86400
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: karo
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: karo" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "inbox_stall: agent=shogun" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-B4C-EXEMPT-003: 対象を名指ししていないagentは機械由来でも従来どおり発火 ---
+
+@test "TC-B4C-EXEMPT-003: machine-origin stale inbox for a non-exempt agent still fires normally" {
+    write_settings true 5 60 "" "" "" "" 5400 shogun 86400
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru3.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: baton_watchdog
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "inbox_stall: agent=ashigaru3" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-B4C-EXEMPT-004: fromが欠落したshogun宛staleは安全側(通常閾値)で発火 ---
+
+@test "TC-B4C-EXEMPT-004: shogun inbox message with missing 'from' is treated as non-machine (safe side) and fires normally" {
+    write_settings true 5 60 "" "" "" "" 5400 shogun 86400
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "inbox_stall: agent=shogun" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-B4C-EXEMPT-005【change_3で名指しした罠を直接押さえる】空リストは巻き戻し弁 ---
+
+@test "TC-B4C-EXEMPT-005: empty machine_exempt_agents list restores pre-cmd_189 semantics (rollback valve works)" {
+    write_settings true 5 60 "" "" "" "" 5400 "" 86400
+    local stale_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: baton_watchdog
+    timestamp: '${stale_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "inbox_stall: agent=shogun" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-B4C-EXEMPT-006: 安全網(24h)の境界 ---
+
+@test "TC-B4C-EXEMPT-006: 24h safety net boundary — fires past 86400s, stays silent just under it" {
+    write_settings true 5 60 "" "" "" "" 5400 shogun 86400
+
+    local over_ts
+    over_ts=$(date -d "@$(( $(date +%s) - 90000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: baton_watchdog
+    timestamp: '${over_ts}'
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "inbox_stall: agent=shogun" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    > "$SHOGUN_NOTIFY_LOG"
+    local under_ts
+    under_ts=$(date -d "@$(( $(date +%s) - 80000 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: baton_watchdog
+    timestamp: '${under_ts}'
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ]
+}
+
+# --- TC-B4C-EXEMPT-007: 機械由来staleとエージェント由来freshの同居で境界混同しない ---
+
+@test "TC-B4C-EXEMPT-007: a stale machine-origin message alongside a fresh agent-origin message in shogun's inbox does not fire" {
+    write_settings true 5 60 "" "" "" "" 5400 shogun 86400
+    local stale_ts fresh_ts
+    stale_ts=$(date -d "@$(( $(date +%s) - 6000 ))" +"%Y-%m-%dT%H:%M:%S")
+    fresh_ts=$(date -d "@$(( $(date +%s) - 10 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_machine_stale
+    read: false
+    from: baton_watchdog
+    timestamp: '${stale_ts}'
+  - id: msg_agent_fresh
+    read: false
+    from: karo
+    timestamp: '${fresh_ts}'
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        pgrep() { echo \"MOCKPGREP \$*\" >> '$PGREP_LOG'; return 0; }
+        export -f pgrep
+        baton_watchdog_refresh_watcher_snapshot
+        check_b4c_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ]
+}
+
+# --- TC-D1-EXEMPT-001【非退行の明示的な番人】D-1はwatcher死亡時、shogunの機械由来staleでも従来どおり発火する ---
+
+@test "TC-D1-EXEMPT-001: D-1 still fires for machine-origin shogun stale messages when the watcher is dead (exemption must not leak into D-1)" {
+    write_settings true 5 60 "" "" "" "" 5400 shogun 86400
+    local stale_ts before_count after_count
+    stale_ts=$(date -d "@$(( $(date +%s) - 700 ))" +"%Y-%m-%dT%H:%M:%S")
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << YAML
+messages:
+  - id: msg_stale
+    read: false
+    from: baton_watchdog
+    timestamp: '${stale_ts}'
+YAML
+    before_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_d1_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: karo" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "delivery_stall" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    after_count=$(grep -c 'read: false' "$FIXTURE_ROOT/queue/inbox/shogun.yaml")
+    [ "$before_count" -eq "$after_count" ] || { echo "shogun unread count changed: before=$before_count after=$after_count"; false; }
 }
 
 
