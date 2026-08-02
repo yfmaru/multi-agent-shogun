@@ -68,6 +68,13 @@ BATON_LOST_SINCE=0     # 3条件が揃い始めた epoch（揃っていなけれ
 BATON_NOTIFIED=0       # 将軍inbox通知を同一継続停止で二重送信しないためのガード
 BATON_NTFY_NOTIFIED=0  # ntfy通知（cmd_172/急報）を同一継続停止で二重送信しないためのガード
 
+# cmd_197: 長い安全網（人待ちの印が付いたまま24h+滞留）専用の独立トラッカー。
+# BATON_LOST_SINCEとは絶対に混ぜない（混ぜると通常判定が偽になるたび
+# 安全網のタイマーまで巻き戻る）。印は「発報を止める」のではなく
+# 「急かす間隔を延ばす」だけであることの実体がこの独立性である。
+BATON_HELD_SINCE=0     # 安全網条件(除外前open_cmds>0等)が揃い始めたepoch（揃っていなければ0）
+BATON_HELD_NOTIFIED=0  # 安全網通知を同一継続で二重送信しないためのガード
+
 # ─── 使用量監視 (cmd_181) プロセスローカル状態 ───
 USAGE_LAST_CHECK_AT=0
 declare -A USAGE_WARNED_WINDOW=()   # label -> 予告済み枠の reset epoch
@@ -166,7 +173,61 @@ baton_watchdog_count_active_tasks() {
 # shogun_to_karo.yaml の commands のうち status != done の件数。
 # ファイル欠損・壊れた YAML でも 0 を返し、決して非0で落ちない
 # （TC-BATON-008: cmd_163 BL-3 と同じ「安全な既定値」教訓の再適用）。
+#
+# 第1引数（省略可・cmd_197）: "exclude_awaiting" を渡すと、
+# awaiting: lord を持つ cmd を数から除く。引数なし（usage_resume の
+# 無引数呼び出しを含む）は従来と完全に同一の挙動——1バイトも変えない。
 baton_watchdog_count_open_cmds() {
+    local exclude_awaiting="${1:-}"
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" "$exclude_awaiting" <<'PY'
+import sys
+
+try:
+    import yaml
+except Exception:
+    print(0)
+    raise SystemExit(0)
+
+path = sys.argv[1]
+exclude_awaiting = sys.argv[2] if len(sys.argv) > 2 else ""
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+cmds = data.get("commands")
+if cmds is None:
+    cmds = data.get("cmds")
+if isinstance(cmds, dict):
+    cmds = list(cmds.values())
+if not isinstance(cmds, list):
+    cmds = []
+
+def _is_open(c):
+    if not isinstance(c, dict):
+        return False
+    if c.get("status") == "done":
+        return False
+    if exclude_awaiting == "exclude_awaiting" and c.get("awaiting") == "lord":
+        return False
+    return True
+
+print(sum(1 for c in cmds if _is_open(c)))
+PY
+}
+
+# awaiting: lord を持つ開いた(status != done) cmd の id を1行1件で返す
+# （cmd_197・change_d_visibility）。「黙って引き算するな」の実体——
+# ログ行・発報文が実際にどの cmd を除外したか示すために使う。
+# ファイル欠損・壊れた YAML でも空を返すのみで決して非0で落ちない。
+baton_watchdog_list_awaiting_lord_cmd_ids() {
     local python_bin
     python_bin="$(stall_policy_python)"
     "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" <<'PY'
@@ -175,7 +236,6 @@ import sys
 try:
     import yaml
 except Exception:
-    print(0)
     raise SystemExit(0)
 
 path = sys.argv[1]
@@ -196,7 +256,15 @@ if isinstance(cmds, dict):
 if not isinstance(cmds, list):
     cmds = []
 
-print(sum(1 for c in cmds if isinstance(c, dict) and c.get("status") != "done"))
+for c in cmds:
+    if not isinstance(c, dict):
+        continue
+    if c.get("status") == "done":
+        continue
+    if c.get("awaiting") == "lord":
+        cid = c.get("id")
+        if cid:
+            print(cid)
 PY
 }
 
@@ -351,8 +419,9 @@ baton_watchdog_notify_inbox() {
 
 # 1回だけ判定する。メインループ・--once どちらからも呼ばれる。
 check_once() {
-    local now unread active open_cmds condition
-    local shogun_threshold ntfy_threshold elapsed
+    local now unread active open_cmds open_cmds_machine awaiting_n awaiting_ids condition
+    local shogun_threshold ntfy_threshold elapsed excl_note
+    local held_threshold held_elapsed
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -361,9 +430,12 @@ check_once() {
     now=$(date +%s)
     unread=$(baton_watchdog_count_unread)
     active=$(baton_watchdog_count_active_tasks)
-    open_cmds=$(baton_watchdog_count_open_cmds)
+    open_cmds=$(baton_watchdog_count_open_cmds)                          # 全件(安全網用)
+    open_cmds_machine=$(baton_watchdog_count_open_cmds exclude_awaiting) # 人待ち除外後
+    awaiting_n=$((open_cmds - open_cmds_machine))
+    awaiting_ids=$(baton_watchdog_list_awaiting_lord_cmd_ids | paste -sd, -)
 
-    if [ "${unread:-0}" -eq 0 ] && [ "${active:-0}" -eq 0 ] && [ "${open_cmds:-0}" -gt 0 ]; then
+    if [ "${unread:-0}" -eq 0 ] && [ "${active:-0}" -eq 0 ] && [ "${open_cmds_machine:-0}" -gt 0 ]; then
         condition=true
 
         if [ "$BATON_LOST_SINCE" -eq 0 ]; then
@@ -371,11 +443,19 @@ check_once() {
         fi
         elapsed=$((now - BATON_LOST_SINCE))
 
+        # cmd_197: 除外は「引き算」であって「発報停止」ではない。除外が
+        # 実際に効いている時だけ、除外件数・cmd_idを発報文に明記する
+        # （黙って引き算しない）。
+        excl_note=""
+        if [ "${awaiting_n:-0}" -gt 0 ]; then
+            excl_note=" (人待ち除外 ${awaiting_n}件: ${awaiting_ids})"
+        fi
+
         # 主経路: 将軍inbox通知。900秒(既定)継続で無条件に発火する。
         # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
         shogun_threshold=$(baton_watchdog_query baton_lost_after_sec)
         if [ "$elapsed" -ge "$shogun_threshold" ] && [ "$BATON_NOTIFIED" -eq 0 ]; then
-            baton_watchdog_notify_shogun "baton_lost: unread=0 active=0 open_cmds=${open_cmds} (${shogun_threshold}s+継続)"
+            baton_watchdog_notify_shogun "baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
             BATON_NOTIFIED=1
         fi
 
@@ -384,7 +464,7 @@ check_once() {
         # 通知には一切影響させない。
         ntfy_threshold=$(baton_watchdog_query baton_ntfy_after_sec)
         if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "$BATON_NTFY_NOTIFIED" -eq 0 ]; then
-            if ! branch_policy_notify "baton_lost: unread=0 active=0 open_cmds=${open_cmds} (${ntfy_threshold}s+継続・ntfy)"; then
+            if ! branch_policy_notify "baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${ntfy_threshold}s+継続・ntfy)"; then
                 echo "[$(date)] [baton_watchdog] ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
             fi
             BATON_NTFY_NOTIFIED=1
@@ -398,7 +478,32 @@ check_once() {
         BATON_NTFY_NOTIFIED=0
     fi
 
-    echo "[$(date)] [baton_watchdog/check_once] unread=${unread} active=${active} open_cmds=${open_cmds} baton_condition=${condition}"
+    # ── 長い安全網（cmd_197・絶対厳守）──────────────────────
+    # 通常判定(condition)とは完全に独立。「家老が誤って印を付けたまま、
+    # 実は機械側がバトンを落としていた」を見落とさないための網であり、
+    # 印は発報を止めず、急かす間隔を延ばすだけであることの実体。
+    # 除外前の全件(open_cmds)で判定する — 通常判定が偽でも必ず発火させる。
+    if [ "${unread:-0}" -eq 0 ] && [ "${active:-0}" -eq 0 ] && [ "${open_cmds:-0}" -gt 0 ]; then
+        if [ "$BATON_HELD_SINCE" -eq 0 ]; then
+            BATON_HELD_SINCE=$now
+        fi
+        held_elapsed=$((now - BATON_HELD_SINCE))
+        held_threshold=$(baton_watchdog_query baton_lost_human_held_after_sec)
+
+        if [ "$held_elapsed" -ge "$held_threshold" ] && [ "$BATON_HELD_NOTIFIED" -eq 0 ]; then
+            if [ -n "$awaiting_ids" ]; then
+                baton_watchdog_notify_shogun "baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${awaiting_ids}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
+            else
+                baton_watchdog_notify_shogun "baton_lost(human-held): unread=0 active=0 open_cmds=${open_cmds}(人待ちの印なし)が${held_threshold}s+滞留。主の手番が本当に続いているか確かめよ"
+            fi
+            BATON_HELD_NOTIFIED=1
+        fi
+    else
+        BATON_HELD_SINCE=0
+        BATON_HELD_NOTIFIED=0
+    fi
+
+    echo "[$(date)] [baton_watchdog/check_once] unread=${unread} active=${active} open_cmds=${open_cmds} open_cmds_machine=${open_cmds_machine} awaiting_lord=${awaiting_n}(${awaiting_ids}) baton_condition=${condition}"
 }
 
 # ═══════════════════════════════════════════════════════════════

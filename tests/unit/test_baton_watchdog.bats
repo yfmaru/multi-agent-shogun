@@ -51,6 +51,19 @@
 # `date -u` でUTCのnaive文字列を書いていたため本番との乖離が緑のまま
 # 見逃されていた。以降フィクスチャは `-u` を使わず、本番と同一の
 # ローカル時刻naive書式で timestamp を生成する。
+#
+# 【cmd_197: baton_watchdogへ「人待ち」の印を追加】check_once が数える
+# open_cmds のうち、`queue/shogun_to_karo.yaml` の cmd に
+# `awaiting: lord` が付いたものを通常閾値では除外し、24h(既定)の
+# 安全網のみで発火させる。usage_resume（無引数呼び出し）には一切影響
+# させない（TC-BATON-REG-001が守る）。
+#   TC-BATON-AW-001: 印付きcmdが1件だけ開いている → 通常閾値では発報せぬ
+#   TC-BATON-AW-002: 同上＋印なしcmdが1件ある → 発報する（除外は引き算であって停止ではない）
+#   TC-BATON-AW-003: 印付き1件のみが安全網閾値を超えて滞留 → 発火し文面にhuman-held相当とcmd_idを含む
+#   TC-BATON-AW-004: 印の値がlord以外（例: yes・空文字） → 除外せぬ（allowlist方向の確認）
+#   TC-BATON-AW-005: awaitingフィールドが無い既存形 → 従来どおり数える
+#   TC-BATON-AW-006: 毎サイクルのログ行にopen_cmds_machine/awaiting_lordが現れる
+#   TC-BATON-REG-001: usage_resumeが使う無引数呼び出しの戻り値が従来と一致する（将軍指定・最重要）
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHDOG_SCRIPT="$PROJECT_ROOT/scripts/baton_watchdog.sh"
@@ -176,9 +189,10 @@ teardown() {
 #    「キー省略」と「意図的な空リスト」を区別するため、他の引数と違い
 #    呼び出し側は明示的にこの区別を要求される。cmd_189）
 # $10=baton_b4c_machine_stale_after_sec（省略時はキー自体を書かず、コード側の既定86400に委ねる。cmd_189）
+# $11=baton_lost_human_held_after_sec（省略時はキー自体を書かず、コード側の既定86400に委ねる。cmd_197）
 write_settings() {
     local ntfy_line="" d1_ntfy_line="" progress_stall_line="" b4b_ntfy_line="" b4c_stale_line=""
-    local machine_exempt_block="" machine_stale_line=""
+    local machine_exempt_block="" machine_stale_line="" human_held_line=""
     if [ -n "${4:-}" ]; then
         ntfy_line="  baton_ntfy_after_sec: $4"
     fi
@@ -210,6 +224,9 @@ write_settings() {
     if [ -n "${10:-}" ]; then
         machine_stale_line="  baton_b4c_machine_stale_after_sec: ${10}"
     fi
+    if [ -n "${11:-}" ]; then
+        human_held_line="  baton_lost_human_held_after_sec: ${11}"
+    fi
     cat > "$FIXTURE_ROOT/config/settings.yaml" << YAML
 baton_watchdog:
   enabled: $1
@@ -222,6 +239,7 @@ $b4b_ntfy_line
 $b4c_stale_line
 $machine_exempt_block
 $machine_stale_line
+$human_held_line
 YAML
 }
 
@@ -415,6 +433,165 @@ YAML
     "
     [ "$status" -eq 0 ]
     [ ! -s "$NOTIFY_LOG" ]
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_197: 「人待ち」の印（awaiting: lord）
+# ═══════════════════════════════════════════════════════════════
+
+# --- TC-BATON-AW-001: 印付きcmdが1件だけ開いている → 通常閾値では発報せぬ ---
+
+@test "TC-BATON-AW-001: no normal-path notification when the only open cmd is marked awaiting:lord" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))  # threshold=5s, already 10s elapsed
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    ! grep -q "baton_lost:" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-BATON-AW-002: 印付き＋印なしcmdが1件ずつ → 発報する（除外は引き算であって停止ではない）---
+
+@test "TC-BATON-AW-002: normal-path notification still fires when an unmarked open cmd coexists, with exclusion breakdown in the message" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+  - id: cmd_200
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "baton_lost: unread=0 active=0 open_cmds=1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "人待ち除外 1件: cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-BATON-AW-003: 印付き1件のみが安全網閾値を超えて滞留 → 発火しhuman-held相当の文言を含む ---
+
+@test "TC-BATON-AW-003: the 24h safety net fires for a lone awaiting-marked cmd even though the normal path stays silent" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_HELD_SINCE=\$(( \$(date +%s) - 90000 ))  # default threshold=86400s, 90000s elapsed
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    # 通常経路は依然として沈黙している（機械側の除外が効いたまま）
+    ! grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-BATON-AW-004: 印の値がlord以外なら除外せぬ（allowlist方向の確認）---
+
+@test "TC-BATON-AW-004: a non-'lord' awaiting value (or empty string) does not exclude the cmd" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+    awaiting: "yes"
+  - id: cmd_2
+    status: in_progress
+    awaiting: ""
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds exclude_awaiting
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "2" ]
+}
+
+# --- TC-BATON-AW-005: awaitingフィールドが無い既存形は従来どおり数える ---
+
+@test "TC-BATON-AW-005: cmds without an awaiting field are counted the same with or without exclusion" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+  - id: cmd_2
+    status: assigned
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "2" ]
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds exclude_awaiting
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "2" ]
+}
+
+# --- TC-BATON-AW-006: 毎サイクルのログ行にopen_cmds_machine/awaiting_lordが現れる ---
+
+@test "TC-BATON-AW-006: the per-cycle status line exposes open_cmds_machine and awaiting_lord with the excluded cmd id" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+  - id: cmd_200
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "open_cmds=2 open_cmds_machine=1 awaiting_lord=1(cmd_192)" || { echo "$output"; false; }
+}
+
+# --- TC-BATON-REG-001: 将軍指定・最重要。usage_resumeが使う無引数呼び出しの戻り値が従来と一致する ---
+
+@test "TC-BATON-REG-001: the no-arg call used by usage_resume still counts awaiting-marked cmds (regression guard)" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+  - id: cmd_200
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "2" ]
 }
 
 
