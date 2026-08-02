@@ -15,6 +15,11 @@
 #   QC34-F1-001, QC34-F2-001 (cmd_178 redo): failing inbox_write.sh call and
 #     empty pgrep match for actual_pane extraction must not abort the daemon
 #     under set -euo pipefail (gunshi QC FAIL findings, see gunshi_qc_178_obs22.yaml)
+#   TC-NOPANE-001..006 (cmd_193): pane不在の継続を検知し、記録(層1)+配送
+#     (層2)+主経路(層3)で報せる。設計は queue/reports/gunshi_193_design.yaml。
+#     001 記録される / 002 2行目が出ない(重複防止) / 003 再武装 /
+#     004 瞬断で吠えぬ(閾値未満) / 005 errexit耐性 /
+#     006 通知先が当人でないこと(本cmdの肝)
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 SUPERVISOR_SCRIPT="$PROJECT_ROOT/scripts/watcher_supervisor.sh"
@@ -670,4 +675,282 @@ source_supervisor_functions() {
 
     [ -f "$TEST_TMP/survived.log" ]
     rm -f "$notified_flag"
+}
+
+# ---------------------------------------------------------------------------
+# TC-NOPANE-001 (cmd_193): pane不在が NOPANE_WARN_AFTER_SEC(30s) を超えて
+# 継続していると、WARN行(層1)+inbox_write(層2)が1回ずつ発生し、通知先は
+# 診断対象(agent)当人ではなく規則どおりの宛先(agent=ashigaru→shogun)になる。
+# ---------------------------------------------------------------------------
+@test "TC-NOPANE-001: pane missing past warn threshold sends WARN + inbox_write to notify target" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_nopane001"
+    local since_file="/tmp/shogun_watcher_nopane_${agent}"
+    local notified_flag="/tmp/shogun_watcher_nopane_notified_${agent}"
+    local ntfy_flag="/tmp/shogun_watcher_nopane_ntfy_${agent}"
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+    echo "$(( $(date +%s) - 40 ))" > "$since_file"
+
+    (
+        NOPANE_WARN_AFTER_SEC=30
+        NOPANE_NTFY_AFTER_SEC=300
+        pane_exists() { return 1; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane001.log" 2>"$TEST_TMP/warn.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        # $* の先頭語は "scripts/inbox_write.sh" 自体。宛先は2語目。
+        [ "$(awk '{print $2}' "$TEST_TMP/inbox_write_calls.log" | head -n1)" = "shogun" ]
+        grep -q "$agent" "$TEST_TMP/inbox_write_calls.log"
+        [ "$(grep -c 'pane不在検知' "$TEST_TMP/inbox_write_calls.log")" -eq 1 ]
+        [ "$(grep -c '\[WARN\] pane missing' "$TEST_TMP/warn.log")" -eq 1 ]
+        [ -f "$notified_flag" ]
+    )
+
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+}
+
+# ---------------------------------------------------------------------------
+# TC-NOPANE-002 (cmd_193): 未解消のまま2回連続で呼んでも、重複防止フラグに
+# より2回目はWARN・inbox_writeとも発生しない(番犬周期5秒ごとの洪水対策)。
+# ---------------------------------------------------------------------------
+@test "TC-NOPANE-002: repeated calls with unresolved condition do not re-notify" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_nopane002"
+    local since_file="/tmp/shogun_watcher_nopane_${agent}"
+    local notified_flag="/tmp/shogun_watcher_nopane_notified_${agent}"
+    local ntfy_flag="/tmp/shogun_watcher_nopane_ntfy_${agent}"
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+    echo "$(( $(date +%s) - 40 ))" > "$since_file"
+
+    (
+        NOPANE_WARN_AFTER_SEC=30
+        NOPANE_NTFY_AFTER_SEC=300
+        pane_exists() { return 1; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane002_1.log"
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane002_2.log"
+
+        [ "$(grep -c 'pane不在検知' "$TEST_TMP/inbox_write_calls.log")" -eq 1 ]
+        [ -f "$notified_flag" ]
+    )
+
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+}
+
+# ---------------------------------------------------------------------------
+# TC-NOPANE-003 (cmd_193): pane不在→通知後、paneが在る状態(解消)になると
+# 状態ファイル群が消え(再武装)、その後改めてpane不在が閾値超まで継続すると
+# 再び通知が発生する。
+# ---------------------------------------------------------------------------
+@test "TC-NOPANE-003: resolution clears state and a fresh occurrence notifies again" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_nopane003"
+    local since_file="/tmp/shogun_watcher_nopane_${agent}"
+    local notified_flag="/tmp/shogun_watcher_nopane_notified_${agent}"
+    local ntfy_flag="/tmp/shogun_watcher_nopane_ntfy_${agent}"
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+    echo "$(( $(date +%s) - 40 ))" > "$since_file"
+
+    (
+        NOPANE_WARN_AFTER_SEC=30
+        NOPANE_NTFY_AFTER_SEC=300
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        pane_exists() { return 1; }
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane003_1.log"
+        [ -f "$notified_flag" ]
+
+        # pane解消: 既存の稼働中watcher経路(pgrep一致)へフォールスルーさせ、
+        # 何も起動させずに素通りさせる。
+        pane_exists() { return 0; }
+        pgrep() { return 0; }
+        flock() { return 0; }
+        nohup() { :; }
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane003_2.log"
+        [ ! -f "$since_file" ]
+        [ ! -f "$notified_flag" ]
+
+        # 改めてpane不在・改めて閾値超 → 再び通知される
+        echo "$(( $(date +%s) - 40 ))" > "$since_file"
+        pane_exists() { return 1; }
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane003_3.log"
+
+        [ "$(grep -c 'pane不在検知' "$TEST_TMP/inbox_write_calls.log")" -eq 2 ]
+        [ -f "$notified_flag" ]
+    )
+
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+}
+
+# ---------------------------------------------------------------------------
+# TC-NOPANE-004 (cmd_193): pane不在の継続がNOPANE_WARN_AFTER_SEC未満(瞬断)の
+# 場合はWARN・inbox_writeとも0件。閾値そのものを固定する。
+# ---------------------------------------------------------------------------
+@test "TC-NOPANE-004: pane missing below warn threshold does not notify" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_nopane004"
+    local since_file="/tmp/shogun_watcher_nopane_${agent}"
+    local notified_flag="/tmp/shogun_watcher_nopane_notified_${agent}"
+    local ntfy_flag="/tmp/shogun_watcher_nopane_ntfy_${agent}"
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+
+    (
+        NOPANE_WARN_AFTER_SEC=30
+        NOPANE_NTFY_AFTER_SEC=300
+        pane_exists() { return 1; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane004.log" 2>"$TEST_TMP/warn.log"
+
+        [ -f "$since_file" ]
+        [ ! -f "$TEST_TMP/inbox_write_calls.log" ]
+        [ ! -f "$notified_flag" ]
+        ! grep -q '\[WARN\] pane missing' "$TEST_TMP/warn.log" 2>/dev/null
+    )
+
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+}
+
+# ---------------------------------------------------------------------------
+# TC-NOPANE-005 (cmd_193): inbox_write.sh が非0で終わっても、
+# set -euo pipefail 下でデーモンを落とさず、通知済みフラグも立てない
+# (次周期に再試行できる)。QC34-F1-001と同型。
+# ---------------------------------------------------------------------------
+@test "TC-NOPANE-005: failing inbox_write.sh call does not abort under errexit and leaves flag unset" {
+    local agent="ashigaru1_${BATS_TEST_NUMBER}_$$_nopane005"
+    local since_file="/tmp/shogun_watcher_nopane_${agent}"
+    local notified_flag="/tmp/shogun_watcher_nopane_notified_${agent}"
+    local ntfy_flag="/tmp/shogun_watcher_nopane_ntfy_${agent}"
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+    echo "$(( $(date +%s) - 40 ))" > "$since_file"
+
+    (
+        NOPANE_WARN_AFTER_SEC=30
+        NOPANE_NTFY_AFTER_SEC=300
+        set -euo pipefail
+
+        pane_exists() { return 1; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 1
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.1" "/tmp/test_nopane005.log" 2>"$TEST_TMP/warn.log"
+
+        # ここへ到達すること自体がerrexitでサブシェルが落ちなかった証明。
+        echo "survived" >> "$TEST_TMP/survived.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        grep -q "failed to notify" "$TEST_TMP/warn.log"
+        [ ! -f "$notified_flag" ]
+    )
+
+    [ -f "$TEST_TMP/survived.log" ]
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+}
+
+# ---------------------------------------------------------------------------
+# TC-NOPANE-006 (cmd_193・本cmdの肝): agent=shogun のとき、通知先はkaro
+# (cmd_180規則)であり、shogun自身のinboxへは1度も書かれない。
+# 当人のinbox_watcherが無い(=本条件そのもの)ため当人宛は構造的に配送
+# 不能——「書いたが届かぬ」形は沈黙より悪いことを、ここで独立に固定する。
+# 実agent名(literal "shogun")を使う必要があるため、状態ファイルは
+# テスト前後で明示的にrm -fし、実行中の本番watcher_supervisor(未だ本cmdの
+# コードは走っていない)の領域を汚さぬよう最小化する。
+# ---------------------------------------------------------------------------
+@test "TC-NOPANE-006: agent=shogun never receives its own nopane notification (routed to karo)" {
+    local agent="shogun"
+    local since_file="/tmp/shogun_watcher_nopane_${agent}"
+    local notified_flag="/tmp/shogun_watcher_nopane_notified_${agent}"
+    local ntfy_flag="/tmp/shogun_watcher_nopane_ntfy_${agent}"
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
+    echo "$(( $(date +%s) - 40 ))" > "$since_file"
+
+    (
+        NOPANE_WARN_AFTER_SEC=30
+        NOPANE_NTFY_AFTER_SEC=300
+        pane_exists() { return 1; }
+        ensure_inbox_file() { touch "$TEST_TMP/queue/inbox/${1}.yaml"; }
+        bash() {
+            if [ "$1" = "scripts/inbox_write.sh" ]; then
+                echo "$*" >> "$TEST_TMP/inbox_write_calls.log"
+                return 0
+            fi
+            command bash "$@"
+        }
+
+        eval "$(
+            awk '/^start_watcher_if_missing\(\)/{p=1} p{print} /^\}$/{if(p){p=0}}' \
+                "$SUPERVISOR_SCRIPT"
+        )"
+
+        start_watcher_if_missing "$agent" "multiagent:agents.0" "/tmp/test_nopane006.log"
+
+        [ -f "$TEST_TMP/inbox_write_calls.log" ]
+        # $* の先頭語は "scripts/inbox_write.sh" 自体。宛先は2語目。
+        # 本cmdの肝: 診断対象(shogun)当人へは1度も書かれない。
+        [ "$(awk '{print $2}' "$TEST_TMP/inbox_write_calls.log" | head -n1)" = "karo" ]
+        [ "$(awk '{print $2}' "$TEST_TMP/inbox_write_calls.log" | head -n1)" != "shogun" ]
+        [ -f "$notified_flag" ]
+    )
+
+    rm -f "$since_file" "$notified_flag" "$ntfy_flag"
 }
