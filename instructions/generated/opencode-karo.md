@@ -837,6 +837,7 @@ Meanings and allowed/forbidden actions (short):
 - `assigned`: start now
   - Allowed: assignee ashigaru executes, writes the report, then closes out via `bash scripts/task_complete.sh --task-id <id> --to gunshi --message "..."` — this updates status to `done`/`failed`/`blocked` and hands off via inbox_write as one command (see CLAUDE.md「バトンの規律」)
   - Forbidden: other agents editing that ashigaru YAML; updating status and inbox_write as two separate manual steps
+  - Caution (cmd_190): if the handoff message contains backticks, `$(...)`, or `$VAR`, the caller's own shell can silently expand them inside double quotes before `task_complete.sh` ever sees the text. Wrap the message in single quotes, or pass `--message-file <path>` (writes the text via a file instead of the shell — expansion cannot happen at all) instead of `--message`.
 
 - `blocked`: do NOT start yet (prereqs missing)
   - Allowed: Karo unblocks by changing to `assigned` when ready, then inbox_write

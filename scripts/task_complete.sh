@@ -20,6 +20,11 @@
 #     [--no-report]                   # 報告突き合わせ前提条件を外す
 #     [--dry-run]                     # preflightのみ。一切書き換えぬ
 #
+# --message と --message-file <path> は排他。引き継ぎ本文に
+# バッククォート・$(...)・$VAR を含める場合、--message（二重引用符）
+# では呼び手のシェルがそれらを展開し本文が黙って壊れる（単一引用符で
+# 守るか、シェルを経路から外す --message-file を用いよ。cmd_190）。
+#
 # exit codes (常に標準エラーへ1行の状態説明を伴う):
 #   0 成功
 #   2 前提不一致（何も変えていない）
@@ -37,6 +42,7 @@ AGENT=""
 TASK_ID=""
 TO=""
 MESSAGE=""
+MESSAGE_FILE=""
 TYPE="report_received"
 STATUS="done"
 REQUIRE_REPORT=1
@@ -47,6 +53,7 @@ while [ $# -gt 0 ]; do
         --task-id) TASK_ID="$2"; shift 2 ;;
         --to) TO="$2"; shift 2 ;;
         --message) MESSAGE="$2"; shift 2 ;;
+        --message-file) MESSAGE_FILE="$2"; shift 2 ;;
         --agent) AGENT="$2"; shift 2 ;;
         --type) TYPE="$2"; shift 2 ;;
         --status) STATUS="$2"; shift 2 ;;
@@ -58,7 +65,18 @@ done
 
 [ -n "$TASK_ID" ] || die 2 "--task-idは必須である"
 [ -n "$TO" ]      || die 2 "--toは必須である"
-[ -n "$MESSAGE" ] || die 2 "--messageは必須である"
+# --message と --message-file は排他（cmd_190: シェルを経路から外すための
+# ファイル渡し経路。両方あれば意図不明、どちらも無ければ本文が無い）
+if [ -n "$MESSAGE" ] && [ -n "$MESSAGE_FILE" ]; then
+    die 2 "--messageと--message-fileは同時指定できぬ"
+fi
+if [ -z "$MESSAGE" ] && [ -z "$MESSAGE_FILE" ]; then
+    die 2 "--messageまたは--message-fileのいずれかが必須である"
+fi
+if [ -n "$MESSAGE_FILE" ]; then
+    [ -r "$MESSAGE_FILE" ] || die 2 "--message-fileが読めぬ: $MESSAGE_FILE"
+    MESSAGE=$(cat -- "$MESSAGE_FILE") || die 2 "--message-fileの読み取りに失敗した"
+fi
 
 : "${AGENT:=$(tmux display-message -t "${TMUX_PANE:-}" -p '#{@agent_id}' 2>/dev/null || true)}"
 TASK_FILE="$ROOT/queue/tasks/${AGENT}.yaml"
@@ -71,8 +89,27 @@ cur_id=$(grep -m1 '^  task_id:' "$TASK_FILE" | sed -E 's/^  task_id:[[:space:]]*
 [ "$cur_id" = "$TASK_ID" ] || die 2 "task_id不一致: YAML=$cur_id 指定=$TASK_ID"
 cur_status=$(grep -m1 '^  status:' "$TASK_FILE" | sed -E 's/^  status:[[:space:]]*//')
 [ "$TO" != "$AGENT" ] || die 2 "自己宛の引き継ぎは成立せぬ"
+# 三重引用符の禁止はYAML埋め込みの安全性が理由であり、シェル展開とは無関係。
+# 撤回されたバッククォート die 案(a)とは別物ゆえ、--message-file経路でも
+# 等しく適用する（巻き添えで外さぬこと）。
 case "$MESSAGE" in *"'''"*) die 2 "messageに三重引用符を含めてはならぬ";; esac
 case "$MESSAGE" in *\\*) echo "[task_complete] 警告: messageにバックスラッシュを含む。\\n等は改行へ化ける" >&2;; esac
+
+# cmd_190: 呼び手のシェルが message を展開した痕跡を探す。
+# 展開後の文字列からは検知できぬため、親プロセスのcmdlineに残る
+# 「展開前の生テキスト」と突き合わせる（設計: gunshi_190_design.yaml）。
+# 誤検知の類型が実在するため **die にはせず警告に留める**。
+# --message-file経路は原理的に展開が起こり得ぬため検査しない
+# （ファイル内容はコマンド行に現れず、行えば必ず誤検知になる）。
+if [ -z "$MESSAGE_FILE" ] && [ -r "/proc/$PPID/cmdline" ]; then
+    raw=$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null || true)
+    if [ -n "$raw" ]; then
+        case "$raw" in
+            *"$MESSAGE"*) : ;;   # 逐語で在る＝展開されておらぬ
+            *) echo "[task_complete] 警告: messageが呼び手のシェルで展開された可能性がある（受け取った本文が元のコマンド行に逐語で現れぬ）。バッククォート・\$(...)・\$VAR を含む本文は単一引用符で囲むか、--message-file を用いよ" >&2 ;;
+        esac
+    fi
+fi || true
 
 if [ "$REQUIRE_REPORT" = 1 ]; then
     [ -f "$REPORT_FILE" ] || die 3 "報告YAMLが無い。報告を書いてから呼べ"

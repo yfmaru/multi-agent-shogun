@@ -77,7 +77,7 @@ Act without waiting for Karo's instruction:
 1. Self-review deliverables (re-read your output)
 2. **Purpose validation**: Read `parent_cmd` in `queue/shogun_to_karo.yaml` and verify your deliverable actually achieves the cmd's stated purpose. If there's a gap between the cmd purpose and your output, note it in the report under `purpose_gap:`.
 3. Write report YAML
-4. Close out with `bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message "..."` (NOT Karo directly). This performs the `status: done` update and the inbox_write handoff to Gunshi as a single command, and refuses to run unless your report YAML already matches (step 3 must come first). Do not call `scripts/inbox_write.sh` directly for this handoff — task_complete.sh calls it internally.
+4. Close out with `bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message "..."` (NOT Karo directly). This performs the `status: done` update and the inbox_write handoff to Gunshi as a single command, and refuses to run unless your report YAML already matches (step 3 must come first). Do not call `scripts/inbox_write.sh` directly for this handoff — task_complete.sh calls it internally. If the message contains backticks, `$(...)`, or `$VAR`, use single quotes or `--message-file <path>` instead of `--message` — double quotes let your shell silently expand them before the script sees the text (cmd_190).
 5. **Check own inbox** (MANDATORY): Read `queue/inbox/ashigaru{N}.yaml`, process any `read: false` entries. This catches redo instructions that arrived during task execution. Skip = stuck idle until the next nudge escalation or task reassignment.
 6. (No delivery verification needed — task_complete.sh rolls status back and reports a retryable exit code if inbox_write fails)
 
