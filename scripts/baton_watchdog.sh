@@ -312,6 +312,8 @@ if not isinstance(cmds, list):
 
 
 def parse_ts(value):
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
     if not isinstance(value, str):
         return None
     s = value.strip()
