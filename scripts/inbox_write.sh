@@ -3,16 +3,42 @@
 # Usage: bash scripts/inbox_write.sh <target_agent> <content> <type> <from>
 # Example: bash scripts/inbox_write.sh karo "足軽5号、任務完了" report_received ashigaru5
 #
+# 記号（バッククォート・$(...)・$VAR・${...}）を含む本文はファイル経由で渡せ:
+#   bash scripts/inbox_write.sh --to karo --content-file <path> --type report_received --from gunshi
+#
 # 過去の既読メッセージ（overflow時に退避されたもの）を参照したい場合は
 # `grep` で `queue/inbox/archive/<agent>-*.yaml` を検索せよ。
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET="$1"
-CONTENT="$2"
-TYPE="$3"
-FROM="$4"
+
+# 第1引数が -- で始まらなければ従来経路（位置引数）。始まればフラグ形式。
+if [ "${1:-}" = "${1#--}" ]; then
+    TARGET="$1"
+    CONTENT="$2"
+    TYPE="$3"
+    FROM="$4"
+else
+    CONTENT_FILE=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --to)           TARGET="${2:-}";       shift 2 ;;
+            --content-file) CONTENT_FILE="${2:-}"; shift 2 ;;
+            --type)         TYPE="${2:-}";         shift 2 ;;
+            --from)         FROM="${2:-}";         shift 2 ;;
+            *) echo "[inbox_write] 未知の引数: $1" >&2; exit 1 ;;
+        esac
+    done
+    [ -n "$CONTENT_FILE" ] || {
+        echo "[inbox_write] フラグ形式では --content-file が必須である。inline本文は従来の位置引数で渡せ" >&2; exit 1; }
+    [ -r "$CONTENT_FILE" ] || {
+        echo "[inbox_write] --content-file が読めぬ: $CONTENT_FILE" >&2; exit 1; }
+    CONTENT=$(cat -- "$CONTENT_FILE") || {
+        echo "[inbox_write] --content-file の読み取りに失敗した" >&2; exit 1; }
+    [ -n "$CONTENT" ] || {
+        echo "[inbox_write] --content-file が空である: $CONTENT_FILE" >&2; exit 1; }
+fi
 
 INBOX="$SCRIPT_DIR/queue/inbox/${TARGET}.yaml"
 LOCKFILE="${INBOX}.lock"
@@ -80,13 +106,15 @@ max_attempts=3
 while [ $attempt -lt $max_attempts ]; do
     if _acquire_lock; then
         trap _release_lock EXIT
-        if "$SCRIPT_DIR/.venv/bin/python3" -c "
+        if INBOX="$INBOX" MSG_ID="$MSG_ID" FROM="$FROM" TIMESTAMP="$TIMESTAMP" \
+           TYPE="$TYPE" CONTENT="$CONTENT" TARGET="$TARGET" \
+           "$SCRIPT_DIR/.venv/bin/python3" - <<'PYSRC'
 import yaml, sys
 import tempfile, os
 
 try:
     # Load existing inbox
-    with open('$INBOX') as f:
+    with open(os.environ["INBOX"]) as f:
         data = yaml.safe_load(f)
 
     # Initialize if needed
@@ -97,11 +125,11 @@ try:
 
     # Add new message
     new_msg = {
-        'id': '$MSG_ID',
-        'from': '$FROM',
-        'timestamp': '$TIMESTAMP',
-        'type': '$TYPE',
-        'content': '''$CONTENT''',
+        'id': os.environ["MSG_ID"],
+        'from': os.environ["FROM"],
+        'timestamp': os.environ["TIMESTAMP"],
+        'type': os.environ["TYPE"],
+        'content': os.environ["CONTENT"],
         'read': False
     }
     data['messages'].append(new_msg)
@@ -118,10 +146,10 @@ try:
 
         # Invariant: unread (read: false) messages must NEVER be archived/discarded.
         if to_archive:
-            archive_dir = os.path.join(os.path.dirname('$INBOX'), 'archive')
+            archive_dir = os.path.join(os.path.dirname(os.environ["INBOX"]), 'archive')
             os.makedirs(archive_dir, exist_ok=True)
-            archive_date = '$TIMESTAMP'.split('T')[0]
-            archive_path = os.path.join(archive_dir, '${TARGET}-' + archive_date + '.yaml')
+            archive_date = os.environ["TIMESTAMP"].split('T')[0]
+            archive_path = os.path.join(archive_dir, os.environ["TARGET"] + '-' + archive_date + '.yaml')
 
             if os.path.exists(archive_path):
                 with open(archive_path) as af:
@@ -144,11 +172,11 @@ try:
                 raise
 
     # Atomic write: tmp file + rename (prevents partial reads)
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname('$INBOX'), suffix='.tmp')
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(os.environ["INBOX"]), suffix='.tmp')
     try:
         with os.fdopen(tmp_fd, 'w') as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True, indent=2)
-        os.replace(tmp_path, '$INBOX')
+        os.replace(tmp_path, os.environ["INBOX"])
     except:
         os.unlink(tmp_path)
         raise
@@ -156,7 +184,8 @@ try:
 except Exception as e:
     print(f'ERROR: {e}', file=sys.stderr)
     sys.exit(1)
-"; then
+PYSRC
+        then
             STATUS=0
         else
             STATUS=$?

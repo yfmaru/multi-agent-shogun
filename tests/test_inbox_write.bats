@@ -464,3 +464,183 @@ PYFAIL
 
     [ ! -d "$TEST_INBOX_DIR/test_agent.yaml.lock.d" ]
 }
+
+# =============================================================================
+# cmd_196・S1: Pythonソース補間の解体 ＋ --content-file 新設
+# =============================================================================
+
+# -----------------------------------------------------------------------
+# TC-IW-INJ-001~003: 補間解体の証明
+# -----------------------------------------------------------------------
+
+@test "TC-IW-INJ-001: injection payload in content is stored verbatim, not evaluated" {
+    run bash "$TEST_INBOX_WRITE" "test_agent" "安全な本文''' + str(1+1) + '''末尾" "cmd_new" "shogun"
+    [ "$status" -eq 0 ]
+
+    "$VENV_PYTHON" <<EOF
+import yaml
+
+with open('$TEST_INBOX_DIR/test_agent.yaml') as f:
+    data = yaml.safe_load(f)
+
+content = data['messages'][0]['content']
+# 是正前はこれが '安全な本文2末尾' に化ける（式が評価された証拠）。
+# 是正後は逐語のまま残らねばならぬ。
+assert content == "安全な本文''' + str(1+1) + '''末尾", f'injection was evaluated: {content!r}'
+
+print('TC-IW-INJ-001: PASS')
+EOF
+}
+
+@test "TC-IW-INJ-002: single quotes in FROM/TYPE do not break or get evaluated" {
+    run bash "$TEST_INBOX_WRITE" "test_agent" "本文" "type'with'quotes" "from'with'quotes"
+    [ "$status" -eq 0 ]
+
+    "$VENV_PYTHON" <<EOF
+import yaml
+
+with open('$TEST_INBOX_DIR/test_agent.yaml') as f:
+    data = yaml.safe_load(f)
+
+msg = data['messages'][0]
+assert msg['type'] == "type'with'quotes", f'type mismatch: {msg["type"]!r}'
+assert msg['from'] == "from'with'quotes", f'from mismatch: {msg["from"]!r}'
+
+print('TC-IW-INJ-002: PASS')
+EOF
+}
+
+@test "TC-IW-INJ-003: apostrophe, double quote, newline in content round-trip exactly via YAML" {
+    CONTENT_WITH_QUOTES="アポストロフィ'二重引用符\"改行
+2行目"
+    run bash "$TEST_INBOX_WRITE" "test_agent" "$CONTENT_WITH_QUOTES" "cmd_new" "shogun"
+    [ "$status" -eq 0 ]
+
+    "$VENV_PYTHON" <<EOF
+import yaml
+
+with open('$TEST_INBOX_DIR/test_agent.yaml') as f:
+    data = yaml.safe_load(f)
+
+expected = '''アポストロフィ'二重引用符"改行
+2行目'''
+assert data['messages'][0]['content'] == expected, f'roundtrip mismatch: {data["messages"][0]["content"]!r}'
+
+print('TC-IW-INJ-003: PASS')
+EOF
+}
+
+# -----------------------------------------------------------------------
+# TC-IW-CF-001~007: --content-file
+# -----------------------------------------------------------------------
+
+@test "TC-IW-CF-001: symbol-laden content via --content-file lands byte-exact (yaml round-trip, not grep -F)" {
+    CONTENT_FILE="$TEST_TMPDIR/content.txt"
+    printf '記号入り本文: `echo hi` $(whoami) $HOME ${PATH} と単一引用符'"'"'末尾' > "$CONTENT_FILE"
+
+    run bash "$TEST_INBOX_WRITE" --to test_agent --content-file "$CONTENT_FILE" --type report_received --from gunshi
+    [ "$status" -eq 0 ]
+
+    "$VENV_PYTHON" <<EOF
+import yaml
+
+with open('$CONTENT_FILE') as f:
+    expected = f.read()
+
+with open('$TEST_INBOX_DIR/test_agent.yaml') as f:
+    data = yaml.safe_load(f)
+
+actual = data['messages'][0]['content']
+assert actual == expected, f'content mismatch: expected={expected!r} actual={actual!r}'
+
+print('TC-IW-CF-001: PASS')
+EOF
+}
+
+@test "TC-IW-CF-002: flag form without --content-file → exit 1, inbox not created" {
+    run bash "$TEST_INBOX_WRITE" --to test_agent --type report_received --from gunshi
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "--content-file" ]]
+    [ ! -f "$TEST_INBOX_DIR/test_agent.yaml" ]
+}
+
+@test "TC-IW-CF-003: unreadable --content-file path → exit 1, inbox not created" {
+    run bash "$TEST_INBOX_WRITE" --to test_agent --content-file "$TEST_TMPDIR/does_not_exist.txt" --type report_received --from gunshi
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "読めぬ" ]]
+    [ ! -f "$TEST_INBOX_DIR/test_agent.yaml" ]
+}
+
+@test "TC-IW-CF-004: empty --content-file → exit 1, inbox not created" {
+    CONTENT_FILE="$TEST_TMPDIR/empty.txt"
+    : > "$CONTENT_FILE"
+
+    run bash "$TEST_INBOX_WRITE" --to test_agent --content-file "$CONTENT_FILE" --type report_received --from gunshi
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "空である" ]]
+    [ ! -f "$TEST_INBOX_DIR/test_agent.yaml" ]
+}
+
+@test "TC-IW-CF-005: flag form self-send (from==to) → exit 1 with REJECTED" {
+    CONTENT_FILE="$TEST_TMPDIR/content.txt"
+    echo "自己宛本文" > "$CONTENT_FILE"
+
+    run bash "$TEST_INBOX_WRITE" --to gunshi --content-file "$CONTENT_FILE" --type report_received --from gunshi
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "REJECTED" ]]
+    [ ! -f "$TEST_INBOX_DIR/gunshi.yaml" ]
+}
+
+@test "TC-IW-CF-006: unknown flag → exit 1" {
+    run bash "$TEST_INBOX_WRITE" --to test_agent --bogus-flag foo --type report_received --from gunshi
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "未知の引数" ]]
+    [ ! -f "$TEST_INBOX_DIR/test_agent.yaml" ]
+}
+
+@test "TC-IW-CF-007: content-file payload never appears on the command line and has no side effect" {
+    CONTENT_FILE="$TEST_TMPDIR/content.txt"
+    SIDE_EFFECT_MARKER="$TEST_TMPDIR/side_effect_marker"
+    printf '副作用検体: $(touch %s)' "$SIDE_EFFECT_MARKER" > "$CONTENT_FILE"
+
+    run bash -c "bash \"$TEST_INBOX_WRITE\" --to test_agent --content-file \"$CONTENT_FILE\" --type report_received --from gunshi"
+    [ "$status" -eq 0 ]
+
+    # 副作用（本文中のコマンド置換が実際に実行されること）が起きておらぬこと
+    [ ! -f "$SIDE_EFFECT_MARKER" ]
+
+    "$VENV_PYTHON" <<EOF
+import yaml
+
+with open('$TEST_INBOX_DIR/test_agent.yaml') as f:
+    data = yaml.safe_load(f)
+
+content = data['messages'][0]['content']
+assert '\$(touch' in content, f'content was altered, expected literal command substitution text: {content!r}'
+
+print('TC-IW-CF-007: PASS')
+EOF
+}
+
+# -----------------------------------------------------------------------
+# TC-IW-REG-001: 従来経路の非破壊
+# -----------------------------------------------------------------------
+
+@test "TC-IW-REG-001: traditional positional form still succeeds unchanged after branching was added" {
+    run bash "$TEST_INBOX_WRITE" "test_agent" "従来形式メッセージ" "cmd_new" "shogun"
+    [ "$status" -eq 0 ]
+
+    "$VENV_PYTHON" <<EOF
+import yaml
+
+with open('$TEST_INBOX_DIR/test_agent.yaml') as f:
+    data = yaml.safe_load(f)
+
+msg = data['messages'][0]
+assert msg['content'] == '従来形式メッセージ', f'content mismatch: {msg["content"]!r}'
+assert msg['type'] == 'cmd_new', f'type mismatch: {msg["type"]!r}'
+assert msg['from'] == 'shogun', f'from mismatch: {msg["from"]!r}'
+
+print('TC-IW-REG-001: PASS')
+EOF
+}
