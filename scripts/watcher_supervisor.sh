@@ -53,12 +53,12 @@ rotate_log_if_large() {
     [ "$size" -gt "$max_bytes" ] || return 0
 
     local tail_content
-    tail_content=$(tail -n "$keep_lines" "$log_file")
-    : > "$log_file"
+    tail_content=$(tail -n "$keep_lines" "$log_file") || return 0
+    : > "$log_file" || return 0
     {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [watcher_supervisor/log_rotate] rotated ${log_file} in place: previous size ${size} bytes exceeded ${max_bytes} bytes cap; kept last ${keep_lines} lines"
         printf '%s\n' "$tail_content"
-    } >> "$log_file"
+    } >> "$log_file" || return 0
 }
 
 rotate_all_managed_logs() {

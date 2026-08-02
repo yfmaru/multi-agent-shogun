@@ -11,13 +11,22 @@
 #   T-ROT-001: log under the size cap is left untouched
 #   T-ROT-002: log over the size cap is truncated in place, keeping only
 #              the last N lines plus a rotation marker line
-#   T-ROT-003: missing log file is a no-op (no error under set -euo pipefail)
+#   T-ROT-003: missing log file is a no-op. Note: this test's setup() only
+#              extracts the rotate_log_if_large() function body via awk+eval
+#              (see below) — the script's own top-of-file `set -euo pipefail`
+#              line is outside the extracted range, so this test shell does
+#              NOT have errexit active. It exercises the early-return path
+#              only, not errexit resilience.
 #   T-ROT-004: rotation truncates the file IN PLACE (same inode before/after)
 #              rather than replacing it — this is the property that keeps
 #              an already-open append-mode fd (held by the daemon whose
 #              stdout was redirected with `>>` at launch) still landing in
 #              the visible file after rotation, instead of silently
 #              writing into an unlinked, invisible inode.
+#   TC-ROT-005: with `set -euo pipefail` explicitly enabled in-test (QC52-F1,
+#               cmd_186 PR#52 redo), a failing `tail` inside
+#               rotate_log_if_large() must not kill the caller — the function
+#               must return 0 and the caller's subsequent line must still run.
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 SUPERVISOR_SCRIPT="$PROJECT_ROOT/scripts/watcher_supervisor.sh"
@@ -110,4 +119,31 @@ teardown() {
     exec 9>&-
 
     grep -q "post-rotate-via-old-fd" "$log" || { cat "$log"; false; }
+}
+
+@test "TC-ROT-005: under set -euo pipefail, tail failure returns 0 and caller continues" {
+    local log="$TEST_TMP/tail_fail.log"
+    for i in $(seq 1 100); do
+        echo "line-${i}" >> "$log"
+    done
+    local before
+    before=$(cat "$log")
+
+    # Stub tail to always fail, simulating an I/O failure inside the
+    # command substitution that feeds tail_content.
+    tail() { return 1; }
+
+    local marker_file="$TEST_TMP/reached_after_call"
+    rm -f "$marker_file"
+
+    (
+        set -euo pipefail
+        WATCHER_LOG_ROTATE_MAX_BYTES=100 WATCHER_LOG_ROTATE_KEEP_LINES=10 rotate_log_if_large "$log"
+        touch "$marker_file"
+    )
+    local subshell_status=$?
+
+    [ "$subshell_status" -eq 0 ] || { echo "subshell aborted under set -euo pipefail (status=$subshell_status) — errexit killed the caller instead of the function returning 0"; false; }
+    [ -f "$marker_file" ] || { echo "caller's line after rotate_log_if_large never ran — errexit killed the shell before returning"; false; }
+    [ "$(cat "$log")" = "$before" ] || { echo "log file was modified despite tail failure"; cat "$log"; false; }
 }
