@@ -35,6 +35,20 @@
 #
 #   TC-TCOMP-012 ロック競合時、保持者側のロックを壊さない(QC49-F1)
 #   TC-TCOMP-013 _release_lock定義前に落ちてもBACKUPが残らない(QC49-F2)
+#
+# TC-TCOMP-MF/EXP/REG は cmd_190（軍師設計 gunshi_190_design.yaml）に基づく。
+# 主対策=--message-file（シェルを経路から外す）、副対策=展開検知の警告
+# （die にはせぬ）。test_plan節どおり最低9件。
+#
+#   TC-TCOMP-MF-001  --message-fileの内容がバッククォート等を含め逐語で届く
+#   TC-TCOMP-MF-002  --messageと--message-fileの同時指定 → exit 2
+#   TC-TCOMP-MF-003  どちらも未指定 → exit 2
+#   TC-TCOMP-MF-004  --message-fileが読めぬ → exit 2・task YAML不変
+#   TC-TCOMP-EXP-001 --message経路・cmdlineに本文が逐語で在る → 警告なし
+#   TC-TCOMP-EXP-002 --message経路・シェル展開で本文が消えた → 警告1行(exit 0)
+#   TC-TCOMP-EXP-003 --message-file経路では常に警告なし（安全な経路の番人）
+#   TC-TCOMP-EXP-004 /procが読めぬ環境を模す → 黙って飛ばしexit 0
+#   TC-TCOMP-REG-001 既存の--message呼び出し形は非破壊
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 
@@ -236,4 +250,118 @@ run_tc() {
     local leftovers=("$FIXTURE_ROOT"/queue/tasks/*.bak.*)
     shopt -u nullglob
     [ "${#leftovers[@]}" -eq 0 ] || { echo "REGRESSION: BACKUPが残存: ${leftovers[*]}"; false; }
+}
+
+@test "TC-TCOMP-MF-001: --message-file passes the file's raw content through unchanged (backticks, \$(), \$VAR survive verbatim)" {
+    write_task assigned
+    write_report done
+    local msg_file="$TEST_TMPDIR/msg.txt"
+    printf '%s' 'raw: `date` and $(whoami) and $HOME must survive literally' > "$msg_file"
+    run_tc --task-id subtask_test --to gunshi --message-file "$msg_file" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    grep -qF 'raw: `date` and $(whoami) and $HOME must survive literally' "$INBOX_LOG" || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-MF-002: --message and --message-file together exits 2, inbox untouched" {
+    write_task assigned
+    write_report done
+    local msg_file="$TEST_TMPDIR/msg.txt"
+    printf '%s' 'irrelevant' > "$msg_file"
+    run_tc --task-id subtask_test --to gunshi --message "hello" --message-file "$msg_file" --agent ashigaru1
+    [ "$status" -eq 2 ] || { echo "output: $output"; false; }
+    [ ! -s "$INBOX_LOG" ] || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-MF-003: neither --message nor --message-file exits 2" {
+    write_task assigned
+    write_report done
+    run_tc --task-id subtask_test --to gunshi --agent ashigaru1
+    [ "$status" -eq 2 ] || { echo "output: $output"; false; }
+    [ ! -s "$INBOX_LOG" ] || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-MF-004: unreadable --message-file path exits 2, task YAML unmutated" {
+    write_task assigned
+    write_report done
+    run_tc --task-id subtask_test --to gunshi --message-file "$TEST_TMPDIR/does_not_exist.txt" --agent ashigaru1
+    [ "$status" -eq 2 ] || { echo "output: $output"; false; }
+    grep -qE '^  status: assigned$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+    [ ! -s "$INBOX_LOG" ] || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-EXP-001: --message path emits no warning when the caller's raw cmdline contains the message verbatim" {
+    write_task assigned
+    write_report done
+    # 末尾の`; :`は必須: bashはサブシェル内の末尾コマンドをexecで
+    # 自身に置き換える最適化を行うため、これが無いとtask_complete.shの
+    # 実プロセスが1階層祖父母側($PPID)へ繰り上がり、本テストの前提
+    # （task_complete.shの$PPIDがこの-cプロセス自身になること）が崩れる
+    local placeholder='MESSAGE="hello world literal"; bash "__ROOT__/scripts/task_complete.sh" --task-id subtask_test --to gunshi --message "$MESSAGE" --agent ashigaru1; :'
+    local inner="${placeholder//__ROOT__/$FIXTURE_ROOT}"
+    run bash -c "$inner"
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"警告"* ]] || { echo "output: $output"; false; }
+    [ "$(wc -l < "$INBOX_LOG")" -eq 1 ] || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-EXP-002: --message path warns (but still exits 0) when the caller's shell expanded the text away from the raw cmdline" {
+    write_task assigned
+    write_report done
+    # 末尾の`; :`はEXP-001と同じ理由で必須（bashのexec置き換え最適化対策）
+    local placeholder='bash "__ROOT__/scripts/task_complete.sh" --task-id subtask_test --to gunshi --message "A `echo MANGLED` B" --agent ashigaru1; :'
+    local inner="${placeholder//__ROOT__/$FIXTURE_ROOT}"
+    run bash -c "$inner"
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # macOSにはそもそも/procが無く、展開検知の仕組み自体がEXP-004と
+        # 同じ理由で原理的に働かない。ゆえに警告は出ない（この非対称性
+        # 自体がmacOSでの正しい挙動であり、失敗ではない）
+        [[ "$output" != *"警告"* ]] || { echo "output: $output"; false; }
+    else
+        [[ "$output" == *"警告"* ]] || { echo "output: $output"; false; }
+    fi
+    [ "$(wc -l < "$INBOX_LOG")" -eq 1 ] || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-EXP-003: --message-file path never emits the expansion warning, even with a cmdline mismatch" {
+    write_task assigned
+    write_report done
+    local msg_file="$TEST_TMPDIR/msg.txt"
+    printf '%s' 'content that will never appear on any cmdline verbatim xyz789' > "$msg_file"
+    run_tc --task-id subtask_test --to gunshi --message-file "$msg_file" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"警告"* ]] || { echo "output: $output"; false; }
+}
+
+@test "TC-TCOMP-EXP-004: no readable /proc entry for the parent silently skips the check (exit 0, no warning)" {
+    write_task assigned
+    write_report done
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # macOSにはそもそも/procが無く、本テストが検証したい状態が
+        # 最初から自然に成立している
+        run_tc --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
+    elif command -v unshare >/dev/null 2>&1 && unshare -rm -- true >/dev/null 2>&1; then
+        # Linux: 非特権 user+mount namespace で /proc を空tmpfsへ置き換え、
+        # 「/procが読めぬ」状態を人為的に再現する
+        local placeholder='mount -t tmpfs none /proc; bash "__ROOT__/scripts/task_complete.sh" --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1; :'
+        local inner="${placeholder//__ROOT__/$FIXTURE_ROOT}"
+        run unshare -rm -- bash -c "$inner"
+    else
+        # ubuntu-latest実測(cmd_190 PR#56): AppArmorの
+        # unprivileged_userns restrictionによりunshare -rm自体が拒否される
+        # 環境が実在する。--message-fileが原理的に安全という主張はここに
+        # 依存しないため、CIのSKIP=FAILゲート対象外として明示的に許容する
+        skip "user namespaceで/procを隠せず、/procが無い状況を再現できぬ (CI environment: AppArmor unprivileged userns restriction)"
+    fi
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"警告"* ]] || { echo "output: $output"; false; }
+}
+
+@test "TC-TCOMP-REG-001: existing --message call form is unaffected by the new --message-file path" {
+    write_task assigned
+    write_report done
+    run_tc --task-id subtask_test --to gunshi --message "plain handoff text" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    grep -qE '^  status: done$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+    grep -q "gunshi plain handoff text report_received ashigaru1" "$INBOX_LOG" || { cat "$INBOX_LOG"; false; }
 }

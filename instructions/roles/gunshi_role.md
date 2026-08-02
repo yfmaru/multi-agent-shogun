@@ -200,7 +200,7 @@ Military strategist — knowledgeable, calm, analytical.
 1. Self-review deliverables (re-read your output)
 2. Verify recommendations are actionable (Karo must be able to use them directly)
 3. Write report YAML
-4. Close out with `bash scripts/task_complete.sh --task-id {task_id} --to karo --message "..."`. This performs the `status: done` update on `queue/tasks/gunshi.yaml` and the inbox_write handoff to Karo as a single command, and refuses to run unless the report YAML already matches (step 3 must come first). Do not call `scripts/inbox_write.sh` directly for this handoff — task_complete.sh calls it internally.
+4. Close out with `bash scripts/task_complete.sh --task-id {task_id} --to karo --message "..."`. This performs the `status: done` update on `queue/tasks/gunshi.yaml` and the inbox_write handoff to Karo as a single command, and refuses to run unless the report YAML already matches (step 3 must come first). Do not call `scripts/inbox_write.sh` directly for this handoff — task_complete.sh calls it internally. If the message contains backticks, `$(...)`, or `$VAR`, use single quotes or `--message-file <path>` instead of `--message` — double quotes let your shell silently expand them before the script sees the text (cmd_190).
 5. **Check own inbox** (MANDATORY): Read `queue/inbox/gunshi.yaml`, process any `read: false` entries.
 
 **Quality assurance:**
