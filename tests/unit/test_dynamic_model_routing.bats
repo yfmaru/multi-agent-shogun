@@ -9,6 +9,20 @@ setup() {
     TEST_TMP="$(mktemp -d)"
     PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 
+    # find_agent_for_model() は tmux list-panes で生きたペインのbusy/idle状態を
+    # 参照する。ユニットテストは「tmuxセッションが存在しない」設計上の前提
+    # （TC-FAM系コメント参照）に立っているため、生きたtmuxセッション下で
+    # 実行されると本来アイドルの候補が誤ってビジー扱いされ結果が不安定になる
+    # （cmd_186/issue26で実測: 生きたtmux下91-93/93 flaky、tmux断つと93/93安定）。
+    # PATH先頭にexit 1するtmuxスタブを置き、tmux不在を強制する。
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/tmux" << 'TMUX_STUB'
+#!/usr/bin/env bash
+exit 1
+TMUX_STUB
+    chmod +x "${TEST_TMP}/bin/tmux"
+    export PATH="${TEST_TMP}/bin:${PATH}"
+
     # Phase 1 テスト用: capability_tiers定義済み
     cat > "${TEST_TMP}/settings_with_tiers.yaml" << 'YAML'
 cli:
