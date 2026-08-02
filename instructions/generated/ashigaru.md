@@ -313,23 +313,36 @@ gh pr create --draft --base <base> --title "..." --body "..."
 
 ## Mailbox System (inbox_write.sh)
 
-Agent-to-agent communication uses file-based mailbox:
+Agent-to-agent communication uses a file-based mailbox.
+**本文の渡し方は2つある。「本文に記号を含むか」で選べ。**
+
+**(1) 記号を含む本文 → ファイルで渡す（フラグ形式）。**
+本文がシェルを通らぬゆえ、展開は原理的に起こり得ない:
 
 ```bash
-bash scripts/inbox_write.sh <target_agent> "<message>" <type> <from>
+# 本文は Write ツールで書く（シェルを経由せぬ）。その上で:
+bash scripts/inbox_write.sh --to karo --content-file <path> \
+     --type report_received --from gunshi
 ```
 
-Examples:
+**(2) 記号を含まぬ平文 → 従来の位置引数。単一引用符で囲め。**
+
 ```bash
-# Shogun → Karo
-bash scripts/inbox_write.sh karo "cmd_048を書いた。実行せよ。" cmd_new shogun
-
-# Ashigaru → Karo
-bash scripts/inbox_write.sh karo "足軽5号、任務完了。報告YAML確認されたし。" report_received ashigaru5
-
-# Karo → Ashigaru
-bash scripts/inbox_write.sh ashigaru3 "タスクYAMLを読んで作業開始せよ。" task_assigned karo
+bash scripts/inbox_write.sh karo 'cmd_048を書いた。実行せよ。' cmd_new shogun
+bash scripts/inbox_write.sh karo '足軽5号、任務完了。報告YAML確認されたし。' report_received ashigaru5
+bash scripts/inbox_write.sh ashigaru3 'タスクYAMLを読んで作業開始せよ。' task_assigned karo
 ```
+
+**バッククォート・`$(...)`・`$VAR` を含む本文を二重引用符で囲むな。**
+呼び手のシェルがスクリプト起動**前に**展開する。本文が黙って書き換わる
+だけでなく、**置換された中身が実行される**——2026-08-02、本文中の
+バッククォートが `watcher_supervisor.sh` を起動させ、呼び出しが2分半
+ハングし、そのメッセージは一度も届かなかった。
+
+補足: 単一引用符の中にアポストロフィは書けぬ。本文にアポストロフィが
+要るなら (1) のファイル形式を使え。
+
+引き継ぎ（`task_complete.sh`）にも同じ理屈で `--message-file` がある。
 
 Delivery is handled by `inbox_watcher.sh` (infrastructure layer).
 **Agents NEVER call tmux send-keys directly.**
@@ -422,8 +435,13 @@ Race condition is eliminated: context reset wipes old context. Agent re-reads YA
 
 ### Sending Messages
 
+**本文に記号（バッククォート・`$(...)`・`$VAR`・`${...}`）を含む場合は
+`--content-file`（ファイル形式）を使え。含まぬ平文のみ、従来の位置引数を
+単一引用符で囲んで使ってよい。** 詳細は「Mailbox System」節を見よ。
+
 ```bash
-bash scripts/inbox_write.sh <target> "<message>" <type> <from>
+# 記号を含まぬ平文の場合のみ:
+bash scripts/inbox_write.sh <target> '<message>' <type> <from>
 ```
 
 **No sleep interval needed.** No delivery confirmation needed. Multiple sends can be done in rapid succession — flock handles concurrency.
@@ -433,7 +451,7 @@ bash scripts/inbox_write.sh <target> "<message>" <type> <from>
 After writing report YAML, notify Karo:
 
 ```bash
-bash scripts/inbox_write.sh karo "足軽{N}号、任務完了でござる。報告書を確認されよ。" report_received ashigaru{N}
+bash scripts/inbox_write.sh karo '足軽{N}号、任務完了でござる。報告書を確認されよ。' report_received ashigaru{N}
 ```
 
 That's it. No state checking, no retry, no delivery verification.
@@ -768,7 +786,7 @@ Runtime switching is available but rarely needed (Gunshi handles L4+ tasks inste
 
 ```bash
 # Manual override only — not for Bloom-based auto-switching
-bash scripts/inbox_write.sh ashigaru{N} "/model <new_model>" model_switch karo
+bash scripts/inbox_write.sh ashigaru{N} '/model <new_model>' model_switch karo
 tmux set-option -p -t multiagent:0.{N} @model_name '<DisplayName>'
 ```
 
@@ -779,7 +797,7 @@ For Ashigaru: You don't switch models yourself. Karo manages this.
 For Karo only: Send `/clear` to ashigaru for context reset:
 
 ```bash
-bash scripts/inbox_write.sh ashigaru{N} "タスクYAMLを読んで作業開始せよ。" clear_command karo
+bash scripts/inbox_write.sh ashigaru{N} 'タスクYAMLを読んで作業開始せよ。' clear_command karo
 ```
 
 For Ashigaru: After `/clear`, follow CLAUDE.md /clear recovery procedure. Do NOT read instructions/ashigaru.md for the first task (cost saving).

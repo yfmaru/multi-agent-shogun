@@ -412,7 +412,7 @@ skill_candidate:
 After writing report YAML, close out with `scripts/task_complete.sh` (NOT `inbox_write.sh` directly — it performs the `status: done` update on `queue/tasks/gunshi.yaml` and the inbox_write handoff to Karo as one command, and refuses to run unless the report YAML already matches this task_id):
 
 ```bash
-bash scripts/task_complete.sh --task-id {task_id} --to karo --message "軍師、策を練り終えたり。報告書を確認されよ。"
+bash scripts/task_complete.sh --task-id {task_id} --to karo --message '軍師、策を練り終えたり。報告書を確認されよ。'
 ```
 
 ### 引き継ぎの冒頭明示

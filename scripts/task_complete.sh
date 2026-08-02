@@ -89,9 +89,12 @@ cur_id=$(grep -m1 '^  task_id:' "$TASK_FILE" | sed -E 's/^  task_id:[[:space:]]*
 [ "$cur_id" = "$TASK_ID" ] || die 2 "task_id不一致: YAML=$cur_id 指定=$TASK_ID"
 cur_status=$(grep -m1 '^  status:' "$TASK_FILE" | sed -E 's/^  status:[[:space:]]*//')
 [ "$TO" != "$AGENT" ] || die 2 "自己宛の引き継ぎは成立せぬ"
-# 三重引用符の禁止はYAML埋め込みの安全性が理由であり、シェル展開とは無関係。
-# 撤回されたバッククォート die 案(a)とは別物ゆえ、--message-file経路でも
-# 等しく適用する（巻き添えで外さぬこと）。
+# 三重引用符の禁止は、もはやPythonソース保護のためではない
+#（cmd_196 S1でinbox_write.shの本文Pythonソース補間そのものを解体済み。
+# 現在はos.environ経由で渡り、yaml.dumpが引用符を自前で処理する）。
+# 撤去してよい状態だが、正当な本文が''' を含むことは稀であり無害ゆえ、
+# 二重の守りとして意図的に残す。撤回されたバッククォート die 案(a)とは
+# 別物ゆえ、--message-file経路でも等しく適用する（巻き添えで外さぬこと）。
 case "$MESSAGE" in *"'''"*) die 2 "messageに三重引用符を含めてはならぬ";; esac
 case "$MESSAGE" in *\\*) echo "[task_complete] 警告: messageにバックスラッシュを含む。\\n等は改行へ化ける" >&2;; esac
 
