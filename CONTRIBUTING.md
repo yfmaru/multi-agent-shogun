@@ -311,7 +311,7 @@ teardown() {
 }
 
 @test "inbox_write.sh creates inbox file" {
-    run bash scripts/inbox_write.sh karo "test message" cmd_new shogun
+    run bash scripts/inbox_write.sh karo 'test message' cmd_new shogun
     [ "$status" -eq 0 ]
     [ -f "queue/inbox/karo.yaml" ]
 }

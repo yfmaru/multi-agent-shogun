@@ -242,7 +242,7 @@ gh pr create --draft --base <base> --title "..." --body "..."
 After writing report YAML, close out with `scripts/task_complete.sh` (NOT Karo — Gunshi handles quality check + dashboard aggregation):
 
 ```bash
-bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message "足軽{N}号、任務完了でござる。品質チェックを仰ぎたし。"
+bash scripts/task_complete.sh --task-id {task_id} --to gunshi --message '足軽{N}号、任務完了でござる。品質チェックを仰ぎたし。'
 ```
 
 This performs the `status: done` update on your task YAML and the inbox_write handoff to Gunshi as a single command — it refuses to run (exit 3) unless your report YAML already matches this task_id with status done/failed/blocked, so it structurally cannot be called before step 5. It internally calls `scripts/inbox_write.sh`; do not call `inbox_write.sh` directly for this handoff. On failure it prints an exit code (2/3/4/5) with a one-line explanation to stderr and, on inbox_write failure (exit 4), rolls the status back so you still hold the baton — re-run once the cause is fixed.

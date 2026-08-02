@@ -241,17 +241,22 @@ date "+%Y-%m-%dT%H:%M:%S"    # For YAML (ISO 8601)
 
 ### Sending Messages to Ashigaru
 
+**本文に記号（バッククォート・`$(...)`・`$VAR`・`${...}`）を含む場合は
+`--content-file`（ファイル形式）を使え。含まぬ平文のみ、以下のように
+単一引用符で囲んだ位置引数を使ってよい。** 詳細はCLAUDE.md「Mailbox
+System」節を見よ。
+
 ```bash
-bash scripts/inbox_write.sh ashigaru{N} "<message>" task_assigned karo
+bash scripts/inbox_write.sh ashigaru{N} '<message>' task_assigned karo
 ```
 
 **No sleep interval needed.** No delivery confirmation needed. Multiple sends can be done in rapid succession — flock handles concurrency.
 
 Example:
 ```bash
-bash scripts/inbox_write.sh ashigaru1 "タスクYAMLを読んで作業開始せよ。" task_assigned karo
-bash scripts/inbox_write.sh ashigaru2 "タスクYAMLを読んで作業開始せよ。" task_assigned karo
-bash scripts/inbox_write.sh ashigaru3 "タスクYAMLを読んで作業開始せよ。" task_assigned karo
+bash scripts/inbox_write.sh ashigaru1 'タスクYAMLを読んで作業開始せよ。' task_assigned karo
+bash scripts/inbox_write.sh ashigaru2 'タスクYAMLを読んで作業開始せよ。' task_assigned karo
+bash scripts/inbox_write.sh ashigaru3 'タスクYAMLを読んで作業開始せよ。' task_assigned karo
 # No sleep needed. All messages guaranteed delivered by inbox_watcher.sh
 ```
 
@@ -354,7 +359,7 @@ inbox_watcher.shのEscape抑止（send_wakeup_with_escape関数内、
 ログ文字列"claude: suppressing Escape escalation"で確認できる）
 により梯子で原理的に開けられない——一度モーダルへ流れると
 主のお手を煩わせるまで永久に固まる。代わりに以下を実行せよ:
-  bash scripts/inbox_write.sh karo "<詰まった内容を具体的に>" report_received <自分のagent_id>
+  bash scripts/inbox_write.sh karo '<詰まった内容を具体的に>' report_received <自分のagent_id>
 で家老へ上げ、その後は新たな入力を待たず作業を停止せよ
 （上記が非0で終わった場合でも、報告YAMLには必ず同じ内容を
 残しておくこと——通知経路が1本しか無い手順は、その1本が
@@ -720,7 +725,7 @@ STEP 3: Reset pane title (after ashigaru is idle — ❯ visible)
   If model_override active → use that model name
 
 STEP 4: Send /clear via inbox
-  bash scripts/inbox_write.sh ashigaru{N} "タスクYAMLを読んで作業開始せよ。" clear_command karo
+  bash scripts/inbox_write.sh ashigaru{N} 'タスクYAMLを読んで作業開始せよ。' clear_command karo
   # inbox_watcher が type=clear_command を検知し、/clear送信 → 待機 → 指示送信 を自動実行
 
 STEP 5以降は不要（watcherが一括処理）
@@ -781,7 +786,7 @@ STEP 1: Write new task YAML
   - status: assigned
 
 STEP 2: Send /clear via inbox (NOT task_assigned)
-  bash scripts/inbox_write.sh ashigaru{N} "タスクYAMLを読んで作業開始せよ。" clear_command karo
+  bash scripts/inbox_write.sh ashigaru{N} 'タスクYAMLを読んで作業開始せよ。' clear_command karo
   # /clear wipes previous context → agent re-reads YAML → sees new task
 
 STEP 3: If still unsatisfactory after 2 redos → escalate to dashboard 🚨
@@ -855,7 +860,7 @@ STEP 2: Write task YAML to queue/tasks/gunshi.yaml
 STEP 3: Set pane task label
   tmux set-option -p -t multiagent:0.8 @current_task "戦略立案"
 STEP 4: Send inbox
-  bash scripts/inbox_write.sh gunshi "タスクYAMLを読んで分析開始せよ。" task_assigned karo
+  bash scripts/inbox_write.sh gunshi 'タスクYAMLを読んで分析開始せよ。' task_assigned karo
 STEP 5: Continue dispatching other ashigaru tasks in parallel
   → Gunshi works independently. Process its report when it arrives.
 ```

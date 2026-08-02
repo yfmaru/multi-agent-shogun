@@ -116,7 +116,7 @@ Thinking ON/OFF の切替手順:
 
 ```bash
 # 家老が足軽のCLIを切り替える場合
-bash scripts/inbox_write.sh ashigaru3 "--type claude --model claude-opus-4-6" cli_restart karo
+bash scripts/inbox_write.sh ashigaru3 '--type claude --model claude-opus-4-6' cli_restart karo
 ```
 
 inbox_watcher が `cli_restart` type を検知し、switch_cli.sh を自動実行する。

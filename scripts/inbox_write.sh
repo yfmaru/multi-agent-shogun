@@ -23,10 +23,18 @@ else
     CONTENT_FILE=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --to)           TARGET="${2:-}";       shift 2 ;;
-            --content-file) CONTENT_FILE="${2:-}"; shift 2 ;;
-            --type)         TYPE="${2:-}";         shift 2 ;;
-            --from)         FROM="${2:-}";         shift 2 ;;
+            --to)
+                [ $# -ge 2 ] || { echo "[inbox_write] --to には値が必要である" >&2; exit 1; }
+                TARGET="$2"; shift 2 ;;
+            --content-file)
+                [ $# -ge 2 ] || { echo "[inbox_write] --content-file には値が必要である" >&2; exit 1; }
+                CONTENT_FILE="$2"; shift 2 ;;
+            --type)
+                [ $# -ge 2 ] || { echo "[inbox_write] --type には値が必要である" >&2; exit 1; }
+                TYPE="$2"; shift 2 ;;
+            --from)
+                [ $# -ge 2 ] || { echo "[inbox_write] --from には値が必要である" >&2; exit 1; }
+                FROM="$2"; shift 2 ;;
             *) echo "[inbox_write] 未知の引数: $1" >&2; exit 1 ;;
         esac
     done

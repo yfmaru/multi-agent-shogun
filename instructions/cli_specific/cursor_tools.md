@@ -26,10 +26,12 @@
 ## エージェント間通信
 
 エージェントへのメッセージ送信は必ず `inbox-write` スキルを使うこと。
-tmux を直接操作することは禁止。
+tmux を直接操作することは禁止。本文に記号（バッククォート・`$(...)`・
+`$VAR`等）を含むか否かで渡し方を選べ（`.cursor/skills/inbox-write/SKILL.md`
+参照）。記号を含まぬ平文の場合のみ、以下の位置引数形式を使う:
 
 ```bash
-bash scripts/inbox_write.sh <target_agent> "<message>" <type> <from>
+bash scripts/inbox_write.sh <target_agent> '<message>' <type> <from>
 ```
 
 ## モデル切り替え

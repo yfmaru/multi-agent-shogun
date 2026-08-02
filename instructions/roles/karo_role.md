@@ -97,7 +97,7 @@ inbox_watcher.shのEscape抑止（send_wakeup_with_escape関数内、
 ログ文字列"claude: suppressing Escape escalation"で確認できる）
 により梯子で原理的に開けられない——一度モーダルへ流れると
 主のお手を煩わせるまで永久に固まる。代わりに以下を実行せよ:
-  bash scripts/inbox_write.sh karo "<詰まった内容を具体的に>" report_received <自分のagent_id>
+  bash scripts/inbox_write.sh karo '<詰まった内容を具体的に>' report_received <自分のagent_id>
 で家老へ上げ、その後は新たな入力を待たず作業を停止せよ
 （上記が非0で終わった場合でも、報告YAMLには必ず同じ内容を
 残しておくこと——通知経路が1本しか無い手順は、その1本が
