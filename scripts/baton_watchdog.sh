@@ -446,35 +446,62 @@ BATON_D1_CONDITION_SINCE=0       # dead_stale_count>0 になり始めたepoch（
 BATON_D1_NTFY_NOTIFIED=0         # 副経路（ntfy）の二重通知防止ガード
 
 # queue/inbox/*.yaml のうち、read: false かつ timestamp が
-# BATON_D1_STALE_AFTER_SEC 秒以上前のメッセージを1件以上含む inbox の
+# threshold 秒以上前のメッセージを1件以上含む inbox の
 # agent名（ファイル名から拡張子を除いたもの）を、1行1件で標準出力へ返す。
 # naive（tzinfo無し）timestamp は「ローカル時刻」として解釈する
 # （書き手 scripts/inbox_write.sh:46 は `date "+%Y-%m-%dT%H:%M:%S"` で
 #   ローカル時刻・オフセット表記なしのnaive文字列を書くため）。
 # 読むのは queue/inbox/*.yaml のみ。tmux には一切触れない（TC-D1-005）。
+#
+# 第2・第3引数（省略可・cmd_189）: 呼び出し側が対象を名指しした場合に
+# 限り、その対象の inbox でのみ機械由来（agent_registry_agentsに非該当の
+# from）の未読を別扱いにできる。
+#   exempt_agents_csv        : この対象名リストに含まれる agent のみ
+#                               機械由来を通常閾値と別に扱う（CSV）
+#   machine_stale_after_sec  : 機械由来に適用する専用閾値。0なら
+#                               「機械由来は永久にstaleと数えぬ」
+# 省略時（第2・第3引数なし）は現行と完全に同一の挙動——全 from を
+# threshold のみで判定する。D-1（check_d1_once）はこの省略形のまま
+# 呼び出し、一文字も変えない。
 baton_watchdog_list_stale_inbox_agents() {
     local threshold="${1:-$BATON_D1_STALE_AFTER_SEC}"
-    local python_bin
+    local exempt_agents_csv="${2:-}"
+    local machine_stale_after_sec="${3:-}"
+    local python_bin allowed_agents
     python_bin="$(stall_policy_python)"
-    "$python_bin" - "$ROOT" "$threshold" <<'PY'
+    allowed_agents="$(agent_registry_agents_joined ",")"
+    "$python_bin" - "$ROOT" "$threshold" "$exempt_agents_csv" "$machine_stale_after_sec" "$allowed_agents" <<'PY'
 import glob
 import os
 import sys
 from datetime import datetime, timezone
 
 root, threshold = sys.argv[1], int(sys.argv[2])
-# この関数は count_unread とは異なり allowlist フィルタを適用しない
-# （cmd_187/QC45-F1是正）。count_unread が問うのは「誰かがバトンを
-# 保持しておるか」——機械の書き込みは保持の証拠ではないため除外が
+EXEMPT = set(a for a in sys.argv[3].split(",") if a)
+MACHINE_THRESHOLD = int(sys.argv[4]) if sys.argv[4] != "" else None
+ALLOWED = set(a for a in sys.argv[5].split(",") if a)
+# この関数は count_unread とは異なり、既定では allowlist フィルタを
+# 適用しない（cmd_187/QC45-F1是正）。count_unread が問うのは「誰かが
+# バトンを保持しておるか」——機械の書き込みは保持の証拠ではないため除外が
 # 正しい。list_stale_inbox_agents が問うのは「この inbox は読まれずに
 # 滞留しておるか」——この問いにとって書き手が誰かは無関係。機械が
 # 書いた auto-recovery 通知も、当人が読むべき未読である。
+# 【cmd_189】ただし呼び出し側（B-4c）が対象を名指しした場合に限り、
+# その対象についてのみ機械由来の未読を専用閾値（またはstaleと数えぬ）で
+# 別扱いできる。D-1は名指しせぬためこの分岐に入らず、従来どおり全fromを
+# threshold のみで判定する。
 #
 # ── 未読を数える3関数の問いと規律（対応表） ──────────────
 #   関数                              | 問い                      | 機械書き手
 #   baton_watchdog_count_unread       | 誰かがバトンを保持中か      | 除外する
-#   baton_watchdog_list_stale_inbox_agents | inboxが滞留しているか  | 除外しない
+#   baton_watchdog_list_stale_inbox_agents | inboxが滞留しているか  | 既定は除外しない。
+#                                       呼び出し側が対象を名指しした場合のみ、
+#                                       その対象について機械由来を別閾値で扱う
 #   periodic_clear_count_unread       | inboxに未読が残っているか  | 除外しない
+# D-1（check_d1_once）は名指ししない: 配送機構死亡の問いにとって書き手は
+#   無関係、かつ watcher死亡というAND条件が偽陽性を潰すため変更不要。
+# B-4c（check_b4c_once）は将軍を名指しする: 「読んでおらぬか」という問い
+#   にとって、主ご不在中の将軍が機械由来の通知を読まぬのは正常であるため。
 # ─────────────────────────────────────────────────────
 
 try:
@@ -512,6 +539,8 @@ for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
     messages = data.get("messages")
     if not isinstance(messages, list):
         continue
+    agent_name = os.path.splitext(os.path.basename(path))[0]
+    agent_is_exempt = agent_name in EXEMPT
     stale_here = False
     for msg in messages:
         if not isinstance(msg, dict):
@@ -521,11 +550,26 @@ for path in glob.glob(os.path.join(root, "queue", "inbox", "*.yaml")):
         dt = parse_ts(msg.get("timestamp"))
         if dt is None:
             continue
-        if (now - dt).total_seconds() >= threshold:
+        elapsed = (now - dt).total_seconds()
+        sender = msg.get("from")
+        # from欠落は「機械ではない」＝通常閾値で判定する（安全側。
+        # baton_watchdog_count_unread がfrom欠落を除外せぬのと同じ
+        # 向きに揃える。倒す向きを二つの関数で違えてはならぬ）。
+        if agent_is_exempt and sender is not None and sender not in ALLOWED:
+            if MACHINE_THRESHOLD is None:
+                # 呼び出し側が第3引数を省略＝現行どおりthresholdで判定
+                is_stale = elapsed >= threshold
+            elif MACHINE_THRESHOLD == 0:
+                is_stale = False
+            else:
+                is_stale = elapsed >= MACHINE_THRESHOLD
+        else:
+            is_stale = elapsed >= threshold
+        if is_stale:
             stale_here = True
             break
     if stale_here:
-        print(os.path.splitext(os.path.basename(path))[0])
+        print(agent_name)
 PY
 }
 
@@ -906,8 +950,9 @@ baton_watchdog_notify_target_for() {
 # とは完全に独立した関数であり、それらを呼ばない・その内部にも触れない。
 check_b4c_once() {
     local agent now stale_threshold ntfy_threshold notify_target
-    local elapsed stale_agent
+    local elapsed stale_agent exempt_csv machine_threshold
     local -A stale_agent_set=()
+    local -A stale_agent_set_no_safety_net=()
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -916,11 +961,26 @@ check_b4c_once() {
     now=$(date +%s)
     stale_threshold=$(baton_watchdog_query baton_b4c_stale_after_sec)
     ntfy_threshold=$(baton_watchdog_query baton_b4b_ntfy_after_sec)
+    # cmd_189: 将軍inboxに限り、機械由来（agent_registry_agents非該当の
+    # from）の未読を通常閾値では数えず、24時間の安全網のみで発火させる。
+    # D-1（check_d1_once）はこの除外を一切適用しない無引数呼び出しのまま。
+    exempt_csv=$(baton_watchdog_query baton_b4c_machine_exempt_agents | paste -sd, -)
+    machine_threshold=$(baton_watchdog_query baton_b4c_machine_stale_after_sec)
 
     while IFS= read -r stale_agent; do
         [ -n "$stale_agent" ] || continue
         stale_agent_set[$stale_agent]=1
-    done < <(baton_watchdog_list_stale_inbox_agents "$stale_threshold")
+    done < <(baton_watchdog_list_stale_inbox_agents "$stale_threshold" "$exempt_csv" "$machine_threshold")
+
+    # cmd_189・通知文言の書き分け用（risks節）: 安全網(machine_threshold)を
+    # 0に固定して同じ判定をやり直す。stale_agent_set にのみ現れ、こちらに
+    # 現れないagentは「安全網のみが理由でstaleとなった」＝機械由来のみ。
+    # 非exempt agentや、exempt agentでもagent由来の未読がある場合は両集合が
+    # 一致するため、この判定は自然にexemptかつ機械由来のみの場合だけに絞られる。
+    while IFS= read -r stale_agent; do
+        [ -n "$stale_agent" ] || continue
+        stale_agent_set_no_safety_net[$stale_agent]=1
+    done < <(baton_watchdog_list_stale_inbox_agents "$stale_threshold" "$exempt_csv" 0)
 
     # 全inboxエージェントを固定の母集合として毎回走査する（B-4bと同じ
     # 規律）。stale集合のみを走査すると、staleから外れたエージェントの
@@ -938,8 +998,15 @@ check_b4c_once() {
 
             # 主経路: 検知した時点で無条件・即座に発火する（stale未読
             # 自体が継続の証拠であり、追加の待機は挟まない）。
+            # cmd_189: 安全網(machine_stale_after_sec)のみが理由で発火した
+            # 場合、家老が「対象が停止した」と読み違えぬよう、機械由来のみ
+            # である旨と次に何をすべきかを文言に含める（risks節）。
             if [ "${B4C_NOTIFIED[$agent]:-0}" -eq 0 ]; then
-                baton_watchdog_notify_inbox "$notify_target" "inbox_stall: agent=${agent} (${stale_threshold}s+未読放置 かつ watcherプロセス生存。読まれていない疑い)"
+                if [ "${stale_agent_set_no_safety_net[$agent]:-0}" != "1" ]; then
+                    baton_watchdog_notify_inbox "$notify_target" "inbox_stall: agent=${agent} (machine-origin only, ${machine_threshold}s+。主の長期ご不在の可能性が高い。${agent} paneの実見で切り分けよ)"
+                else
+                    baton_watchdog_notify_inbox "$notify_target" "inbox_stall: agent=${agent} (${stale_threshold}s+未読放置 かつ watcherプロセス生存。読まれていない疑い)"
+                fi
                 B4C_NOTIFIED[$agent]=1
             fi
 

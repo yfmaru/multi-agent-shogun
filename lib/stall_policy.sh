@@ -123,6 +123,11 @@ DEFAULT_BATON_WATCHDOG = {
     "periodic_clear_enabled": False,
     "periodic_clear_idle_sec": 1800,
     "periodic_clear_agents": ["karo", "gunshi"],
+    # cmd_189: B-4c(check_b4c_once)専用。list_stale_inbox_agentsの
+    # 呼び出し側が対象を名指しする形で使う設定であり、D-1(check_d1_once)
+    # には一切効かない(D-1は無引数呼び出しのまま)。
+    "baton_b4c_machine_exempt_agents": ["shogun"],
+    "baton_b4c_machine_stale_after_sec": 86400,
     "usage_warn_pct": 80,
     "usage_resume_below_pct": 50,
     "usage_check_interval_sec": 300,
@@ -146,12 +151,20 @@ def policy_get(key):
 
 if query in ("enabled", "periodic_clear_enabled"):
     print("true" if policy_get(query) is True else "false")
-elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec"):
+elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec"):
     print(int(policy_get(query)))
 elif query == "periodic_clear_agents":
     agents = policy_get(query)
     if not isinstance(agents, list) or not agents:
         agents = DEFAULT_BATON_WATCHDOG["periodic_clear_agents"]
+    print("\n".join(str(a) for a in agents))
+elif query == "baton_b4c_machine_exempt_agents":
+    # periodic_clear_agentsと違い、空リストは「除外なし」という意味の
+    # ある設定値である(cmd_189)。空を既定へ差し替えてはならない
+    # (差し替えると空リストによる巻き戻し弁が効かなくなる)。
+    agents = policy_get(query)
+    if not isinstance(agents, list):
+        agents = DEFAULT_BATON_WATCHDOG[query]
     print("\n".join(str(a) for a in agents))
 else:
     raise SystemExit(f"unknown baton_watchdog query: {query}")
