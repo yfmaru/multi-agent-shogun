@@ -8,8 +8,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 source "$SCRIPT_DIR/lib/agent_registry.sh"
+source "$SCRIPT_DIR/lib/branch_policy.sh"
 
 mkdir -p logs queue/inbox
+
+# cmd_193: pane不在の継続を検知し、記録(層1)+配送(層2)+主経路(層3・ntfy)
+# で報せる。設計はqueue/reports/gunshi_193_design.yaml。新規設定鍵は
+# 増やさぬ方針のため、値はスクリプト冒頭のシェル変数として持つ。
+NOPANE_WARN_AFTER_SEC=30
+NOPANE_NTFY_AFTER_SEC=300
 
 get_multiagent_pane_base() {
     if [ -n "${SHOGUN_PANE_BASE:-}" ]; then
@@ -38,11 +45,52 @@ start_watcher_if_missing() {
     local cli
     local lockfile="/tmp/shogun_watcher_start_${agent}.lock"
     local notified_flag="/tmp/shogun_watcher_obs22_notified_${agent}"
+    local nopane_since_file="/tmp/shogun_watcher_nopane_${agent}"
+    local nopane_notified_flag="/tmp/shogun_watcher_nopane_notified_${agent}"
+    local nopane_ntfy_flag="/tmp/shogun_watcher_nopane_ntfy_${agent}"
 
     ensure_inbox_file "$agent"
     if ! pane_exists "$pane"; then
+        local now since elapsed nopane_target
+        now=$(date +%s 2>/dev/null || echo 0)
+        if [ -f "$nopane_since_file" ]; then
+            since=$(cat "$nopane_since_file" 2>/dev/null || echo "$now")
+        else
+            since="$now"
+            echo "$now" > "$nopane_since_file" 2>/dev/null || true
+        fi
+        elapsed=$(( now - since ))
+
+        if [ "$elapsed" -ge "$NOPANE_WARN_AFTER_SEC" ] && [ ! -f "$nopane_notified_flag" ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] pane missing for ${agent} (expected ${pane}) for ${elapsed}s; inbox_watcher cannot be started." >&2
+            # cmd_180と同じ通知先規則。診断対象(agent)当人へは書かぬ——
+            # 当人のinbox_watcherが無い(=本条件そのもの)ため当人宛は
+            # 構造的に配送不能。harnessのawk抽出対策でインライン記述
+            # (baton_watchdog.sh の baton_watchdog_notify_target_for と
+            # 同一規則の別実装。共有化は別cmdの射程)。
+            case "$agent" in
+                shogun) nopane_target=karo ;;
+                karo)   nopane_target=shogun ;;
+                *)      nopane_target=shogun ;;
+            esac
+            if bash scripts/inbox_write.sh "$nopane_target" "pane不在検知: agent=${agent} expected_pane=${pane}。${elapsed}秒継続。inbox_watcherを起動できず配送不能の疑い。要確認。" watcher_alert watcher_supervisor; then
+                touch "$nopane_notified_flag" 2>/dev/null || true
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] failed to notify ${nopane_target} of pane absence for ${agent}" >&2
+            fi
+        fi
+
+        if [ "$elapsed" -ge "$NOPANE_NTFY_AFTER_SEC" ] && [ ! -f "$nopane_ntfy_flag" ]; then
+            if declare -f branch_policy_notify >/dev/null 2>&1; then
+                branch_policy_notify "pane_missing: agent=${agent} expected_pane=${pane} (${elapsed}s+継続。inbox_watcher起動不能。配送機構そのものの不全の疑い)" || true
+            fi
+            touch "$nopane_ntfy_flag" 2>/dev/null || true
+        fi
+
         return 0
     fi
+
+    rm -f "$nopane_since_file" "$nopane_notified_flag" "$nopane_ntfy_flag" 2>/dev/null || true
 
     (
         flock -n 9 || return 0
