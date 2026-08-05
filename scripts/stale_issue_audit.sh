@@ -38,6 +38,7 @@ export BRANCH_POLICY_DRY_RUN="$DRY_RUN"
 
 NOW_SECONDS="$(date -u +%s)"
 mapfile -t REPO_PATHS < <(branch_policy_query repos)
+echo "[INFO] monitoring ${#REPO_PATHS[@]} repositories"
 
 CANDIDATES_FILE="$(mktemp)"
 trap 'rm -f "$CANDIDATES_FILE"' EXIT
@@ -62,7 +63,7 @@ for repo_path in "${REPO_PATHS[@]}"; do
 
     echo "[INFO] checking $owner_repo ($repo_path)"
 
-    issues_json="$(gh issue list --state open --json number,comments --repo "$owner_repo" 2>&1)" || {
+    issues_json="$(gh issue list --state open --json number,comments --repo "$owner_repo" --limit 200 2>&1)" || {
         echo "[SKIP] gh issue list failed: $owner_repo" >&2
         continue
     }
@@ -82,7 +83,7 @@ for repo_path in "${REPO_PATHS[@]}"; do
         fi
 
         merged_json="$(gh pr list --state merged --repo "$owner_repo" \
-            --search "merged:>$created_at" --json number 2>/dev/null || echo '[]')"
+            --search "merged:>$created_at" --json number --limit 200 2>/dev/null || echo '[]')"
         merged_count="$(printf '%s' "$merged_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
 
         if (( merged_count > 0 )); then
