@@ -130,6 +130,7 @@ scripts/seo_qc.sh
 !scripts/compute_daily_consumption.py
 !scripts/task_complete.sh
 !scripts/stale_issue_audit.sh
+!scripts/instructions_parity_check.sh
 
 
 # SayTask (sample template only, not actual data)
