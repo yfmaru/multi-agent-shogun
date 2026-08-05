@@ -9,8 +9,9 @@ Thank you for your interest in contributing to multi-agent-shogun! This document
 3. [.gitignore Whitelist Approach](#gitignore-whitelist-approach)
 4. [Coding Conventions](#coding-conventions)
 5. [Testing](#testing)
-6. [Pull Request Guidelines](#pull-request-guidelines)
-7. [Communication](#communication)
+6. [CLAUDE.md へ条文を追加する前に](#claudemd-へ条文を追加する前に)
+7. [Pull Request Guidelines](#pull-request-guidelines)
+8. [Communication](#communication)
 
 ---
 
@@ -397,6 +398,51 @@ implementation, before it ever reached CI.
      (TC-TCOMP-EXP-004), found by ashigaru7 during cmd_190
      (`task_complete.sh` `--message-file` work), PR #56, endorsed by
      gunshi QC (`queue/reports/gunshi_qc_190_pr56.yaml`).
+
+---
+
+## CLAUDE.md へ条文を追加する前に
+
+CLAUDE.mdは全エージェントが毎セッション読み込む文書である。そこに条文を
+足す判断は**全軍への課税**であり、足す前に「本当に常駐させるべきか」を
+判定する基準を持つ。
+
+この基準は新規発明ではない。本リポジトリが既に用いていた2つの判断
+（batsの罠は本ドキュメントの[Known Pitfalls](#known-pitfalls)へ移設・
+`inbox_write`の手順はCLAUDE.mdへ常駐、という2判断）を言語化したものである。
+
+### 判定の2軸
+
+**軸1: 遭遇母数** — 全役職が日常的に通る場面か、特定の作業をする者だけが
+通る場面か。
+
+**軸2: 自覚可能性** — 発火の直前に「自分は今この規律の射程に居る」と
+気づけるか。気づけるなら参照先を引ける。気づけないなら、あらかじめ
+持っていなければ守りようがない。
+
+### 判定表
+
+| 軸2 | 軸1 | 判定 |
+|-----|-----|------|
+| 気づけない | （問わず） | **常駐**（引けぬのだから持たせるほかない） |
+| 気づける | 全員毎日 | **常駐**（毎ターン引く手間のほうが高い） |
+| 気づける | 一部 | **移設**（CLAUDE.mdには1行のポインタ） |
+
+判定を書けないなら、その条文をCLAUDE.mdに常駐させてはならない。
+`instructions/roles/` 等の役職別ファイルや、本ドキュメントのような
+特定作業時に参照するファイルへの移設を検討すること。
+
+### あてはめの例
+
+- `inbox_write`: 全員が毎ターン行い、かつ「本文に記号が混じっている」
+  ことに気づかぬまま踏む（実際に踏んだ例がある）→ 軸2気づけない →
+  常駐。
+- batsの罠: batsテストを書く者だけが遭遇し、その者は「自分は今bats
+  を書いている」と自覚している → 軸2気づける・軸1一部 → 移設
+  （[Known Pitfalls](#known-pitfalls)へ）。
+
+PRでCLAUDE.mdへ条文を追加・拡張する場合は、PRテンプレートの該当項目に
+この判定を1行で書くこと。
 
 ---
 
