@@ -28,6 +28,7 @@ cron_block() {
 # multi-agent-shogun branch policy start
 0 * * * * bash $SCRIPT_DIR/scripts/branch_drift_check.sh >> $SCRIPT_DIR/logs/branch_drift_check.log 2>&1
 0 */6 * * * bash $SCRIPT_DIR/scripts/auto_merge_short_lived.sh >> $SCRIPT_DIR/logs/auto_merge_short_lived.log 2>&1
+15 3 * * * bash $SCRIPT_DIR/scripts/stale_issue_audit.sh >> $SCRIPT_DIR/logs/stale_issue_audit.log 2>&1
 # multi-agent-shogun branch policy end
 EOF
 }
