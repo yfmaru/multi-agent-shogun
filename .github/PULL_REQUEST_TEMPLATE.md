@@ -14,7 +14,7 @@ How was this tested? (`make test`, `make test-int`, manual steps, etc.)
       → If checked, skip the rest of this section (N/A).
 - [ ] This PR **does** add or expand a rule in `CLAUDE.md`.
       → If checked, write the axis judgment below, per
-      [CONTRIBUTING.md: CLAUDE.md へ条文を追加する前に](../CONTRIBUTING.md#claudemd-へ条文を追加する前に).
+      [CONTRIBUTING.md: CLAUDE.md へ条文を追加する前に](https://github.com/yfmaru/multi-agent-shogun/blob/main/CONTRIBUTING.md#claudemd-へ条文を追加する前に).
 
 Axis judgment (required if the box above is checked):
 
