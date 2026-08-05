@@ -129,6 +129,7 @@ scripts/seo_qc.sh
 !scripts/log_daily_consumption.sh
 !scripts/compute_daily_consumption.py
 !scripts/task_complete.sh
+!scripts/stale_issue_audit.sh
 
 
 # SayTask (sample template only, not actual data)
