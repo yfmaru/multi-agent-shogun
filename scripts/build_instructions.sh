@@ -521,9 +521,13 @@ ${permission_yaml}
 
 FRONTMATTER
 
-        # Append role-specific content (same pipeline as build_instruction_file)
+        # Append role-specific content (same pipeline as build_instruction_file).
+        # Strip any YAML front matter from the role source first: this file is
+        # embedded after our own frontmatter block above, so a second `---`
+        # pair here would corrupt the agent definition. Works whether or not
+        # roles/${role}_role.md currently has front matter.
         {
-            cat "$PARTS_DIR/roles/${role}_role.md"
+            awk 'NR==1 && /^---$/ {infm=1; next} infm && /^---$/ {infm=0; next} infm {next} {print}' "$PARTS_DIR/roles/${role}_role.md"
 
             echo ""
             cat <<EOF

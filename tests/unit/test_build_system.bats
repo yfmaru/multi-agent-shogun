@@ -438,6 +438,40 @@ assert "queue/inbox/*.yaml" in config["common"]["edit_deny"]
 PYEOF
 }
 
+@test "opencode-agent: exactly one frontmatter block in each generated agent file [T0]" {
+    local file count
+
+    for file in "$PROJECT_ROOT"/.opencode/agents/*.md; do
+        case "$file" in
+            *-runtime.md) continue ;;
+        esac
+        count=$(grep -c '^---$' "$file")
+        [ "$count" -eq 2 ] || { echo "FAIL: $file has $count '---' lines (expected 2)" >&2; false; }
+    done
+}
+
+@test "opencode-agent: role body frontmatter is stripped even if roles/*.md gains its own frontmatter [T0]" {
+    local role_file="$PROJECT_ROOT/instructions/roles/shogun_role.md"
+    local backup="$BATS_TEST_TMPDIR/shogun_role.md.bak"
+    cp "$role_file" "$backup"
+
+    { printf -- '---\nfoo: bar\n---\n\n'; cat "$backup"; } > "$role_file"
+
+    run bash "$BUILD_SCRIPT"
+    local build_status="$status"
+    local count=0
+    if [ -f "$PROJECT_ROOT/.opencode/agents/shogun.md" ]; then
+        count=$(grep -c '^---$' "$PROJECT_ROOT/.opencode/agents/shogun.md")
+    fi
+
+    # Always restore, even if the assertions below fail.
+    cp "$backup" "$role_file"
+    bash "$BUILD_SCRIPT" > /dev/null 2>&1 || true
+
+    [ "$build_status" -eq 0 ]
+    [ "$count" -eq 2 ] || { echo "FAIL: shogun.md has $count '---' lines after roles/*.md gained frontmatter (expected 2)" >&2; false; }
+}
+
 @test "opencode-tool: mark-as-read enforces current agent and inbox lock [R6]" {
     local tool_file="$PROJECT_ROOT/.opencode/tools/mark-as-read.ts"
 
