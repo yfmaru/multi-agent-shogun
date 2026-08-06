@@ -49,6 +49,17 @@
 #   TC-TCOMP-EXP-003 --message-file経路では常に警告なし（安全な経路の番人）
 #   TC-TCOMP-EXP-004 /procが読めぬ環境を模す → 黙って飛ばしexit 0
 #   TC-TCOMP-REG-001 既存の--message呼び出し形は非破壊
+#
+# TC-TCOMP-PF-* は cmd_203 案C（軍師設計 gunshi_self_return_dependency_design.yaml
+# 案C）に基づく。queue/shogun_to_karo.yamlのpending_followups（status: pending分
+# のみ）を、完了出力へ強制的に割り込ませて表示する。
+#
+#   TC-TCOMP-PF-001 status: doneのfollowupは表示されない
+#   TC-TCOMP-PF-002 status: pendingのfollowupはid/when/thenの形で表示される
+#   TC-TCOMP-PF-003 隣接する別cmdのpending_followupsが混入しない
+#   TC-TCOMP-PF-004 parent_cmdはあるがshogun_to_karo.yaml自体が無い → 無破壊
+#   TC-TCOMP-PF-005 該当cmdにpending_followups自体が無い（cmd未存在含む） → 無出力
+#   TC-TCOMP-PF-006 回帰: parent_cmdフィールドが無いtaskはkaro_fileが在っても無出力
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 
@@ -84,6 +95,7 @@ STUB2
 
     TASK_FILE="$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
     REPORT_FILE="$FIXTURE_ROOT/queue/reports/ashigaru1_report.yaml"
+    KARO_FILE="$FIXTURE_ROOT/queue/shogun_to_karo.yaml"
 
     write_task done
     write_report done
@@ -119,6 +131,63 @@ write_report() {
     cat > "$REPORT_FILE" << YAML
 task_id: $task_id
 status: $status
+YAML
+}
+
+# TC-TCOMP-PF-* 用: parent_cmdフィールドを持つtask YAML。
+write_task_with_parent() {
+    local status="$1"
+    local parent="$2"
+    cat > "$TASK_FILE" << YAML
+task:
+  task_id: subtask_test
+  parent_cmd: $parent
+  description: |
+    紛らわしい字下げの決り文句:
+    status: assigned
+  status: $status
+YAML
+}
+
+# TC-TCOMP-PF-* 用: cmd_100（隣・前）/ cmd_203（本題。実物のcmd_203
+# サンプルどおりt3_dispatch=done, cmd204_unblock=pending）/ cmd_300
+# （隣・後）の3ブロックを持つ、実物のshogun_to_karo.yaml形式のfixture。
+# 前後どちらの隣接cmdからも混入しないことを1ファイルで検証できる。
+write_karo_file() {
+    cat > "$KARO_FILE" << 'YAML'
+  - id: cmd_100
+    timestamp: "2026-01-01T00:00:00"
+    pending_followups:
+      - id: neighbor_pending
+        when: "隣cmd(前)の条件"
+        then: "隣cmd(前)のアクション"
+        declared_at: "2026-01-01T00:00:00"
+        declared_by: karo
+        status: pending
+  - id: cmd_203
+    timestamp: "2026-01-01T00:00:00"
+    pending_followups:
+      - id: t3_dispatch
+        when: "T2a〜T2dの4本すべてがdevelopへ着地"
+        then: "T3を足軽へ発注する"
+        declared_at: "2026-01-01T00:00:00"
+        declared_by: karo
+        status: done
+      - id: cmd204_unblock
+        when: "T3がdevelopへ着地"
+        then: "cmd_204の着手条件が整う"
+        declared_at: "2026-01-01T00:00:00"
+        declared_by: karo
+        status: pending
+  - id: cmd_300
+    timestamp: "2026-01-01T00:00:00"
+    pending_followups:
+      - id: another_neighbor
+        when: "隣cmd(後)の条件"
+        then: "隣cmd(後)のアクション"
+        declared_at: "2026-01-01T00:00:00"
+        declared_by: karo
+        status: pending
 YAML
 }
 
@@ -364,4 +433,61 @@ run_tc() {
     [ "$status" -eq 0 ] || { echo "output: $output"; false; }
     grep -qE '^  status: done$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
     grep -q "gunshi plain handoff text report_received ashigaru1" "$INBOX_LOG" || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-PF-001: a pending_followups item with status done is not surfaced" {
+    write_task_with_parent assigned cmd_203
+    write_report done
+    write_karo_file
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"t3_dispatch"* ]] || { echo "output: $output"; false; }
+}
+
+@test "TC-TCOMP-PF-002: a pending_followups item with status pending is surfaced as id/when/then" {
+    write_task_with_parent assigned cmd_203
+    write_report done
+    write_karo_file
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" == *"pending_followups"* ]] || { echo "output: $output"; false; }
+    [[ "$output" == *"cmd204_unblock: T3がdevelopへ着地 → cmd_204の着手条件が整う"* ]] || { echo "output: $output"; false; }
+}
+
+@test "TC-TCOMP-PF-003: pending_followups belonging to neighboring cmd blocks (before and after) are not leaked" {
+    write_task_with_parent assigned cmd_203
+    write_report done
+    write_karo_file
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"neighbor_pending"* ]] || { echo "output: $output"; false; }
+    [[ "$output" != *"another_neighbor"* ]] || { echo "output: $output"; false; }
+}
+
+@test "TC-TCOMP-PF-004: parent_cmd is set but shogun_to_karo.yaml itself is absent - completion is unaffected" {
+    write_task_with_parent assigned cmd_203
+    write_report done
+    rm -f "$KARO_FILE"
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"pending_followups"* ]] || { echo "output: $output"; false; }
+    grep -qE '^  status: done$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+}
+
+@test "TC-TCOMP-PF-005: target cmd has no pending_followups (cmd not present in karo_file at all) - no output" {
+    write_task_with_parent assigned cmd_999
+    write_report done
+    write_karo_file
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"pending_followups"* ]] || { echo "output: $output"; false; }
+}
+
+@test "TC-TCOMP-PF-006: regression - a task with no parent_cmd field emits no pending_followups output even if karo_file exists" {
+    write_task done
+    write_report done
+    write_karo_file
+    run_tc --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" != *"pending_followups"* ]] || { echo "output: $output"; false; }
 }

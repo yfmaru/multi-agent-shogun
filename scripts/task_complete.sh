@@ -37,6 +37,86 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 die() { echo "[task_complete] $2" >&2; exit "$1"; }
 
+# --- pending_followups表示（cmd_203 案C・軍師設計） ---
+# 「戻ってきて思い出す」の代わりに、条件成就させた当人の完了出力へ
+# 強制的に割り込ませ、目に入れる。$TASK_FILE の parent_cmd を鍵に
+# queue/shogun_to_karo.yaml の該当cmdブロックを引き、status: pending の
+# followupだけを表示する（status: doneは表示しない＝案A側のデータを
+# 読むだけで、本スクリプトは一切書き込まない）。
+# 範囲抽出は厳密なYAML解析ではなく実用上十分な文字列処理でよい
+# （cur_id等task_id抽出と同じ流儀）。他cmdのpending_followupsを拾わぬ
+# ことが唯一の厳格な要件のため、cmdブロック境界は`  - id:`行で区切る。
+_print_pending_followups() {
+    local task_file="$1" karo_file="$2"
+    local parent_cmd followups
+    # parent_cmdは大半のtask YAMLに存在せぬ（本来任意のフィールド）。
+    # grepが無一致=exit 1となり、pipefail下ではパイプライン全体の
+    # 終了ステータスとなる。set -eの元でこれをそのまま代入させると
+    # 「completion echo後・exit 0前」で関数自体が失敗しスクリプトが
+    # 中断してしまう（status/inbox更新は済んでいるのに異常終了する
+    # 重大な回帰）。`|| true`で無一致を正常系として吸収する。
+    parent_cmd=$(grep -m1 '^  parent_cmd:' "$task_file" | sed -E 's/^  parent_cmd:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//' || true)
+    [ -n "$parent_cmd" ] || return 0
+    [ -f "$karo_file" ] || return 0
+    followups="$(awk -v cmd="$parent_cmd" '
+      function flush_item() {
+        if (pf_status == "pending") {
+          printf("  - %s: %s → %s\n", pf_id, pf_when, pf_then)
+        }
+        pf_in_item = 0
+      }
+      /^  - id: / {
+        if (pf_in_item) flush_item()
+        pf_in_item = 0; pf_in_pf = 0
+        pf_blockid = $0
+        sub(/^  - id: /, "", pf_blockid)
+        gsub(/[[:space:]]+$/, "", pf_blockid)
+        pf_in_block = (pf_blockid == cmd)
+        next
+      }
+      !pf_in_block { next }
+      /^    pending_followups:/ { pf_in_pf = 1; next }
+      pf_in_pf && /^    [A-Za-z_]/ {
+        if (pf_in_item) flush_item()
+        pf_in_pf = 0
+      }
+      !pf_in_pf { next }
+      /^      - id: / {
+        if (pf_in_item) flush_item()
+        pf_id = $0
+        sub(/^      - id: /, "", pf_id)
+        gsub(/[[:space:]]+$/, "", pf_id)
+        pf_when = ""; pf_then = ""; pf_status = ""
+        pf_in_item = 1
+        next
+      }
+      pf_in_item && /^        when: / {
+        pf_when = $0
+        sub(/^        when: /, "", pf_when)
+        sub(/^"/, "", pf_when)
+        sub(/"$/, "", pf_when)
+        next
+      }
+      pf_in_item && /^        then: / {
+        pf_then = $0
+        sub(/^        then: /, "", pf_then)
+        sub(/^"/, "", pf_then)
+        sub(/"$/, "", pf_then)
+        next
+      }
+      pf_in_item && /^        status:/ {
+        pf_status = $0
+        sub(/^        status:[[:space:]]*/, "", pf_status)
+        gsub(/[[:space:]]/, "", pf_status)
+        next
+      }
+      END { if (pf_in_item) flush_item() }
+    ' "$karo_file")"
+    [ -n "$followups" ] || return 0
+    echo "[task_complete] ⚠ この完了で条件成就し得るpending_followupsあり:"
+    echo "$followups"
+}
+
 # --- 引数解析 ---
 AGENT=""
 TASK_ID=""
@@ -181,6 +261,7 @@ awk -v st="$STATUS" -v ts="$(date -Iseconds)" '
 # --- M4..M5 不可逆側 ---
 if bash "$ROOT/scripts/inbox_write.sh" "$TO" "$MESSAGE" "$TYPE" "$AGENT"; then
     echo "[task_complete] 完了: status=$STATUS, 引き継ぎ→$TO"
+    _print_pending_followups "$TASK_FILE" "$ROOT/queue/shogun_to_karo.yaml"
     exit 0
 fi
 
