@@ -74,6 +74,15 @@
 #                    datetime型として解釈する値）でもparse_tsが解析でき、
 #                    OBS-61-1と同じフォールバックへ黙って落ちない
 #   TC-BATON-REG-001: usage_resumeが使う無引数呼び出しの戻り値が従来と一致する（将軍指定・最重要）
+#
+# 【cmd_208: baton_lost主経路の宛先二重化・人待ち安全網の閾値是正・再武装】
+# (gunshi_design_208.yaml)
+#   TC-208-V1: 通常経路がkaro・shogunの両方へ1件ずつ書く（措置A）
+#   TC-208-V2a/V2b: repeat閾値未満では再通知せず、超えたら再通知する（措置C）
+#   TC-208-V2c: 条件が偽になったら次回は新たな継続として計り直す（既存意味論の回帰固定）
+#   TC-208-V3【必須・回帰固定】: 番犬自身がkaro宛に書いた警報はunreadに数えない
+#   TC-208-V4: 印付きcmdが(新既定)3600秒超でhuman-held警報がkaroにも届く（措置B）
+#   TC-208-V4b: 旧既定(86400s)を明示指定すれば4000s経過では発火しない（既定値是正の直接確認）
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHDOG_SCRIPT="$PROJECT_ROOT/scripts/baton_watchdog.sh"
@@ -2501,8 +2510,14 @@ YAML
         check_once
     "
     [ "$status" -eq 0 ] || { echo "$output"; false; }
+    # 【cmd_208/措置A是正】通常経路は今やkaro・shogunの二重通知のため、
+    # 1回の発報につき2行(karo分・shogun分)書かれる。ここで確かめたい
+    # 不変条件は行数そのものではなく「BATON_NOTIFIEDが interleaved
+    # check_usage_once を挟んでも生き延び、2回目のcheck_onceで再発火
+    # しないこと」——ゆえに2(=1回分の発報)を期待し、4(=2回分)にはならぬ
+    # ことを確認する。
     count=$(grep -c "baton_lost" "$SHOGUN_NOTIFY_LOG")
-    [ "$count" -eq 1 ] || { echo "expected exactly 1 baton_lost notification (BATON_NOTIFIED must survive an interleaved check_usage_once call), got $count:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ "$count" -eq 2 ] || { echo "expected exactly 2 baton_lost notification lines (karo+shogun, 1回分。BATON_NOTIFIED must survive an interleaved check_usage_once call), got $count:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
 
 # --- TC-USAGE-RESUME-006【OBS-181-6回帰・実ファイル書き込み】予告がkaro自身の
@@ -3134,4 +3149,178 @@ YAML
     [ "$status" -eq 0 ]
     grep -q "no_progress: agent=ashigaru3" "$SHOGUN_NOTIFY_LOG" || { echo "expected B-4b to fire for the redo shape (report_delivered's mtime条項 must not suppress B-4b's own detection)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
     grep -q "subtask_b4b008" "$SHOGUN_NOTIFY_LOG"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_208: baton_lost主経路の宛先二重化・人待ち安全網の閾値是正・再武装
+# (gunshi_design_208.yaml)
+#   V-1: 通常経路がkaro・shogunの両方へ1件ずつ書く
+#   V-2: repeat閾値未満では再通知せず、超えたら再通知する。条件が偽に
+#        なった場合は新たな継続として計り直す（既存else節の意味論維持）
+#   V-3【回帰固定・必須】番犬自身がkaro宛に書いた警報はunreadに数えない
+#        （措置Aの安全性が全面的に依存する性質）
+#   V-4: 印付きcmdが(新既定)3600秒超でhuman-held警報がkaroにも届く
+# ═══════════════════════════════════════════════════════════════
+
+# --- V-1: 通常経路の宛先二重化 ---
+
+@test "TC-208-V1: baton_lost normal path writes one baton_alert each to karo and shogun" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))  # threshold=5s, 10s elapsed
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ "$(grep -c 'INBOX_WRITE: shogun ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "baton_alert" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    # 将軍への通知は削らず維持されていること（措置Aは追加のみ）
+    grep -q "baton_lost: unread=0 active=0 open_cmds=1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- V-2a: repeat閾値未満では再通知しない ---
+
+@test "TC-208-V2a: no repeat notification while under baton_lost_repeat_after_sec" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    # BATON_NOTIFIEDは100秒前(既定repeat閾値900秒未満) → 再通知させない
+    run bash -c "
+        source '$TEST_HARNESS'
+        now=\$(date +%s)
+        BATON_LOST_SINCE=\$((now - 10))
+        BATON_NOTIFIED=\$((now - 100))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { echo "expected no repeat notification yet"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- V-2b: repeat閾値を超えたら再通知する ---
+
+@test "TC-208-V2b: repeat notification fires once baton_lost_repeat_after_sec is exceeded" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    # BATON_NOTIFIEDは1000秒前(既定repeat閾値900秒超) → 再通知させる
+    run bash -c "
+        source '$TEST_HARNESS'
+        now=\$(date +%s)
+        BATON_LOST_SINCE=\$((now - 10))
+        BATON_NOTIFIED=\$((now - 1000))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ "$(grep -c 'INBOX_WRITE: shogun ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- V-2c: 条件が偽になったら次回は新たな継続として計り直す（既存意味論の回帰固定） ---
+
+@test "TC-208-V2c: when the condition goes false, BATON_LOST_SINCE and the epoch-based BATON_NOTIFIED both reset to 0" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+    # unreadを1件立てて条件を偽にする
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru1.yaml" << 'YAML'
+messages:
+  - id: msg_unread
+    read: false
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        now=\$(date +%s)
+        BATON_LOST_SINCE=\$((now - 10))
+        BATON_NOTIFIED=\$((now - 10))
+        check_once
+        echo \"RESET_STATE:\${BATON_LOST_SINCE}:\${BATON_NOTIFIED}\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RESET_STATE:0:0"* ]] || { echo "$output"; false; }
+}
+
+# --- V-3【必須・回帰固定】自己給餌しないこと ---
+
+@test "TC-208-V3: baton_watchdog_count_unread returns 0 for its own karo alert (self-feeding safety, regression-pinned)" {
+    cat > "$FIXTURE_ROOT/queue/inbox/karo.yaml" << 'YAML'
+messages:
+  - id: msg_self_written_by_watchdog
+    from: baton_watchdog
+    read: false
+    timestamp: "2026-08-07T00:00:00"
+    type: baton_alert
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_unread
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ] || { echo "expected 0 (self-written baton_alert must not be counted); got: $output"; false; }
+}
+
+# --- V-4: 印付きcmdが(新既定)3600秒超でhuman-held警報がkaroにも届く ---
+
+@test "TC-208-V4: the human-held safety net (now defaulting to 3600s) reaches karo in addition to shogun" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"  # 新既定3600sを超過
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: karo " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "INBOX_WRITE: shogun " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_192" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- V-4b: 24時間の旧既定ではもはや発火しないこと（既定値是正の直接確認）---
+
+@test "TC-208-V4b: the safety net does NOT fire yet at 4000s elapsed if the old 86400s default were still in effect (sanity: confirms the default actually changed)" {
+    write_settings true 5 60 "" "" "" "" "" shogun 86400 86400   # 明示的に旧既定(86400s)へ戻す
+    local since
+    since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_192
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    ! grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
 }

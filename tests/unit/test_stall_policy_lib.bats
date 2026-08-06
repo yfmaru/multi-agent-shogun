@@ -114,3 +114,12 @@ EOF
         bash -c 'source "'"$PROJECT_ROOT"'/lib/stall_policy.sh"; baton_watchdog_query not_a_real_key'
     [ "$status" -ne 0 ]
 }
+
+# cmd_208/措置B・C: 既定値が実際に変わったこと自体の回帰固定。
+@test "TC-CFG-208: baton_watchdog_query default for baton_lost_human_held_after_sec is 3600 (was 86400), and baton_lost_repeat_after_sec defaults to 900" {
+    run env STALL_POLICY_SETTINGS="$TEST_SETTINGS_NO_SECTION" \
+        bash -c 'source "'"$PROJECT_ROOT"'/lib/stall_policy.sh"; baton_watchdog_query baton_lost_human_held_after_sec; baton_watchdog_query baton_lost_repeat_after_sec'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "3600" ]
+    [ "${lines[1]}" = "900" ]
+}
