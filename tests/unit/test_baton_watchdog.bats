@@ -1570,6 +1570,61 @@ YAML
     grep -q "NOTIFY: baton_lost" "$NOTIFY_LOG"
 }
 
+# --- TC-SELF-005b/c: 副経路ntfyの成否がbaton_watchdog自身のログにも残る (cmd_171) ---
+
+@test "TC-SELF-005b: a successful secondary ntfy notify leaves a one-line success log entry" {
+    write_settings true 5 60 8   # shogun threshold=5s, ntfy threshold=8s
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_alert
+    read: false
+    from: baton_watchdog
+    type: baton_alert
+    timestamp: '2026-07-31T20:52:25'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "ntfy notify sent (branch_policy_notify succeeded)" || { echo "$output"; false; }
+}
+
+@test "TC-SELF-005c: a failed secondary ntfy notify still leaves only the failure log entry, not a success one" {
+    write_settings true 5 60 8   # shogun threshold=5s, ntfy threshold=8s
+    cat > "$FIXTURE_ROOT/queue/inbox/shogun.yaml" << 'YAML'
+messages:
+  - id: msg_alert
+    read: false
+    from: baton_watchdog
+    type: baton_alert
+    timestamp: '2026-07-31T20:52:25'
+YAML
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        branch_policy_notify() { return 1; }
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "ntfy notify failed" || { echo "$output"; false; }
+    echo "$output" | grep -q "ntfy notify sent" && { echo "$output"; false; }
+    true
+}
+
 # --- TC-SELF-006: python/yaml失敗時のフォールバック方向（除外なしgrep方式） ---
 
 @test "TC-SELF-006: count_unread falls back to the conservative grep count (no exclusion) when python/yaml is unavailable" {
