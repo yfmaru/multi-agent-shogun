@@ -140,6 +140,8 @@ logs/
 !docs/status_reference.md
 !docs/pre_commit_gate.md
 !docs/agent_selfwatch_phases.md
+!docs/architecture.md
+!docs/incidents.md
 
 # Screenshots (masked — no secrets)
 !images/

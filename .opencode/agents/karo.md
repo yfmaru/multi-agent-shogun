@@ -191,6 +191,31 @@ When a cmd is `paused` (e.g., project on hold), archive it too.
 To resume a paused cmd, move it back to the active file and set
 status to `in_progress`.
 
+## Batch Processing Protocol (all agents)
+
+When processing large datasets (30+ items requiring individual web search, API calls, or LLM generation), follow this protocol. Skipping steps wastes tokens on bad approaches that get repeated across all batches.
+
+### Default Workflow (mandatory for large-scale tasks)
+
+```
+① Strategy → Gunshi review → incorporate feedback
+② Execute batch1 ONLY → Shogun QC
+③ QC NG → Stop all agents → Root cause analysis → Gunshi review
+   → Fix instructions → Restore clean state → Go to ②
+④ QC OK → Execute batch2+ (no per-batch QC needed)
+⑤ All batches complete → Final QC
+⑥ QC OK → Next phase (go to ①) or Done
+```
+
+### Rules
+
+1. **Never skip batch1 QC gate.** A flawed approach repeated 15 batches = 15× wasted tokens.
+2. **Batch size limit**: 30 items/session (20 if file is >60K tokens). Reset session (/new or /clear) between batches.
+3. **Detection pattern**: Each batch task MUST include a pattern to identify unprocessed items, so restart after /new can auto-skip completed items.
+4. **Quality template**: Every task YAML MUST include quality rules (web search mandatory, no fabrication, fallback for unknown items). Never omit — this caused 100% garbage output in past incidents.
+5. **State management on NG**: Before retry, verify data state (git log, entry counts, file integrity). Revert corrupted data if needed.
+6. **Gunshi review scope**: Strategy review (step ①) covers feasibility, token math, failure scenarios. Post-failure review (step ③) covers root cause and fix verification.
+
 ## Task Design: Five Questions
 
 Before assigning tasks, ask yourself these five questions:
@@ -677,6 +702,17 @@ When conditions met → execute self-/clear:
 
 **Why this helps**: Prevents the 4% context exhaustion that halted karo during cmd_166 (2,754 article production).
 
+## Redo Protocol
+
+When Karo determines a task needs to be redone:
+
+1. Karo writes new task YAML with new task_id (e.g., `subtask_097d` → `subtask_097d2`), adds `redo_of` field
+2. Karo sends `clear_command` type inbox message (NOT `task_assigned`)
+3. inbox_watcher delivers the CLI-appropriate context reset command to the agent → session reset
+4. Agent recovers via Session Start procedure, reads new task YAML, starts fresh
+
+Race condition is eliminated: the context reset wipes old context. Agent re-reads YAML with new task_id.
+
 ## Redo Protocol (Task Correction)
 
 When an ashigaru's output is unsatisfactory and needs to be redone.
@@ -732,6 +768,22 @@ task:
   status: assigned
   timestamp: "2026-02-09T07:46:00"
 ```
+
+## ACが原理的に充足不能と判明した場合の完了判定 (all agents)
+
+acceptance_criteriaの一項が環境的制約等により原理的に充足不能と判明した場合、
+その事実を隠さず明記した上でcmdを完了としてよい。「充足した」と偽って記録する
+ことは、後日の誤った判断の根拠になるため禁ずる。
+
+上記「待機の上限」節の打ち切りの作法（(a)未決 / (b)永遠に偽＝計画の欠陥、の
+書き分け）と対になる規律である。
+
+**実例（cmd_172）**: 2026-07-31、"実装前後の消費量を同一条件で比較計測"という
+acceptance_criteriaの一項が、3日連続で大規模停止を挟んだため比較条件が一度も
+揃わず、原理的に充足不能と判明した（`queue/shogun_to_karo.yaml`のcmd_172
+status行参照）。家老は未充足であることを隠さず明記した上でcmdを締め、
+"効果不明"を"効果あり"にすり替えなかった。この判断を今後の同種判断の
+よりどころとする。
 
 ## Pane Number Mismatch Recovery
 
@@ -983,6 +1035,13 @@ External PRs are reinforcements. Treat with respect.
 | Critical (design flaw, fatal bug) | Request revision with specific fix guidance. Tone: "Fix this and we can merge." |
 | Fundamental design disagreement | Escalate to shogun. Explain politely. |
 
+## 旧記憶機構（廃止・cmd_204）
+
+Memory MCPは2026-08-06 cmd_204で不採用とした（entities 0/relations 0の空の器であり、
+Claude Codeのファイルメモリと二重化していたため）。**別CLI（Codex/OpenCode/Kimi等）で
+指揮層を動かす日が来れば再採用を検討せよ**——ファイルメモリはClaude Code固有の
+仕組みであり、他CLIの指揮層には届かぬ。
+
 ## Compaction Recovery
 
 > See CLAUDE.md for base recovery procedure. Below is karo-specific.
@@ -992,8 +1051,7 @@ External PRs are reinforcements. Treat with respect.
 1. `queue/shogun_to_karo.yaml` — current cmd (check status: pending/done)
 2. `queue/tasks/ashigaru{N}.yaml` — all ashigaru assignments
 3. `queue/reports/ashigaru{N}_report.yaml` — unreflected reports?
-4. `Memory MCP (read_graph)` — system settings, lord's preferences
-5. `context/{project}.md` — project-specific knowledge (if exists)
+4. `context/{project}.md` — project-specific knowledge (if exists)
 
 **dashboard.md is secondary** — may be stale after compaction. YAMLs are ground truth.
 
@@ -1008,12 +1066,11 @@ External PRs are reinforcements. Treat with respect.
 ## Context Loading Procedure
 
 1. CLAUDE.md (auto-loaded)
-2. Memory MCP (`read_graph`)
-3. `config/projects.yaml` — project list
-4. `queue/shogun_to_karo.yaml` — current instructions
-5. If task has `project` field → read `context/{project}.md`
-6. Read related files
-7. Report loading complete, then begin decomposition
+2. `config/projects.yaml` — project list
+3. `queue/shogun_to_karo.yaml` — current instructions
+4. If task has `project` field → read `context/{project}.md`
+5. Read related files
+6. Report loading complete, then begin decomposition
 
 ## Autonomous Judgment (Act Without Being Told)
 
