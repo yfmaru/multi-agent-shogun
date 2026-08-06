@@ -157,8 +157,13 @@ fi
 # Instead, keep the flag alive. The watcher will see the agent as idle
 # and send a nudge, which is the correct behavior — the agent IS idle
 # between the block response and the next turn.
-# The flag will be removed naturally when the agent starts its next turn
-# (Claude Code removes it via the busy detection mechanism).
+# NOTE (cmd_209 P-2 is_stalled_pane と混同するな): このコメントが以前
+# 述べていた「Claude Codeが次ターン開始時に消してくれる」は事実に反する
+# ——このフラグは本リポジトリが自前で作るファイルであり、Claude Codeは
+# その存在を知らぬ。本番の通常運用中にこのフラグを削除する箇所は無い
+# （touch箇所のみ。削除は出陣時のshutsujin_departure.shの一括rmだけ）。
+# cmd_209 P-2で新設したstall_busy()はこの点を承知の上、agent_is_busy()
+# が依存するフラグ方式とは別に、pane解析を直接見る形でstall検知を行う。
 
 # ─── Extract unread message summaries and build block JSON ───
 # Use a single python3 call with env vars to avoid shell quoting issues.
