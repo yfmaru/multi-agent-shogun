@@ -77,16 +77,16 @@ lint:
 # Build + diff check (CI equivalent)
 check: build
 	@echo "Checking for uncommitted instruction changes..."
-	@if [ -f scripts/build_instructions.sh ] && [ -d instructions/generated ] && [ -d .opencode/agents ]; then \
-		if git diff --exit-code instructions/generated/ .opencode/agents/; then \
-			echo "✓ Generated instructions and OpenCode agents are in sync"; \
+	@if [ -f scripts/build_instructions.sh ] && [ -d .opencode/agents ]; then \
+		if git diff --exit-code .opencode/agents/; then \
+			echo "✓ OpenCode agents are in sync"; \
 		else \
-			echo "ERROR: Generated instructions or OpenCode agents are out of sync!"; \
+			echo "ERROR: OpenCode agents are out of sync!"; \
 			echo "Run 'make build' and commit the changes."; \
 			exit 1; \
 		fi; \
 	else \
-		echo "WARNING: build_instructions.sh, instructions/generated, or .opencode/agents not found"; \
+		echo "WARNING: build_instructions.sh or .opencode/agents not found"; \
 		echo "Skipping diff check (Phase 2 feature)"; \
 	fi
 
