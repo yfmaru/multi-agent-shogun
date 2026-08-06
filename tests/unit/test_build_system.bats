@@ -346,6 +346,22 @@ PYEOF
     [ "$output" = "0" ]
 }
 
+@test "codex-clear: docs/architecture.md has no bare '/clear sent (max once' in escalation table" {
+    # cmd_204 P2でDelivery Mechanism節（エスカレーション表を含む）が
+    # CLAUDE.mdからdocs/architecture.mdへ移設された。移設先は生成物ではなく
+    # build時sed置換（CLAUDE.md→AGENTS.md変換）を通らないため、上のAGENTS.md
+    # 向けアサーションだけでは移設先の素の直書きを検知できない（cmd_204 P2 QC F1）。
+    run grep -c '`/clear` sent (max once' "$PROJECT_ROOT/docs/architecture.md"
+    [ "$output" = "0" ]
+}
+
+@test "codex-clear: docs/architecture.md has no bare 'lost on /clear'" {
+    # 同じくDelivery Mechanism節のContext Layers表にあった素の/clear直書き
+    # （cmd_204 P2 QC F1で摘出）が再発しないことを検証する。
+    run grep -c 'lost on /clear' "$PROJECT_ROOT/docs/architecture.md"
+    [ "$output" = "0" ]
+}
+
 @test "codex-clear: AGENTS.md protocol uses CLI-neutral context reset" {
     # cmd_204 P2でDelivery Mechanism節をCLAUDE.mdからdocs/architecture.mdへ
     # 移設したため、clear_command行そのものはAGENTS.mdに現れなくなった。

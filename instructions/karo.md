@@ -1083,7 +1083,7 @@ Ashigaru may perform mechanical reproduction or data gathering, but not quality 
 
 ## Branch & PR Policy — 家老の責務
 
-ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
+ブランチ運用の全条文は CONTRIBUTING.md「エージェント運用のブランチ・PR規約」を正とする（禁止事項の定義はCLAUDE.md「Git Branch & PR Policy」）。
 
 ### タスク分解時
 

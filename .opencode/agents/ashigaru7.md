@@ -92,7 +92,7 @@ date "+%Y-%m-%dT%H:%M:%S"
 
 ## Branch & PR Policy — 足軽の責務
 
-ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
+ブランチ運用の全条文は CONTRIBUTING.md「エージェント運用のブランチ・PR規約」を正とする（禁止事項の定義はCLAUDE.md「Git Branch & PR Policy」）。
 タスク YAML に `git:` ブロックがある場合、以下の手順を必ず踏む。
 
 ### Step 0: 事前調査（外部リポジトリのみ。自リポでは省略可）
