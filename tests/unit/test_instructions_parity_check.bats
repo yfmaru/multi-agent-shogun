@@ -48,12 +48,14 @@ setup() {
     [ "$a_count" = "85" ] || { echo "expected 85, got: $total_line"; false; }
 }
 
-@test "parity: known drift baseline — gen-only(b) total is 26" {
+# cmd_203 T2はgen-only(b)を意図的に減らす作業のため、完全一致ではなく
+# 上限（regression ceiling）判定にする——増加のみを検知し、減少は許容する。
+@test "parity: known drift baseline — gen-only(b) total is at most 26" {
     run bash "$SCRIPT"
     total_line=$(printf '%s\n' "$output" | grep '=== TOTAL ===')
     [ -n "$total_line" ] || { printf '%s\n' "$output"; false; }
     b_count=$(printf '%s\n' "$total_line" | sed -n 's/.*gen-only(b)=\([0-9]*\).*/\1/p')
-    [ "$b_count" = "26" ] || { echo "expected 26, got: $total_line"; false; }
+    [ "$b_count" -le 26 ] || { echo "expected <= 26 (regression), got: $total_line"; false; }
 }
 
 @test "parity: --role shogun limits output to a single role section" {
