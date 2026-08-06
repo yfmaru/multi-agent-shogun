@@ -97,6 +97,14 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
         source "$_branch_policy_lib"
     fi
 
+    # Source usage_limit lib (cmd_171 P-1). Provides usage_limit_state(),
+    # used by Gate 1 (type-C exclusion) to avoid firing Escape at agents
+    # that are merely rate-limited rather than stuck on a modal.
+    _usage_limit_lib="${SCRIPT_DIR}/lib/usage_limit.sh"
+    if [ -f "$_usage_limit_lib" ]; then
+        source "$_usage_limit_lib"
+    fi
+
     # Detect OS and select file-watching backend
     INBOX_WATCHER_OS="$(uname -s)"
     if [ "$INBOX_WATCHER_OS" = "Darwin" ]; then
@@ -914,9 +922,23 @@ agent_is_busy() {
 }
 
 # ─── Stall detection (cmd_171 / T1) ───
-# usage_limit_state() lives in lib/usage_limit.sh (owner: T2). T1 and T2 are
-# developed in parallel worktrees, so fall back to "unknown" when the lib
-# hasn't landed yet — this breaks the T1↔T2 ordering dependency (spec §4).
+# Same double-source guard for usage_limit_state() (cmd_171 P-1), so it is
+# available in test mode too (in normal mode it was already sourced above
+# by the first testing-guarded block; double-sourcing is harmless). Placed
+# here — immediately before the fallback stub below — rather than at the
+# bottom of the file with the stall_policy/branch_policy guards, because
+# the stub definition below runs unconditionally in both modes: if the
+# guard ran after it, `type usage_limit_state` would already see the stub
+# and skip loading the real implementation in test mode.
+_usage_limit_lib="${SCRIPT_DIR}/lib/usage_limit.sh"
+if [ -f "$_usage_limit_lib" ] && ! type usage_limit_state &>/dev/null; then
+    source "$_usage_limit_lib"
+fi
+
+# usage_limit_state() lives in lib/usage_limit.sh and is now sourced above
+# (cmd_171 P-1), so the real implementation is used from here on. The
+# fallback stub below remains only as a safety net for the unlikely case
+# that lib/usage_limit.sh fails to load.
 declare -f usage_limit_state >/dev/null || usage_limit_state() { echo unknown; }
 
 # is_stalled_pane: type-A (interactive-modal-style) stall detection.

@@ -223,6 +223,18 @@ PY
     grep -q "no_idle_full_read" "$WATCHER_SCRIPT"
 }
 
+@test "TC-USAGE-WIRING: usage_limit_state resolves to the real lib/usage_limit.sh impl, not the fallback stub (cmd_171 P-1)" {
+    run bash -c "source '$TEST_HARNESS'; declare -f usage_limit_state"
+    [ "$status" -eq 0 ]
+    # The fallback stub is exactly `usage_limit_state () { echo unknown; }`
+    # (a single-statement body). The real lib/usage_limit.sh implementation
+    # is materially longer, so a line-count threshold distinguishes them
+    # without depending on its internals.
+    body_lines=$(echo "$output" | wc -l)
+    [ "$body_lines" -gt 4 ] || { echo "$output"; false; }
+    ! echo "$output" | grep -q "echo unknown"
+}
+
 @test "TC-NFR-008: test file itself has no skip directives (SKIP=0 guard)" {
     ! grep -Eq '^[[:space:]]*skip([[:space:]]|$)' "$BATS_TEST_FILENAME"
 }
