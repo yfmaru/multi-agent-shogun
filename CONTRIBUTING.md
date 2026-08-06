@@ -399,6 +399,45 @@ implementation, before it ever reached CI.
      (`task_complete.sh` `--message-file` work), PR #56, endorsed by
      gunshi QC (`queue/reports/gunshi_qc_190_pr56.yaml`).
 
+3. **`gh run rerun` replays the recorded commit, not the latest base
+   branch content**
+   - **Trigger**: A PR is open against a base branch (e.g. `develop`)
+     that receives new commits after the PR's last CI run — for
+     example, a shared bats baseline file gets fixed on the base branch
+     while the PR itself hasn't merged that fix in yet. Someone then
+     runs `gh run rerun <run-id> --failed` (or re-runs via the Actions
+     UI) expecting the base branch's fix to now apply.
+   - **Symptom**: The rerun still fails on the exact same assertion,
+     because `gh run rerun` replays the workflow against the commit SHA
+     already recorded for that run (the PR branch's own tip) — it does
+     **not** re-checkout or merge in anything that has landed on the
+     base branch since. Looks like the fix "didn't work," but the fix
+     was never present in the code being tested.
+   - **Workaround**: Use `gh pr update-branch <PR-number>` instead (a
+     GitHub-hosted merge of base into head, done entirely via the
+     remote API — no local checkout needed, avoiding the shared-clone
+     branch-collision risk class this repo has hit before, cmd_201).
+     Only after the branch actually contains the base's new commit does
+     re-running CI make sense. When comparing runs, check the run's
+     `createdAt`/head SHA against the base branch's latest landing
+     time — if the run predates the fix, its result is stale and
+     uninformative regardless of pass/fail.
+   - **Source**: cmd_203 T2, PR #68 and PR #70 (2026-08-06). On PR #68,
+     `gh run rerun 31071117675 --failed` re-ran against headSha
+     `585889df` (the PR branch's own unchanged tip) and still failed at
+     04:52:18Z UTC — *after* the base-branch fix (PR #72) had already
+     landed at 13:47 JST the same day. The run only went green
+     (`31073587684`) once the branch actually contained a merge commit
+     bringing in `origin/develop` (headSha `c1c9e9cb`); PR #68 needed
+     three such merge commits in total (`ddb690fe`, `c6760911`,
+     `c1c9e9cb`) because develop moved twice while the PR was open
+     (PR #72 at 13:47, PR #73 at 14:14). PR #70 hit the identical
+     shape — its CI stayed on a stale run until the branch was updated
+     with a real merge of `origin/develop` rather than a rerun. Found
+     by ashigaru3, root-caused and verified by gunshi (3-run comparison,
+     `queue/inbox/karo.yaml` message `msg_20260806_143818_b3fad97f`,
+     2026-08-06 14:38 JST), escalated by shogun.
+
 ---
 
 ## CLAUDE.md へ条文を追加する前に
