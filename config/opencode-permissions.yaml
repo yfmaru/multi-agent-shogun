@@ -13,7 +13,6 @@ common:
     - agents/default/system.md
     - config/opencode-permissions.yaml
     - config/opencode-tui.json
-    - instructions/generated/*
     - queue/inbox/*.yaml
 
 roles:

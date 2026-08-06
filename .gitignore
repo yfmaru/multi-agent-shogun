@@ -41,16 +41,6 @@
 !instructions/cli_specific/opencode_tools.md
 !instructions/cli_specific/cursor_tools.md
 
-# Multi-CLI: Build template parts (roles, common sections)
-!instructions/roles/
-!instructions/roles/*.md
-!instructions/common/
-!instructions/common/*.md
-
-# Multi-CLI: Generated instruction files (built by build_instructions.sh)
-!instructions/generated/
-!instructions/generated/*.md
-
 # Multi-CLI: CLI adapter library + ntfy auth
 !lib/
 !lib/cli_adapter.sh
@@ -130,8 +120,6 @@ scripts/seo_qc.sh
 !scripts/compute_daily_consumption.py
 !scripts/task_complete.sh
 !scripts/stale_issue_audit.sh
-!scripts/instructions_parity_check.sh
-
 
 # SayTask (sample template only, not actual data)
 !saytask/
@@ -149,6 +137,9 @@ logs/
 !docs/philosophy.md
 !docs/vps_pr118_verification_plan.md
 !docs/gh_cli_setup.md
+!docs/status_reference.md
+!docs/pre_commit_gate.md
+!docs/agent_selfwatch_phases.md
 
 # Screenshots (masked — no secrets)
 !images/

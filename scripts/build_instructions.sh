@@ -2,20 +2,19 @@
 # ============================================================
 # Instruction File Build System
 # ============================================================
-# Combines instruction parts into complete instruction files
-# for each role and CLI combination.
+# Generates each CLI's auto-load file (AGENTS.md, copilot-instructions.md,
+# agents/default/system.md, .opencode/agents/*.md) from the hand-written
+# instructions/<role>.md + CLAUDE.md sources. Claude Code itself reads
+# instructions/<role>.md directly — no generation step is needed for it.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 PARTS_DIR="$ROOT_DIR/instructions"
-OUTPUT_DIR="$ROOT_DIR/instructions/generated"
-
-mkdir -p "$OUTPUT_DIR"
 
 echo "=== Instruction File Build System ==="
-echo "Building instruction files..."
+echo "Building CLI auto-load files..."
 
 # Function: opencode_build_python
 # Description: Returns a Python interpreter with PyYAML for build-time YAML parsing.
@@ -48,117 +47,6 @@ normalize_generated_markdown() {
 }
 
 # ============================================================
-# Helper function: Build a complete instruction file
-# ============================================================
-build_instruction_file() {
-    local cli_type="$1"
-    local role="$2"
-    local output_filename="$3"
-    local output_path="$OUTPUT_DIR/$output_filename"
-    local original_file="$ROOT_DIR/instructions/${role}.md"
-
-    echo "Building: $output_filename (CLI: $cli_type, Role: $role)"
-
-    # Extract YAML front matter from original file
-    if [ -f "$original_file" ]; then
-        awk '/^---$/{if(++n==2) {print "---"; exit} if(n==1) next} n==1' "$original_file" > "$output_path"
-        echo "" >> "$output_path"
-    else
-        # Minimal YAML front matter
-        cat > "$output_path" <<EOFYAML
----
-role: $role
-version: "3.0"
-cli_type: $cli_type
----
-
-EOFYAML
-    fi
-
-    # Append role-specific content
-    cat "$PARTS_DIR/roles/${role}_role.md" >> "$output_path"
-
-    # Append common sections
-    echo "" >> "$output_path"
-    cat "$PARTS_DIR/common/protocol.md" >> "$output_path"
-    echo "" >> "$output_path"
-    cat "$PARTS_DIR/common/task_flow.md" >> "$output_path"
-    echo "" >> "$output_path"
-    cat "$PARTS_DIR/common/forbidden_actions.md" >> "$output_path"
-
-    # Append CLI-specific tools section
-    echo "" >> "$output_path"
-    case "$cli_type" in
-        claude)
-            cat "$PARTS_DIR/cli_specific/claude_tools.md" >> "$output_path"
-            ;;
-        codex)
-            cat "$PARTS_DIR/cli_specific/codex_tools.md" >> "$output_path"
-            ;;
-        copilot)
-            cat "$PARTS_DIR/cli_specific/copilot_tools.md" >> "$output_path"
-            ;;
-        kimi)
-            cat "$PARTS_DIR/cli_specific/kimi_tools.md" >> "$output_path"
-            ;;
-        opencode)
-            cat "$PARTS_DIR/cli_specific/opencode_tools.md" >> "$output_path"
-            ;;
-        cursor)
-            cat "$PARTS_DIR/cli_specific/cursor_tools.md" >> "$output_path"
-            ;;
-        antigravity)
-            cat "$PARTS_DIR/cli_specific/antigravity_tools.md" >> "$output_path"
-            ;;
-    esac
-
-    normalize_generated_markdown "$output_path"
-
-    echo "  ✅ Created: $output_filename"
-}
-
-# Build Claude Code instruction files
-build_instruction_file "claude" "shogun" "shogun.md"
-build_instruction_file "claude" "karo" "karo.md"
-build_instruction_file "claude" "ashigaru" "ashigaru.md"
-build_instruction_file "claude" "gunshi" "gunshi.md"
-
-# Build Codex instruction files
-build_instruction_file "codex" "shogun" "codex-shogun.md"
-build_instruction_file "codex" "karo" "codex-karo.md"
-build_instruction_file "codex" "ashigaru" "codex-ashigaru.md"
-build_instruction_file "codex" "gunshi" "codex-gunshi.md"
-
-# Build Copilot instruction files
-build_instruction_file "copilot" "shogun" "copilot-shogun.md"
-build_instruction_file "copilot" "karo" "copilot-karo.md"
-build_instruction_file "copilot" "ashigaru" "copilot-ashigaru.md"
-build_instruction_file "copilot" "gunshi" "copilot-gunshi.md"
-
-# Build Kimi K2 instruction files
-build_instruction_file "kimi" "shogun" "kimi-shogun.md"
-build_instruction_file "kimi" "karo" "kimi-karo.md"
-build_instruction_file "kimi" "ashigaru" "kimi-ashigaru.md"
-build_instruction_file "kimi" "gunshi" "kimi-gunshi.md"
-
-# Build OpenCode instruction files
-build_instruction_file "opencode" "shogun" "opencode-shogun.md"
-build_instruction_file "opencode" "karo" "opencode-karo.md"
-build_instruction_file "opencode" "ashigaru" "opencode-ashigaru.md"
-build_instruction_file "opencode" "gunshi" "opencode-gunshi.md"
-
-# Build Cursor Agent instruction files
-build_instruction_file "cursor" "shogun" "cursor-shogun.md"
-build_instruction_file "cursor" "karo" "cursor-karo.md"
-build_instruction_file "cursor" "ashigaru" "cursor-ashigaru.md"
-build_instruction_file "cursor" "gunshi" "cursor-gunshi.md"
-# Build Antigravity instruction files
-build_instruction_file "antigravity" "shogun" "antigravity-shogun.md"
-build_instruction_file "antigravity" "karo" "antigravity-karo.md"
-build_instruction_file "antigravity" "ashigaru" "antigravity-ashigaru.md"
-build_instruction_file "antigravity" "gunshi" "antigravity-gunshi.md"
-
-# ============================================================
 # AGENTS.md generation (Codex auto-load file)
 # ============================================================
 # Codex CLIはリポジトリルートのAGENTS.mdを自動読み込みする。
@@ -178,10 +66,6 @@ generate_agents_md() {
     sed \
         -e 's|CLAUDE\.md|AGENTS.md|g' \
         -e 's|CLAUDE\.local\.md|AGENTS.override.md|g' \
-        -e 's|instructions/shogun\.md|instructions/generated/codex-shogun.md|g' \
-        -e 's|instructions/karo\.md|instructions/generated/codex-karo.md|g' \
-        -e 's|instructions/ashigaru\.md|instructions/generated/codex-ashigaru.md|g' \
-        -e 's|instructions/gunshi\.md|instructions/generated/codex-gunshi.md|g' \
         -e 's|~/.claude/|~/.codex/|g' \
         -e 's|\.claude\.json|.codex/config.toml|g' \
         -e 's|\.mcp\.json|config.toml (mcp_servers section)|g' \
@@ -224,10 +108,6 @@ generate_copilot_instructions() {
     sed \
         -e 's|CLAUDE\.md|copilot-instructions.md|g' \
         -e 's|CLAUDE\.local\.md|copilot-instructions.local.md|g' \
-        -e 's|instructions/shogun\.md|instructions/generated/copilot-shogun.md|g' \
-        -e 's|instructions/karo\.md|instructions/generated/copilot-karo.md|g' \
-        -e 's|instructions/ashigaru\.md|instructions/generated/copilot-ashigaru.md|g' \
-        -e 's|instructions/gunshi\.md|instructions/generated/copilot-gunshi.md|g' \
         -e 's|~/.claude/|~/.copilot/|g' \
         -e 's|\.claude\.json|.copilot/config.json|g' \
         -e 's|\.mcp\.json|.copilot/mcp-config.json|g' \
@@ -262,10 +142,6 @@ generate_kimi_instructions() {
     sed \
         -e 's|CLAUDE\.md|agents/default/system.md|g' \
         -e 's|CLAUDE\.local\.md|agents/default/system.local.md|g' \
-        -e 's|instructions/shogun\.md|instructions/generated/kimi-shogun.md|g' \
-        -e 's|instructions/karo\.md|instructions/generated/kimi-karo.md|g' \
-        -e 's|instructions/ashigaru\.md|instructions/generated/kimi-ashigaru.md|g' \
-        -e 's|instructions/gunshi\.md|instructions/generated/kimi-gunshi.md|g' \
         -e 's|~/.claude/|~/.kimi/|g' \
         -e 's|\.claude\.json|.kimi/config.json|g' \
         -e 's|\.mcp\.json|.kimi/mcp.json|g' \
@@ -514,20 +390,24 @@ PYEOF
 description: "${role_title}"
 mode: primary
 # Auto-generated by build_instructions.sh — do not edit manually.
-# Source: instructions/roles/${role}_role.md + instructions/common/* + instructions/cli_specific/opencode_tools.md
+# Source: instructions/${role}.md + instructions/cli_specific/opencode_tools.md
 # grep intentionally inherits '*: allow'; OpenCode grep permission rules match the search regex, not file paths.
 ${permission_yaml}
 ---
 
 FRONTMATTER
 
-        # Append role-specific content (same pipeline as build_instruction_file).
-        # Strip any YAML front matter from the role source first: this file is
-        # embedded after our own frontmatter block above, so a second `---`
-        # pair here would corrupt the agent definition. Works whether or not
-        # roles/${role}_role.md currently has front matter.
+        # Append role-specific content. Strip any YAML front matter from the
+        # role source first: this file is embedded after our own frontmatter
+        # block above, so a second `---` pair here would corrupt the agent
+        # definition. Works whether or not instructions/${role}.md currently
+        # has front matter.
+        local role_source="$PARTS_DIR/${role}.md"
+        local role_frontmatter
+        role_frontmatter=$(awk 'NR==1 && /^---$/ {infm=1; next} infm && /^---$/ {infm=0; exit} infm {print}' "$role_source")
+
         {
-            awk 'NR==1 && /^---$/ {infm=1; next} infm && /^---$/ {infm=0; next} infm {next} {print}' "$PARTS_DIR/roles/${role}_role.md"
+            awk 'NR==1 && /^---$/ {infm=1; next} infm && /^---$/ {infm=0; next} infm {next} {print}' "$role_source"
 
             echo ""
             cat <<EOF
@@ -542,13 +422,21 @@ This generated file belongs to exactly one agent.
 
 EOF
 
-            # Append common sections
-            echo ""
-            cat "$PARTS_DIR/common/protocol.md"
-            echo ""
-            cat "$PARTS_DIR/common/task_flow.md"
-            echo ""
-            cat "$PARTS_DIR/common/forbidden_actions.md"
+            # Re-emit the stripped front matter as a fenced block so the
+            # machine-readable rules it carries (forbidden_actions etc.)
+            # still reach the OpenCode agent, without a second `---` pair.
+            if [[ -n "$role_frontmatter" ]]; then
+                cat <<EOF
+## Role Configuration
+
+（この節は instructions/${role}.md の front matter を機械的に転記したもの）
+
+\`\`\`yaml
+${role_frontmatter}
+\`\`\`
+
+EOF
+            fi
 
             # Append OpenCode-specific tools section
             echo ""
@@ -614,10 +502,6 @@ generate_opencode_agents
 
 echo ""
 echo "=== Build Complete ==="
-echo "Output directory: $OUTPUT_DIR"
-echo ""
-echo "Generated instruction files:"
-ls -lh "$OUTPUT_DIR"/*.md
 echo ""
 echo "CLI auto-load files:"
 [ -f "$ROOT_DIR/AGENTS.md" ] && ls -lh "$ROOT_DIR/AGENTS.md"

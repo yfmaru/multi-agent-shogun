@@ -1,12 +1,8 @@
-# Task Flow
+# Status Reference (Single Source)
 
-## Workflow: Shogun → Karo → Ashigaru
-
-```
-Lord: command → Shogun: write YAML → inbox_write → Karo: decompose → inbox_write → Ashigaru: execute → report YAML → inbox_write → Karo: update dashboard → Shogun: read dashboard
-```
-
-## Status Reference (Single Source)
+Authoritative status definitions for every YAML queue file in this repo.
+`CLAUDE.md` points here — do not duplicate this content back into
+`CLAUDE.md` or the per-role `instructions/*.md` files.
 
 Status is defined per YAML file type. **Keep it minimal. Simple is best.**
 
@@ -18,7 +14,7 @@ Fixed status set (do not add casually):
 
 Do NOT invent new status values without updating this section.
 
-### Command Queue: `queue/shogun_to_karo.yaml`
+## Command Queue: `queue/shogun_to_karo.yaml`
 
 Meanings and allowed/forbidden actions (short):
 
@@ -38,7 +34,7 @@ Meanings and allowed/forbidden actions (short):
   - Allowed: read-only (history)
   - Forbidden: continuing work under this cmd (use a new cmd instead)
 
-### Archive Rule
+## Archive Rule
 
 The active queue file (`queue/shogun_to_karo.yaml`) must only contain
 `pending` and `in_progress` entries. All other statuses are archived.
@@ -69,7 +65,7 @@ forbidden. If found during archive, normalize to the canonical set above.
   - `pending` → `in_progress`
   - This prevents "nobody is working" confusion and stabilizes escalation logic.
 
-### Ashigaru Task File: `queue/tasks/ashigaruN.yaml`
+## Ashigaru Task File: `queue/tasks/ashigaruN.yaml`
 
 Meanings and allowed/forbidden actions (short):
 
@@ -95,13 +91,13 @@ Note:
 - Exception (placeholder only): `status: idle` is allowed **only** when `task_id: null` (clean start template written by `shutsujin_departure.sh --clean`).
   - In that state, the file is a placeholder and should be treated as "no task assigned yet".
 
-### Pending Tasks (Karo-managed): `queue/tasks/pending.yaml`
+## Pending Tasks (Karo-managed): `queue/tasks/pending.yaml`
 
 - `pending_blocked`: holding area; **must not** be assigned yet
   - Allowed: Karo moves it to an `ashigaruN.yaml` as `assigned` after prerequisites complete
   - Forbidden: pre-assigning to ashigaru before ready
 
-### NTFY Inbox (Lord phone): `queue/ntfy_inbox.yaml`
+## NTFY Inbox (Lord phone): `queue/ntfy_inbox.yaml`
 
 - `pending`: needs processing
   - Allowed: Shogun processes and sets `processed`
@@ -110,99 +106,3 @@ Note:
 - `processed`: processed; keep record
   - Allowed: read-only
   - Forbidden: flipping back to pending without creating a new entry
-
-## Immediate Delegation Principle (Shogun)
-
-**Delegate to Karo immediately and end your turn** so the Lord can input next command.
-
-```
-Lord: command → Shogun: write YAML → inbox_write → END TURN
-                                        ↓
-                                  Lord: can input next
-                                        ↓
-                              Karo/Ashigaru: work in background
-                                        ↓
-                              dashboard.md updated as report
-```
-
-## Event-Driven Wait Pattern (Karo)
-
-**After dispatching all subtasks: STOP.** Do not launch background monitors or sleep loops.
-
-```
-Step 7: Dispatch cmd_N subtasks → inbox_write to ashigaru
-Step 8: check_pending → if pending cmd_N+1, process it → then STOP
-  → Karo becomes idle (prompt waiting)
-Step 9: Ashigaru completes → inbox_write karo → watcher nudges karo
-  → Karo wakes, scans reports, acts
-```
-
-**Why no background monitor**: inbox_watcher.sh detects ashigaru's inbox_write to karo and sends a nudge. This is true event-driven. No sleep, no polling, no CPU waste.
-
-**Karo wakes via**: inbox nudge from ashigaru report, shogun new cmd, or system event. Nothing else.
-
-## "Wake = Full Scan" Pattern
-
-Claude Code cannot "wait". Prompt-wait = stopped.
-
-1. Dispatch ashigaru
-2. Say "stopping here" and end processing
-3. Ashigaru wakes you via inbox
-4. Scan ALL report files (not just the reporting one)
-5. Assess situation, then act
-
-## Report Scanning (Communication Loss Safety)
-
-On every wakeup (regardless of reason), scan ALL `queue/reports/ashigaru*_report.yaml`.
-Cross-reference with dashboard.md — process any reports not yet reflected.
-
-**Why**: Ashigaru inbox messages may be delayed. Report files are already written and scannable as a safety net.
-
-## Foreground Block Prevention (24-min Freeze Lesson)
-
-**Karo blocking = entire army halts.** On 2026-02-06, foreground `sleep` during delivery checks froze karo for 24 minutes.
-
-**Rule: NEVER use `sleep` in foreground.** After dispatching tasks → stop and wait for inbox wakeup.
-
-| Command Type | Execution Method | Reason |
-|-------------|-----------------|--------|
-| Read / Write / Edit | Foreground | Completes instantly |
-| inbox_write.sh | Foreground | Completes instantly |
-| `sleep N` | **FORBIDDEN** | Use inbox event-driven instead |
-| tmux capture-pane | **FORBIDDEN** | Read report YAML instead |
-
-### Dispatch-then-Stop Pattern
-
-```
-✅ Correct (event-driven):
-  cmd_008 dispatch → inbox_write ashigaru → stop (await inbox wakeup)
-  → ashigaru completes → inbox_write karo → karo wakes → process report
-
-❌ Wrong (polling):
-  cmd_008 dispatch → sleep 30 → capture-pane → check status → sleep 30 ...
-```
-
-## Timestamps
-
-**Always use `date` command.** Never guess.
-```bash
-date "+%Y-%m-%d %H:%M"       # For dashboard.md
-date "+%Y-%m-%dT%H:%M:%S"    # For YAML (ISO 8601)
-```
-
-## Pre-Commit Gate (CI-Aligned)
-
-Rule:
-- Run the same checks as GitHub Actions *before* committing.
-- Only commit when checks are OK.
-- Ask the Lord before any `git push`.
-
-Minimum local checks:
-```bash
-# Unit tests (same as CI)
-bats tests/*.bats tests/unit/*.bats
-
-# Instruction generation must be in sync (same as CI "Build Instructions Check")
-bash scripts/build_instructions.sh
-git diff --exit-code instructions/generated/
-```

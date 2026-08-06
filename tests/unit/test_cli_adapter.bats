@@ -533,96 +533,51 @@ YAML
 # get_instruction_file テスト
 # =============================================================================
 
-@test "get_instruction_file: shogun + claude → instructions/shogun.md" {
+@test "get_instruction_file: shogun → instructions/shogun.md" {
     load_adapter_with "${TEST_TMP}/settings_mixed.yaml"
     result=$(get_instruction_file "shogun")
     [ "$result" = "instructions/shogun.md" ]
 }
 
-@test "get_instruction_file: karo + claude → instructions/karo.md" {
+@test "get_instruction_file: karo → instructions/karo.md" {
     load_adapter_with "${TEST_TMP}/settings_mixed.yaml"
     result=$(get_instruction_file "karo")
     [ "$result" = "instructions/karo.md" ]
 }
 
-@test "get_instruction_file: ashigaru1 + claude → instructions/ashigaru.md" {
+@test "get_instruction_file: ashigaru1 → instructions/ashigaru.md" {
     load_adapter_with "${TEST_TMP}/settings_mixed.yaml"
     result=$(get_instruction_file "ashigaru1")
     [ "$result" = "instructions/ashigaru.md" ]
 }
 
-@test "get_instruction_file: ashigaru5 + codex → instructions/codex-ashigaru.md" {
+@test "get_instruction_file: gunshi → instructions/gunshi.md" {
     load_adapter_with "${TEST_TMP}/settings_mixed.yaml"
-    result=$(get_instruction_file "ashigaru5")
-    [ "$result" = "instructions/codex-ashigaru.md" ]
+    result=$(get_instruction_file "gunshi")
+    [ "$result" = "instructions/gunshi.md" ]
 }
 
-@test "get_instruction_file: ashigaru7 + copilot → .github/copilot-instructions-ashigaru.md" {
-    load_adapter_with "${TEST_TMP}/settings_mixed.yaml"
-    result=$(get_instruction_file "ashigaru7")
-    [ "$result" = ".github/copilot-instructions-ashigaru.md" ]
-}
-
-@test "get_instruction_file: ashigaru3 + kimi → instructions/generated/kimi-ashigaru.md" {
-    load_adapter_with "${TEST_TMP}/settings_kimi.yaml"
-    result=$(get_instruction_file "ashigaru3")
-    [ "$result" = "instructions/generated/kimi-ashigaru.md" ]
-}
-
-@test "get_instruction_file: shogun + kimi → instructions/generated/kimi-shogun.md" {
-    load_adapter_with "${TEST_TMP}/settings_kimi_default.yaml"
-    result=$(get_instruction_file "shogun")
-    [ "$result" = "instructions/generated/kimi-shogun.md" ]
-}
-
-@test "get_instruction_file: cli_type引数で明示指定 (codex)" {
+@test "get_instruction_file: cli_type引数を渡しても無視される (全CLIがinstructions/<役職>.mdを読む)" {
     load_adapter_with "${TEST_TMP}/settings_none.yaml"
-    result=$(get_instruction_file "shogun" "codex")
-    [ "$result" = "instructions/codex-shogun.md" ]
-}
-
-@test "get_instruction_file: cli_type引数で明示指定 (copilot)" {
-    load_adapter_with "${TEST_TMP}/settings_none.yaml"
-    result=$(get_instruction_file "karo" "copilot")
-    [ "$result" = ".github/copilot-instructions-karo.md" ]
-}
-
-@test "get_instruction_file: 全CLI × 全role組み合わせ" {
-    load_adapter_with "${TEST_TMP}/settings_none.yaml"
-    # claude
     [ "$(get_instruction_file shogun claude)" = "instructions/shogun.md" ]
-    [ "$(get_instruction_file karo claude)" = "instructions/karo.md" ]
-    [ "$(get_instruction_file ashigaru1 claude)" = "instructions/ashigaru.md" ]
-    # codex
-    [ "$(get_instruction_file shogun codex)" = "instructions/codex-shogun.md" ]
-    [ "$(get_instruction_file karo codex)" = "instructions/codex-karo.md" ]
-    [ "$(get_instruction_file ashigaru3 codex)" = "instructions/codex-ashigaru.md" ]
-    # copilot
-    [ "$(get_instruction_file shogun copilot)" = ".github/copilot-instructions-shogun.md" ]
-    [ "$(get_instruction_file karo copilot)" = ".github/copilot-instructions-karo.md" ]
-    [ "$(get_instruction_file ashigaru5 copilot)" = ".github/copilot-instructions-ashigaru.md" ]
-    # kimi
-    [ "$(get_instruction_file shogun kimi)" = "instructions/generated/kimi-shogun.md" ]
-    [ "$(get_instruction_file karo kimi)" = "instructions/generated/kimi-karo.md" ]
-    [ "$(get_instruction_file ashigaru7 kimi)" = "instructions/generated/kimi-ashigaru.md" ]
+    [ "$(get_instruction_file shogun codex)" = "instructions/shogun.md" ]
+    [ "$(get_instruction_file karo copilot)" = "instructions/karo.md" ]
+    [ "$(get_instruction_file ashigaru3 kimi)" = "instructions/ashigaru.md" ]
+    [ "$(get_instruction_file ashigaru7 opencode)" = "instructions/ashigaru.md" ]
+    [ "$(get_instruction_file shogun antigravity)" = "instructions/shogun.md" ]
+}
+
+@test "get_instruction_file: 全ashigaru番号がinstructions/ashigaru.mdへ集約される" {
+    load_adapter_with "${TEST_TMP}/settings_none.yaml"
+    [ "$(get_instruction_file ashigaru1)" = "instructions/ashigaru.md" ]
+    [ "$(get_instruction_file ashigaru5)" = "instructions/ashigaru.md" ]
+    [ "$(get_instruction_file ashigaru7)" = "instructions/ashigaru.md" ]
 }
 
 @test "get_instruction_file: 不明なagent_id → 空文字 + return 1" {
     load_adapter_with "${TEST_TMP}/settings_none.yaml"
     run get_instruction_file "unknown_agent"
     [ "$status" -eq 1 ]
-}
-
-@test "get_instruction_file: opencode + any role → instructions/generated/opencode-shogun.md" {
-    load_adapter_with "${TEST_TMP}/settings_opencode.yaml"
-    result=$(get_instruction_file "shogun")
-    [ "$result" = "instructions/generated/opencode-shogun.md" ]
-}
-
-@test "get_instruction_file: antigravity + any role → instructions/generated/antigravity-shogun.md" {
-    load_adapter_with "${TEST_TMP}/settings_antigravity.yaml"
-    result=$(get_instruction_file "shogun")
-    [ "$result" = "instructions/generated/antigravity-shogun.md" ]
 }
 
 # =============================================================================
