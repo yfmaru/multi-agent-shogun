@@ -347,8 +347,12 @@ PYEOF
 }
 
 @test "codex-clear: AGENTS.md protocol uses CLI-neutral context reset" {
-    # CLAUDE.mdのclear_command行がCLI中立表現になっていること
-    grep -q "context reset command via send-keys" "$PROJECT_ROOT/AGENTS.md"
+    # cmd_204 P2でDelivery Mechanism節をCLAUDE.mdからdocs/architecture.mdへ
+    # 移設したため、clear_command行そのものはAGENTS.mdに現れなくなった。
+    # 代わりにAGENTS.mdがdocs/architecture.mdへのポインタを持ち、
+    # その参照先がCLI中立表現を保っていることを検証する。
+    grep -q "docs/architecture.md" "$PROJECT_ROOT/AGENTS.md"
+    grep -q "context reset command via send-keys" "$PROJECT_ROOT/docs/architecture.md"
 }
 
 # =============================================================================
