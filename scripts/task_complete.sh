@@ -37,6 +37,121 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 die() { echo "[task_complete] $2" >&2; exit "$1"; }
 
+# --- pending_followups表示（cmd_203 案C・軍師設計） ---
+# 「戻ってきて思い出す」の代わりに、条件成就させた当人の完了出力へ
+# 強制的に割り込ませ、目に入れる。$TASK_FILE の parent_cmd を鍵に
+# queue/shogun_to_karo.yaml の該当cmdブロックを引き、status: pending の
+# followupだけを表示する（status: doneは表示しない＝案A側のデータを
+# 読むだけで、本スクリプトは一切書き込まない）。
+# 範囲抽出は厳密なYAML解析ではなく実用上十分な文字列処理でよい
+# （cur_id等task_id抽出と同じ流儀）。他cmdのpending_followupsを拾わぬ
+# ことが唯一の厳格な要件のため、cmdブロック境界は`  - id:`行で区切る。
+_print_pending_followups() {
+    local task_file="$1" karo_file="$2"
+    local parent_cmd followups
+    # parent_cmdは大半のtask YAMLに存在せぬ（本来任意のフィールド）。
+    # grepが無一致=exit 1となり、pipefail下ではパイプライン全体の
+    # 終了ステータスとなる。set -eの元でこれをそのまま代入させると
+    # 「completion echo後・exit 0前」で関数自体が失敗しスクリプトが
+    # 中断してしまう（status/inbox更新は済んでいるのに異常終了する
+    # 重大な回帰）。`|| true`で無一致を正常系として吸収する。
+    parent_cmd=$(grep -m1 '^  parent_cmd:' "$task_file" | sed -E 's/^  parent_cmd:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//' || true)
+    [ -n "$parent_cmd" ] || return 0
+    [ -f "$karo_file" ] || return 0
+    # when/thenはYAML上で複数行（二重引用符の折り返し・ブロックスカラ）で
+    # 書かれることがある。8スペースの既知キー・次item・block終端の
+    # いずれにも該当しない行はwhen/thenの継続行として1つの値へ畳み込む
+    # （cmd_203案C是正F1。実物のcmd204_unblockのthenが折り返されており、
+    # 従来はその行1行しか拾わず「次に取るべき行動」が欠落していた）。
+    followups="$(awk -v cmd="$parent_cmd" '
+      function flush_item() {
+        if (pf_status == "pending") {
+          printf("  - %s: %s → %s\n", pf_id, pf_when, pf_then)
+        }
+        pf_in_item = 0
+        pf_active = ""
+      }
+      function append_active(line) {
+        gsub(/^[[:space:]]+/, "", line)
+        gsub(/[[:space:]]+$/, "", line)
+        if (line == "") return
+        if (pf_active == "when") {
+          if (pf_when_quoted && line ~ /"$/) sub(/"$/, "", line)
+          pf_when = (pf_when == "" ? line : pf_when " " line)
+        } else if (pf_active == "then") {
+          if (pf_then_quoted && line ~ /"$/) sub(/"$/, "", line)
+          pf_then = (pf_then == "" ? line : pf_then " " line)
+        }
+      }
+      /^  - id: / {
+        if (pf_in_item) flush_item()
+        pf_in_item = 0; pf_in_pf = 0; pf_active = ""
+        pf_blockid = $0
+        sub(/^  - id: /, "", pf_blockid)
+        gsub(/[[:space:]]+$/, "", pf_blockid)
+        pf_in_block = (pf_blockid == cmd)
+        next
+      }
+      !pf_in_block { next }
+      /^    pending_followups:/ { pf_in_pf = 1; next }
+      pf_in_pf && /^    [A-Za-z_]/ {
+        if (pf_in_item) flush_item()
+        pf_in_pf = 0; pf_active = ""
+      }
+      !pf_in_pf { next }
+      /^      - id: / {
+        if (pf_in_item) flush_item()
+        pf_id = $0
+        sub(/^      - id: /, "", pf_id)
+        gsub(/[[:space:]]+$/, "", pf_id)
+        pf_when = ""; pf_then = ""; pf_status = ""
+        pf_when_quoted = 0; pf_then_quoted = 0
+        pf_in_item = 1
+        pf_active = ""
+        next
+      }
+      pf_in_item && /^        when: / {
+        pf_when = $0
+        sub(/^        when: /, "", pf_when)
+        pf_when_quoted = (pf_when ~ /^"/)
+        sub(/^"/, "", pf_when)
+        sub(/"$/, "", pf_when)
+        if (pf_when ~ /^[|>][-+]?$/) pf_when = ""
+        pf_active = "when"
+        next
+      }
+      pf_in_item && /^        then: / {
+        pf_then = $0
+        sub(/^        then: /, "", pf_then)
+        pf_then_quoted = (pf_then ~ /^"/)
+        sub(/^"/, "", pf_then)
+        sub(/"$/, "", pf_then)
+        if (pf_then ~ /^[|>][-+]?$/) pf_then = ""
+        pf_active = "then"
+        next
+      }
+      pf_in_item && /^        status:/ {
+        pf_status = $0
+        sub(/^        status:[[:space:]]*/, "", pf_status)
+        gsub(/[[:space:]]/, "", pf_status)
+        pf_active = ""
+        next
+      }
+      pf_in_item && /^        [A-Za-z_]+:/ {
+        pf_active = ""
+        next
+      }
+      pf_in_item && pf_active != "" {
+        append_active($0)
+        next
+      }
+      END { if (pf_in_item) flush_item() }
+    ' "$karo_file")"
+    [ -n "$followups" ] || return 0
+    echo "[task_complete] ⚠ この完了で条件成就し得るpending_followupsあり:"
+    echo "$followups"
+}
+
 # --- 引数解析 ---
 AGENT=""
 TASK_ID=""
@@ -181,6 +296,11 @@ awk -v st="$STATUS" -v ts="$(date -Iseconds)" '
 # --- M4..M5 不可逆側 ---
 if bash "$ROOT/scripts/inbox_write.sh" "$TO" "$MESSAGE" "$TYPE" "$AGENT"; then
     echo "[task_complete] 完了: status=$STATUS, 引き継ぎ→$TO"
+    # 表示は情報提供のみであり、その失敗（読めないkaro_file等）が
+    # 完了処理の成否を左右してはならぬ（cmd_203案C是正F2）。関数内の
+    # 個別対処では将来の追加行ごとに同じ穴が開くため、呼び出し側で
+    # 類型ごと閉じる。
+    _print_pending_followups "$TASK_FILE" "$ROOT/queue/shogun_to_karo.yaml" || true
     exit 0
 fi
 
