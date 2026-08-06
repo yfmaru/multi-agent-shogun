@@ -191,6 +191,42 @@ write_karo_file() {
 YAML
 }
 
+# TC-TCOMP-PF-007/008(F1)用: 実物のcmd204_unblock同様、thenが二重引用符の
+# 折り返し（複数行）で書かれたfixture。従来はwhen: /then: の1行しか
+# 拾わず、途中で切れていた。
+write_karo_file_multiline_then() {
+    cat > "$KARO_FILE" << 'YAML'
+  - id: cmd_203
+    timestamp: "2026-01-01T00:00:00"
+    pending_followups:
+      - id: cmd204_unblock
+        when: "T3がdevelopへ着地"
+        then: "cmd_204の着手条件が
+          整う。移設先を将軍が引き直し済み。
+          軍師へ実装分割の相談をした上で足軽へ発注する"
+        declared_at: "2026-01-01T00:00:00"
+        declared_by: karo
+        status: pending
+YAML
+}
+
+# TC-TCOMP-PF-008(F1)用: thenがYAMLブロックスカラ（|）で書かれたfixture。
+# 従来は「|」の一文字しか出ず情報量が零になっていた。
+write_karo_file_block_scalar_then() {
+    cat > "$KARO_FILE" << 'YAML'
+  - id: cmd_203
+    timestamp: "2026-01-01T00:00:00"
+    pending_followups:
+      - id: block_scalar_case
+        when: "単一行の条件"
+        then: |
+          ブロックスカラの本文行
+        declared_at: "2026-01-01T00:00:00"
+        declared_by: karo
+        status: pending
+YAML
+}
+
 run_tc() {
     run bash "$FIXTURE_ROOT/scripts/task_complete.sh" "$@"
 }
@@ -490,4 +526,38 @@ run_tc() {
     run_tc --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
     [ "$status" -eq 0 ] || { echo "output: $output"; false; }
     [[ "$output" != *"pending_followups"* ]] || { echo "output: $output"; false; }
+}
+
+@test "TC-TCOMP-PF-007: fix(F1) - a multi-line double-quoted 'then' is folded whole, not truncated at the first line" {
+    write_task_with_parent assigned cmd_203
+    write_report done
+    write_karo_file_multiline_then
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" == *"cmd204_unblock: T3がdevelopへ着地 → cmd_204の着手条件が 整う。移設先を将軍が引き直し済み。 軍師へ実装分割の相談をした上で足軽へ発注する"* ]] \
+        || { echo "output: $output"; false; }
+    [[ "$output" != *'"'* ]] || { echo "REGRESSION: 閉じ二重引用符が漏れている: $output"; false; }
+}
+
+@test "TC-TCOMP-PF-008: fix(F1) - a block-scalar 'then' (|) surfaces its content, not a bare pipe character" {
+    write_task_with_parent assigned cmd_203
+    write_report done
+    write_karo_file_block_scalar_then
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [[ "$output" == *"block_scalar_case: 単一行の条件 → ブロックスカラの本文行"* ]] || { echo "output: $output"; false; }
+    [[ "$output" != *"→ |"* ]] || { echo "REGRESSION: ブロックスカラの中身が「|」一文字に潰れている: $output"; false; }
+}
+
+@test "TC-TCOMP-PF-009: fix(F2) - an existing but unreadable karo_file does not abort completion (still exit 0, status done, inbox sent)" {
+    write_task_with_parent assigned cmd_203
+    write_report done
+    write_karo_file
+    chmod 000 "$KARO_FILE"
+    run_tc --task-id subtask_test --to karo --message "hello" --agent ashigaru1
+    chmod 644 "$KARO_FILE"
+    [ "$status" -eq 0 ] || { echo "REGRESSION: 読めないkaro_fileで異常終了した: output=$output"; false; }
+    grep -qE '^  status: done$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+    [ "$(wc -l < "$INBOX_LOG")" -eq 1 ] || { cat "$INBOX_LOG"; false; }
+    [[ "$output" == *"完了: status=done"* ]] || { echo "output: $output"; false; }
 }
