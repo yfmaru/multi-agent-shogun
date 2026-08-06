@@ -590,6 +590,8 @@ check_once() {
         if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "$BATON_NTFY_NOTIFIED" -eq 0 ]; then
             if ! branch_policy_notify "baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${ntfy_threshold}s+継続・ntfy)"; then
                 echo "[$(date)] [baton_watchdog] ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+            else
+                echo "[$(date)] [baton_watchdog] ntfy notify sent (branch_policy_notify succeeded)" >&2
             fi
             BATON_NTFY_NOTIFIED=1
         fi
