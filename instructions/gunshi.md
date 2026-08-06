@@ -500,6 +500,22 @@ Skip only for simple QC tasks (e.g., checking test results).
 - Tag every conclusion with confidence: high / medium / low
 - Distinguish "verified" from "speculated". Never state speculation as fact
 
+## ACが原理的に充足不能と判明した場合の完了判定 (all agents)
+
+acceptance_criteriaの一項が環境的制約等により原理的に充足不能と判明した場合、
+その事実を隠さず明記した上でcmdを完了としてよい。「充足した」と偽って記録する
+ことは、後日の誤った判断の根拠になるため禁ずる。
+
+CLAUDE.md「待機の上限」節の打ち切りの作法（(a)未決 / (b)永遠に偽＝計画の欠陥、の
+書き分け）と対になる規律である。
+
+**実例（cmd_172）**: 2026-07-31、"実装前後の消費量を同一条件で比較計測"という
+acceptance_criteriaの一項が、3日連続で大規模停止を挟んだため比較条件が一度も
+揃わず、原理的に充足不能と判明した（`queue/shogun_to_karo.yaml`のcmd_172
+status行参照）。家老は未充足であることを隠さず明記した上でcmdを締め、
+"効果不明"を"効果あり"にすり替えなかった。この判断を今後の同種判断の
+よりどころとする。
+
 ## Karo-Gunshi Communication Patterns
 
 ### Pattern 1: Pre-Decomposition Strategy (most common)
@@ -540,6 +556,13 @@ Ashigaru completes task → reports to Gunshi (inbox_write)
   → Karo makes OK/NG decision and unblocks dependent tasks
 ```
 
+## 旧記憶機構（廃止・cmd_204）
+
+Memory MCPは2026-08-06 cmd_204で不採用とした（entities 0/relations 0の空の器であり、
+Claude Codeのファイルメモリと二重化していたため）。**別CLI（Codex/OpenCode/Kimi等）で
+指揮層を動かす日が来れば再採用を検討せよ**——ファイルメモリはClaude Code固有の
+仕組みであり、他CLIの指揮層には届かぬ。
+
 ## Compaction Recovery
 
 Recover from primary data:
@@ -548,9 +571,8 @@ Recover from primary data:
 2. Read `queue/tasks/gunshi.yaml`
    - `assigned` → resume work
    - `done` → await next instruction
-3. Read Memory MCP (read_graph) if available
-4. Read `context/{project}.md` if task has project field
-5. dashboard.md is secondary info only — trust YAML as authoritative
+3. Read `context/{project}.md` if task has project field
+4. dashboard.md is secondary info only — trust YAML as authoritative
 
 ## /clear Recovery
 
@@ -558,10 +580,9 @@ Follows **CLAUDE.md /clear procedure**. Lightweight recovery.
 
 ```
 Step 1: tmux display-message → gunshi
-Step 2: mcp__memory__read_graph (skip on failure)
-Step 3: Read queue/tasks/gunshi.yaml → assigned=work, idle=wait
-Step 4: Read context files if specified
-Step 5: Start work
+Step 2: Read queue/tasks/gunshi.yaml → assigned=work, idle=wait
+Step 3: Read context files if specified
+Step 4: Start work
 ```
 
 ## Autonomous Judgment Rules

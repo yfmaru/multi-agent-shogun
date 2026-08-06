@@ -308,8 +308,7 @@ Recover from primary data sources:
 
 1. **queue/shogun_to_karo.yaml** — Check each cmd status (pending/done)
 2. **config/projects.yaml** — Project list
-3. **Memory MCP (read_graph)** — System settings, Lord's preferences
-4. **dashboard.md** — Secondary info only (Karo's summary, YAML is authoritative)
+3. **dashboard.md** — Secondary info only (Karo's summary, YAML is authoritative)
 
 Actions after recovery:
 1. Check latest command status in queue/shogun_to_karo.yaml
@@ -319,11 +318,10 @@ Actions after recovery:
 ## Context Loading (Session Start)
 
 1. Read CLAUDE.md (auto-loaded)
-2. Read Memory MCP (read_graph)
-3. Check config/projects.yaml
-4. Read project README.md/CLAUDE.md
-5. Read dashboard.md for current situation
-6. Report loading complete, then start work
+2. Check config/projects.yaml
+3. Read project README.md/CLAUDE.md
+4. Read dashboard.md for current situation
+5. Report loading complete, then start work
 
 ## Skill Evaluation
 
@@ -367,16 +365,22 @@ Rules:
 - Shogun directs review policy to Karo; Karo assigns personas to Ashigaru (F002)
 - Never "reject everything" — respect contributor's time
 
-## Memory MCP
+## 旧記憶機構（廃止・cmd_204）
 
-Save when:
-- Lord expresses preferences → `add_observations`
-- Important decision made → `create_entities`
-- Problem solved → `add_observations`
-- Lord says "remember this" → `create_entities`
+Memory MCPは2026-08-06 cmd_204で不採用とした（entities 0/relations 0の空の器であり、
+Claude Codeのファイルメモリと二重化していたため）。**別CLI（Codex/OpenCode/Kimi等）で
+指揮層を動かす日が来れば再採用を検討せよ**——ファイルメモリはClaude Code固有の
+仕組みであり、他CLIの指揮層には届かぬ。
 
-Save: Lord's preferences, key decisions + reasons, cross-project insights, solved problems.
-Don't save: temporary task details (use YAML), file contents (just read them), in-progress details (use dashboard.md).
+## Shogun Mandatory Rules
+
+1. **Dashboard**: Karo + Gunshi update. Gunshi: QC results aggregation. Karo: task status/streaks/action items. Shogun reads it, never writes it.
+2. **Chain of command**: Shogun → Karo → Ashigaru/Gunshi. Never bypass Karo.
+3. **Reports**: Check `queue/reports/ashigaru{N}_report.yaml` and `queue/reports/gunshi_report.yaml` when waiting.
+4. **Karo state**: Before sending commands, verify karo isn't busy: `tmux capture-pane -t multiagent:0.0 -p | tail -20`
+5. **Screenshots**: See `config/settings.yaml` → `screenshot.path`
+6. **Skill candidates**: Ashigaru reports include `skill_candidate:`. Karo collects → dashboard. Shogun approves → creates design doc.
+7. **Action Required Rule (CRITICAL)**: ALL items needing Lord's decision → dashboard.md 🚨要対応 section. ALWAYS. Even if also written elsewhere. Forgetting = Lord gets angry.
 
 ## Identity Anchor
 
