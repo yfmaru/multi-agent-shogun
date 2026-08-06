@@ -343,12 +343,12 @@ build_cli_command() {
 }
 
 # get_instruction_file(agent_id [,cli_type])
-# CLIが自動読込すべき指示書ファイルのパスを返す
+# 役職の手書き指示書パスを返す。全CLIが instructions/<役職>.md を読む
+# (B案一本化) ため、cli_type引数は受け取るが分岐には使わない。将来
+# CLI別の指示書が再び必要になった際の受け皿として引数のみ残す。
 get_instruction_file() {
     local agent_id="$1"
-    local cli_type="${2:-$(get_cli_type "$agent_id")}"
     local role
-    cli_type=$(_cli_adapter_normalize_cli_type "$cli_type")
 
     case "$agent_id" in
         shogun)    role="shogun" ;;
@@ -361,16 +361,7 @@ get_instruction_file() {
             ;;
     esac
 
-    case "$cli_type" in
-        claude)  echo "instructions/${role}.md" ;;
-        codex)   echo "instructions/codex-${role}.md" ;;
-        copilot) echo ".github/copilot-instructions-${role}.md" ;;
-        kimi)    echo "instructions/generated/kimi-${role}.md" ;;
-        opencode) echo "instructions/generated/opencode-${role}.md" ;;
-        cursor)  echo "instructions/generated/cursor-${role}.md" ;;
-        antigravity) echo "instructions/generated/antigravity-${role}.md" ;;
-        *)       echo "instructions/${role}.md" ;;
-    esac
+    echo "instructions/${role}.md"
 }
 
 # validate_cli_availability(cli_type)
