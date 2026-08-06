@@ -28,6 +28,14 @@
 #   TC-STALL-006: stall_policy.enabled=false → attempt_stall_recovery no-ops
 #   TC-STALL-007: pane moves mid-ladder → later steps (nudge/clear) not sent
 #   TC-STALL-008: retry cooldown → no repeat action
+#   TC-STALL-009: agent_is_busy_check invokes capture-pane with -J (cmd_209
+#                 P-2 livebug fix, argument-level check independent of the
+#                 mock's blind spot — V-1)
+#   TC-STALL-010: is_stalled_pane detects busy on a terminal-wrapped modal
+#                 footer once -J re-joins it (cmd_209 P-2 livebug fix — V-2)
+#   TC-STALL-011: is_stalled_pane stays idle when the -J-joined capture still
+#                 lacks the 'esc to' marker (negative case recording the bug
+#                 itself — V-2)
 #   TC-USAGE-001: usage_state=limited → no send-keys at all
 #   TC-USAGE-002: usage_state=unknown, unknown_policy=escape_only → Escape only
 #   TC-USAGE-003: usage_state=unknown, unknown_policy=none → nothing sent
@@ -116,6 +124,12 @@ tmux() {
             [ "\$idx" -gt "\$last" ] && idx=\$last
             echo "\${MOCK_CAPTURE_SEQUENCE[\$idx]}"
             echo \$((idx + 1)) > "\$MOCK_CAPTURE_INDEX_FILE"
+        elif echo "\$*" | grep -q -- "-J" && [ "\${MOCK_CAPTURE_PANE_JOINED+x}" = "x" ]; then
+            # cmd_209 P-2 livebug fix (V-2): capture-pane -J re-joins
+            # terminal-wrapped lines. Without this branch the mock would
+            # ignore -J entirely and always return $MOCK_CAPTURE_PANE,
+            # masking the exact linewrap bug this fix addresses.
+            echo "\${MOCK_CAPTURE_PANE_JOINED}"
         else
             echo "\${MOCK_CAPTURE_PANE:-}"
         fi
@@ -184,7 +198,23 @@ teardown() {
 # REAL_BUSY_TAIL: literal fixture captured in cmd_209 P-2 Step 0 (2026-08-06).
 # A single line is enough — agent_is_busy_check() only inspects the last
 # non-empty line of the bottom 5 for the 'esc to' marker.
+# Capture width: presumed 154 columns (the verify209 window, since removed —
+# cannot be re-measured directly). At that width the 48-char line fits
+# without wrapping, which is why this fixture alone never exposed the
+# cmd_209 P-2 livebug linewrap bug fixed below (see REAL_BUSY_TAIL_WRAPPED).
 REAL_BUSY_TAIL=' Esc to cancel · Tab to amend · ctrl+e to explain'
+
+# REAL_BUSY_TAIL_WRAPPED / REAL_BUSY_TAIL_WRAPPED_JOINED: cmd_209 P-2 livebug
+# fixture pair (gunshi live-tmux measurement, 2026-08-07). Capture width: 44
+# columns (production ashigaru pane width). At this width tmux wraps the
+# AskUserQuestion modal footer across two physical lines, splitting "Esc to"
+# from "cancel" — the unjoined tail alone lacks the 'esc to' marker, which is
+# exactly the bug (agent_is_busy_check reported idle while the pane was
+# stuck on a modal). REAL_BUSY_TAIL_WRAPPED_JOINED is what `capture-pane -J`
+# returns for the same pane — the fix under test.
+REAL_BUSY_TAIL_WRAPPED='  Enter to select · ↑/↓ to navigate · Esc to
+ cancel'
+REAL_BUSY_TAIL_WRAPPED_JOINED='  Enter to select · ↑/↓ to navigate · Esc to cancel'
 
 # Helper: seed STALL_HASH/STALL_HASH_SINCE so a subsequent is_stalled_pane()
 # call with the same MOCK_CAPTURE_PANE content sees "already stale for N sec".
@@ -335,6 +365,60 @@ seed_stalled_hash() {
     "
     [ "$status" -eq 0 ]
     ! grep -q "send-keys" "$MOCK_LOG"
+}
+
+# ─── TC-STALL-009: agent_is_busy_check calls capture-pane with -J (V-1) ───
+
+@test "TC-STALL-009: agent_is_busy_check invokes tmux capture-pane with -J" {
+    # Checks the call arguments directly via MOCK_LOG, independent of
+    # whether the mock's return value reflects -J (V-0: it doesn't unless
+    # MOCK_CAPTURE_PANE_JOINED is set). This is the one check that would
+    # catch a silent revert of the -J flag even if every fixture-based
+    # test above happened to still pass.
+    run bash -c "
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
+        source '$TEST_HARNESS'
+        agent_is_busy_check \"\$PANE_TARGET\" claude || true
+        grep -q 'capture-pane.*-J' '$MOCK_LOG' || { cat '$MOCK_LOG'; false; }
+    "
+    [ "$status" -eq 0 ]
+}
+
+# ─── TC-STALL-010/011: linewrap fixture pair (V-2) ───
+
+@test "TC-STALL-010: is_stalled_pane detects busy once -J re-joins a wrapped modal footer" {
+    # cmd_209 P-2 livebug: without -J, MOCK_CAPTURE_PANE alone (unwrapped
+    # tail " cancel") lacks 'esc to' and is_stalled_pane would misread the
+    # pane as idle. MOCK_CAPTURE_PANE_JOINED simulates what -J actually
+    # returns for the same pane once the fix (lib/agent_status.sh:55) is in
+    # place — the mock only serves this value when the tmux call includes -J.
+    # is_stalled_pane()'s OWN hash capture (line ~975, R-2: intentionally
+    # left without -J) still reads MOCK_CAPTURE_PANE — the raw, unjoined
+    # two-line content — so the seeded hash must match that, not the
+    # joined value.
+    run bash -c "
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL_WRAPPED'
+        MOCK_CAPTURE_PANE_JOINED='$REAL_BUSY_TAIL_WRAPPED_JOINED'
+        source '$TEST_HARNESS'
+        $(seed_stalled_hash "$REAL_BUSY_TAIL_WRAPPED" 500)
+        is_stalled_pane
+    "
+    [ "$status" -eq 0 ]
+}
+
+@test "TC-STALL-011: is_stalled_pane stays idle when the -J capture still lacks 'esc to' (bug record)" {
+    # Negative case: even with -J requested, an empty/marker-less joined
+    # capture must not be treated as busy. stall_busy() reports idle here,
+    # so is_stalled_pane() returns 1 at its first gate without ever reaching
+    # the hash capture — this is the exact behavior the original bug
+    # produced for every pane, joined or not, before the -J fix existed.
+    run bash -c "
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL_WRAPPED'
+        MOCK_CAPTURE_PANE_JOINED=''
+        source '$TEST_HARNESS'
+        is_stalled_pane
+    "
+    [ "$status" -eq 1 ]
 }
 
 # ─── TC-USAGE-001: usage_state=limited → no send-keys at all ───

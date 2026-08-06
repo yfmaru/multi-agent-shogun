@@ -52,7 +52,7 @@ agent_is_busy_check() {
     fi
 
     local full_capture
-    full_capture=$(timeout 2 tmux capture-pane -t "$pane_target" -p 2>/dev/null)
+    full_capture=$(timeout 2 tmux capture-pane -t "$pane_target" -p -J 2>/dev/null)
     # Only check the bottom 5 lines by default. Old busy markers linger in
     # scroll-back and cause false-busy if we scan too many lines.
     pane_tail=$(echo "$full_capture" | tail -5)
@@ -99,6 +99,11 @@ agent_is_busy_check() {
     # ONLY during active processing. When idle, this suffix disappears.
     # Checking only the last line avoids false-busy from old spinner text
     # that might still be visible in the bottom 5 lines (T-BUSY-008 scenario).
+    # capture-pane -J (above) re-joins lines tmux wrapped at the terminal
+    # width, so a status bar footer split by a narrow pane (e.g. "Esc to" /
+    # "cancel" at 44 columns) lands back on one line before this check runs.
+    # Without -J, the trailing fragment alone ("cancel") doesn't contain
+    # 'esc to' and the busy signal is missed (cmd_209 P-2 live bug).
     local last_line
     last_line=$(echo "$pane_tail" | grep -v '^[[:space:]]*$' | tail -1)
     if echo "$last_line" | grep -qiF 'esc to'; then
