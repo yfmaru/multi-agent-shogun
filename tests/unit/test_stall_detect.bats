@@ -9,10 +9,20 @@
 # the cmd_168 self-referential FAIL (the runner's own live tmux busy state
 # leaking into the assertions).
 #
+# cmd_209 P-2: is_stalled_pane()'s busy check now goes through stall_busy(),
+# which for claude calls agent_is_busy_check() (real pane-text analysis) —
+# not the idle flag file used by agent_is_busy(). Tests that need the busy
+# branch use REAL_BUSY_TAIL, the literal last line captured from a genuinely
+# stalled Claude Code permission-dialog pane (Step 0 実測, 2026-08-06,
+# ashigaru3): `agent_is_busy_check <verify-pane> claude` returned rc=0 with
+# this exact tail -5 output ending in "Esc to cancel · Tab to amend ·
+# ctrl+e to explain" (the generic 'esc to' match, not the "esc to interrupt"
+# spinner it was originally designed for).
+#
 # テスト構成:
 #   TC-STALL-001: busy + pane hash unchanged for threshold → stalled
 #   TC-STALL-002: pane content changes every sample → never stalled (誤爆防止)
-#   TC-STALL-003: idle (flag present) → not stalled
+#   TC-STALL-003: pane shows no busy marker (idle-looking) → not stalled
 #   TC-STALL-004: pane active + client attached (Gate 0) → no action at all
 #   TC-STALL-005: capture-pane empty → indeterminate, not stalled
 #   TC-STALL-006: stall_policy.enabled=false → attempt_stall_recovery no-ops
@@ -24,7 +34,9 @@
 #   TC-USAGE-004: usage_state=ok → full ladder (Escape -> nudge -> /clear)
 #   TC-USAGE-007: usage_limit_state returning "limited" (e.g. via pane-text
 #                 fallback) is honored identically regardless of source
-#   TC-CL-001: AGENT_ID=shogun/karo/gunshi → /clear never sent even at policy=full
+#   TC-CL-001: AGENT_ID=shogun/karo/gunshi → no keys sent at all (cmd_209
+#              P-2 role guard, mitigation 3 — stricter than the old
+#              "Escape ok, /clear forbidden" behavior)
 
 SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHER_SCRIPT="$SCRIPT_DIR/scripts/inbox_watcher.sh"
@@ -71,7 +83,11 @@ MOCK
     cat > "$TEST_HARNESS" << HARNESS
 #!/bin/bash
 # Variables required by inbox_watcher.sh functions
-AGENT_ID="test_agent"
+# cmd_209 P-2: attempt_stall_recovery now returns immediately for any
+# AGENT_ID not matching ^ashigaru[0-9]+\$ (role guard, mitigation 3).
+# Ladder-mechanics tests need an ashigaru-shaped id to pass that guard;
+# TC-CL-001 overrides this per-agent to exercise the guard itself.
+AGENT_ID="ashigaru9"
 PANE_TARGET="test:0.0"
 CLI_TYPE="claude"
 INBOX="$TEST_INBOX_DIR/test_agent.yaml"
@@ -165,6 +181,11 @@ teardown() {
     rm -rf "$TEST_TMPDIR"
 }
 
+# REAL_BUSY_TAIL: literal fixture captured in cmd_209 P-2 Step 0 (2026-08-06).
+# A single line is enough — agent_is_busy_check() only inspects the last
+# non-empty line of the bottom 5 for the 'esc to' marker.
+REAL_BUSY_TAIL=' Esc to cancel · Tab to amend · ctrl+e to explain'
+
 # Helper: seed STALL_HASH/STALL_HASH_SINCE so a subsequent is_stalled_pane()
 # call with the same MOCK_CAPTURE_PANE content sees "already stale for N sec".
 # Mirrors real usage: the first call always just seeds the hash (returns
@@ -181,9 +202,9 @@ seed_stalled_hash() {
 
 @test "TC-STALL-001: is_stalled_pane detects stall when busy and hash unchanged past threshold" {
     run bash -c "
-        MOCK_CAPTURE_PANE='frozen screen content'
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
         source '$TEST_HARNESS'
-        $(seed_stalled_hash 'frozen screen content' 500)
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
         is_stalled_pane
     "
     [ "$status" -eq 0 ]
@@ -192,11 +213,15 @@ seed_stalled_hash() {
 # ─── TC-STALL-002: pane content changes every sample → never stalled ───
 
 @test "TC-STALL-002: is_stalled_pane never fires while pane content keeps changing (false-positive guard)" {
+    # Each frame carries a real busy marker (last line) so stall_busy()
+    # reports busy every time — the invariant under test is that a
+    # genuinely-busy, ever-CHANGING pane never crosses stall_after_sec.
     run bash -c '
         source "'"$TEST_HARNESS"'"
         rc_all=0
         for i in 1 2 3 4 5 6; do
-            MOCK_CAPTURE_PANE="frame $i $(date +%N)-$RANDOM"
+            MOCK_CAPTURE_PANE="frame $i $(date +%N)-$RANDOM
+ Esc to cancel . Tab to amend . ctrl+e to explain"
             is_stalled_pane
             rc=$?
             if [ "$rc" -eq 0 ]; then rc_all=1; fi
@@ -207,10 +232,13 @@ seed_stalled_hash() {
     echo "$output" | grep -q "rc_all=0"
 }
 
-# ─── TC-STALL-003: idle (flag present) → not stalled ───
+# ─── TC-STALL-003: pane shows no busy marker (idle-looking) → not stalled ───
 
-@test "TC-STALL-003: is_stalled_pane returns false when agent is idle (flag present)" {
-    touch "$TEST_TMPDIR/shogun_idle_test_agent"
+@test "TC-STALL-003: is_stalled_pane returns false when the pane has no busy marker (idle-looking screen)" {
+    # cmd_209 P-2: stall_busy() for claude reads pane text (agent_is_busy_check),
+    # not the idle flag file — so a plain, marker-less capture reads as idle
+    # regardless of any flag on disk. This fixture intentionally has no
+    # 'esc to' / Working-Thinking-etc marker.
     run bash -c "
         MOCK_CAPTURE_PANE='frozen screen content'
         source '$TEST_HARNESS'
@@ -240,8 +268,12 @@ seed_stalled_hash() {
 # ─── TC-STALL-005: capture-pane empty → indeterminate, not stalled ───
 
 @test "TC-STALL-005: is_stalled_pane returns false when capture-pane is empty (indeterminate)" {
+    # First capture (consumed by stall_busy()'s own agent_is_busy_check call)
+    # is busy; second capture (is_stalled_pane's own, for the hash) is empty
+    # — this exercises is_stalled_pane's dedicated empty-capture branch
+    # rather than short-circuiting earlier via stall_busy()=idle.
     run bash -c "
-        MOCK_CAPTURE_PANE=''
+        MOCK_CAPTURE_SEQUENCE=('$REAL_BUSY_TAIL' '')
         source '$TEST_HARNESS'
         is_stalled_pane
     "
@@ -266,12 +298,20 @@ seed_stalled_hash() {
 # ─── TC-STALL-007: pane moves mid-ladder → later steps not sent ───
 
 @test "TC-STALL-007: attempt_stall_recovery aborts the ladder once the pane starts moving again" {
+    # Sequence has 3 slots because is_stalled_pane() now does TWO
+    # capture-pane calls per invocation (stall_busy()'s own, then its own
+    # hash capture): [0]=busy marker for call#1's stall_busy(),
+    # [1]="frozen screen content" for call#1's hash check (matches the
+    # pre-seeded hash below), [2]="screen moved now" for call#2's
+    # stall_busy() — a plain line with no busy marker, so stall_busy()
+    # itself reports idle and the ladder aborts (still verifies the
+    # "pane moved -> ladder aborts" externally-observable contract).
     run bash -c '
         MOCK_RECOVERY_LEVEL=full
         MOCK_USAGE_STATE=ok
         source "'"$TEST_HARNESS"'"
         '"$(seed_stalled_hash 'frozen screen content' 500)"'
-        MOCK_CAPTURE_SEQUENCE=("frozen screen content" "screen moved now")
+        MOCK_CAPTURE_SEQUENCE=("'"$REAL_BUSY_TAIL"'" "frozen screen content" "screen moved now")
         attempt_stall_recovery
     '
     [ "$status" -eq 0 ]
@@ -283,11 +323,13 @@ seed_stalled_hash() {
 # ─── TC-STALL-008: retry cooldown → no repeat action ───
 
 @test "TC-STALL-008: attempt_stall_recovery skips while a prior recovery is within cooldown" {
+    # Must actually reach Gate2=stalled first, or the cooldown gate below it
+    # is never exercised.
     run bash -c "
-        MOCK_CAPTURE_PANE='frozen screen content'
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
         MOCK_STALL_COOLDOWN=600
         source '$TEST_HARNESS'
-        $(seed_stalled_hash 'frozen screen content' 500)
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
         STALL_ACTED_AT=\$(( \$(date +%s) - 30 ))
         attempt_stall_recovery
     "
@@ -298,13 +340,16 @@ seed_stalled_hash() {
 # ─── TC-USAGE-001: usage_state=limited → no send-keys at all ───
 
 @test "TC-USAGE-001: attempt_stall_recovery sends nothing when usage_limit_state is limited" {
+    # Must reach Gate2=stalled first (F1: Gate2 now evaluated before Gate1),
+    # or this test would trivially pass on a Gate2 short-circuit instead of
+    # actually verifying the usage=limited path.
     export MOCK_USAGE_STATE="limited"
     run bash -c "
-        MOCK_CAPTURE_PANE='frozen screen content'
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
         MOCK_USAGE_STATE=limited
         MOCK_RECOVERY_LEVEL=full
         source '$TEST_HARNESS'
-        $(seed_stalled_hash 'frozen screen content' 500)
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
         attempt_stall_recovery
     "
     [ "$status" -eq 0 ]
@@ -315,11 +360,11 @@ seed_stalled_hash() {
 
 @test "TC-USAGE-002: attempt_stall_recovery sends only Escape when usage state is unknown (unknown_policy=escape_only)" {
     run bash -c "
-        MOCK_CAPTURE_PANE='frozen screen content'
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
         MOCK_USAGE_STATE=unknown
         MOCK_UNKNOWN_POLICY=escape_only
         source '$TEST_HARNESS'
-        $(seed_stalled_hash 'frozen screen content' 500)
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
         attempt_stall_recovery
     "
     [ "$status" -eq 0 ]
@@ -332,11 +377,11 @@ seed_stalled_hash() {
 
 @test "TC-USAGE-003: attempt_stall_recovery sends nothing when usage state is unknown and unknown_policy=none" {
     run bash -c "
-        MOCK_CAPTURE_PANE='frozen screen content'
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
         MOCK_USAGE_STATE=unknown
         MOCK_UNKNOWN_POLICY=none
         source '$TEST_HARNESS'
-        $(seed_stalled_hash 'frozen screen content' 500)
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
         attempt_stall_recovery
     "
     [ "$status" -eq 0 ]
@@ -347,11 +392,11 @@ seed_stalled_hash() {
 
 @test "TC-USAGE-004: attempt_stall_recovery runs the full ladder when usage state is ok" {
     run bash -c "
-        MOCK_CAPTURE_PANE='frozen screen content'
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
         MOCK_USAGE_STATE=ok
         MOCK_RECOVERY_LEVEL=full
         source '$TEST_HARNESS'
-        $(seed_stalled_hash 'frozen screen content' 500)
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
         attempt_stall_recovery
     "
     [ "$status" -eq 0 ]
@@ -375,11 +420,11 @@ seed_stalled_hash() {
     # consumes the return value — this asserts that value is trusted as-is.
     export MOCK_USAGE_STATE="limited"
     run bash -c "
-        MOCK_CAPTURE_PANE='frozen screen content'
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
         MOCK_USAGE_STATE=limited
         MOCK_RECOVERY_LEVEL=full
         source '$TEST_HARNESS'
-        $(seed_stalled_hash 'frozen screen content' 500)
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
         attempt_stall_recovery
     "
     [ "$status" -eq 0 ]
@@ -388,7 +433,9 @@ seed_stalled_hash() {
 
 # ─── TC-CL-001: command-layer agents never get /clear from the stall ladder ───
 
-@test "TC-CL-001: attempt_stall_recovery never sends /clear for shogun/karo/gunshi" {
+@test "TC-CL-001: attempt_stall_recovery injects no keys at all for shogun/karo/gunshi (cmd_209 P-2 mitigation 3)" {
+    # cmd_209 主裁可: 対象は足軽paneのみ。旧仕様（Escapeは送るが/clearは
+    # 送らぬ）よりも厳しく、command-layer paneには一切キーを注入しない。
     for agent in shogun karo gunshi; do
         > "$MOCK_LOG"
         run bash -c "
@@ -401,7 +448,6 @@ seed_stalled_hash() {
             attempt_stall_recovery
         "
         [ "$status" -eq 0 ]
-        grep -q "send-keys.*Escape.*Escape" "$MOCK_LOG"
-        ! grep -q "send-keys.*/clear" "$MOCK_LOG"
+        ! grep -q "send-keys" "$MOCK_LOG"
     done
 }

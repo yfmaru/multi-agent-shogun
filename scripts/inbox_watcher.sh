@@ -941,6 +941,21 @@ fi
 # that lib/usage_limit.sh fails to load.
 declare -f usage_limit_state >/dev/null || usage_limit_state() { echo unknown; }
 
+# stall検知専用。フラグファイルではなくpane解析を直接見る。
+# agent_is_busy()（配送経路が依存する）とは意図的に分離する（cmd_209 P-2）:
+# agent_is_busy() を claude 向けに直せば、nudge抑止・/clearガード・
+# エスカレーションという配送経路が同時に挙動を変えてしまうため、
+# stall検知の前提だけをここで差し替える。
+stall_busy() {
+    local cli
+    cli=$(get_effective_cli_type)
+    if [[ "$cli" == "claude" ]]; then
+        agent_is_busy_check "$PANE_TARGET" "$cli"
+    else
+        agent_is_busy
+    fi
+}
+
 # is_stalled_pane: type-A (interactive-modal-style) stall detection.
 # True only when busy AND the pane content hash has been unchanged for
 # stall_after_sec. This is the false-positive guard — genuine long-running
@@ -950,7 +965,7 @@ is_stalled_pane() {
     now=$(date +%s)
 
     # Not busy → not stalled. Reset tracking state.
-    if ! agent_is_busy; then
+    if ! stall_busy; then
         STALL_HASH=""
         STALL_HASH_SINCE=0
         return 1
@@ -1250,23 +1265,35 @@ attempt_stall_recovery() {
         return 0
     fi
 
+    # cmd_209 主裁可: 当面は足軽paneのみを対象とする。
+    # 家老・軍師・将軍のpaneへはキーを注入せぬ（将軍paneは主の卓）。
+    if [[ ! "$AGENT_ID" =~ ^ashigaru[0-9]+$ ]]; then
+        return 0
+    fi
+
     # Gate 0: human may be operating this pane right now — never inject keys.
     if pane_is_active && session_has_client; then
         return 0
     fi
 
+    # Gate 2 (evaluated first — cmd_209 P-2 F1): type-A detection. Cheap
+    # (tmux capture + cksum, no external API), so check it before Gate 1's
+    # usage_limit_state call. §1.0's principle that type-C takes priority
+    # over type-A is unchanged — evaluation ORDER moved, but the priority
+    # of the VERDICT below did not: a stalled+limited pane still falls
+    # through to the Gate 1 check and returns without action.
+    if ! is_stalled_pane; then
+        return 0
+    fi
+
     # Gate 1: type-C (usage limit) takes priority over type-A. An agent
     # stalled by a usage limit has a frozen pane that looks identical to a
-    # type-A stall — evaluating this first is the whole point of §1.0.
+    # type-A stall — evaluating this first (relative to the ladder below)
+    # is the whole point of §1.0.
     local usage_state
     usage_state=$(usage_limit_state "$AGENT_ID" 2>/dev/null) || usage_state="unknown"
     if [ "$usage_state" = "limited" ]; then
         echo "[$(date)] [STALL] $AGENT_ID: type_C usage_limited — no action taken" >&2
-        return 0
-    fi
-
-    # Gate 2: type-A detection
-    if ! is_stalled_pane; then
         return 0
     fi
 

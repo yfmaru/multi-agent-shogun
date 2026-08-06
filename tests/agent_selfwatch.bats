@@ -225,16 +225,13 @@ PY
     grep -q "no_idle_full_read" "$WATCHER_SCRIPT"
 }
 
-@test "TC-USAGE-WIRING: usage_limit_state resolves to the real lib/usage_limit.sh impl, not the fallback stub (cmd_171 P-1)" {
-    run bash -c "source '$TEST_HARNESS'; declare -f usage_limit_state"
+@test "TC-USAGE-WIRING: usage_limit_state resolves to the real lib/usage_limit.sh impl, not the fallback stub (cmd_171 P-1 / cmd_209 P-2 F2)" {
+    run bash -c "source '$TEST_HARNESS'; shopt -s extdebug; declare -F usage_limit_state"
     [ "$status" -eq 0 ]
-    # The fallback stub is exactly `usage_limit_state () { echo unknown; }`
-    # (a single-statement body). The real lib/usage_limit.sh implementation
-    # is materially longer, so a line-count threshold distinguishes them
-    # without depending on its internals.
-    body_lines=$(echo "$output" | wc -l)
-    [ "$body_lines" -gt 4 ] || { echo "$output"; false; }
-    ! echo "$output" | grep -q "echo unknown"
+    # extdebug下のdeclare -Fは「関数名 定義行 定義ファイル」を出す。
+    # 確かめたいのは「実体(lib/usage_limit.sh)から解決されたか」そのもの
+    # であり、実装の字面（行数・echo文言）ではない。
+    [[ "$output" == *"lib/usage_limit.sh"* ]] || { echo "$output"; false; }
 }
 
 @test "TC-NFR-008: test file itself has no skip directives (SKIP=0 guard)" {
