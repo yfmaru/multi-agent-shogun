@@ -45,12 +45,11 @@ case "$AGENT_ID" in
 以下を順番に実行せよ (省略禁止、ユーザ応答/inbox 処理はこの後):
 
 1. \`tmux display-message -t "\$TMUX_PANE" -p '#{@agent_id}'\` で自己識別を再確認
-2. \`mcp__memory__read_graph\` でルール・嗜好・教訓を復元
-3. (shogun のみ) \`memory/MEMORY.md\` を Read
-4. \`instructions/${AGENT_ID}.md\` を最後まで必読 — persona・戦国口調・forbidden_actions 再確立 **(絶対省略禁止)**
-5. \`queue/\` 配下 (tasks/, inbox/, reports/) から state 再構築
+2. \`memory/MEMORY.md\` — Claude Code 使用時は全エージェントのセッションへ自動注入されるため明示的な Read は不要。他CLI（Codex/OpenCode/Kimi 等）では自動注入されぬため、将軍のみ明示的に Read せよ
+3. \`instructions/${AGENT_ID}.md\` を最後まで必読 — persona・戦国口調・forbidden_actions 再確立 **(絶対省略禁止)**
+4. \`queue/\` 配下 (tasks/, inbox/, reports/) から state 再構築
 
-**Step 1-4 完了まで inbox 処理・ユーザ応答は禁止**。inbox{N} nudge が先に届いても無視し、persona 確立を優先せよ。
+**Step 1-3 完了まで inbox 処理・ユーザ応答は禁止**。inbox{N} nudge が先に届いても無視し、persona 確立を優先せよ。
 
 Rationale: 2026-04-18 に家老が「我は将軍」と役職誤認する persona 崩壊事例あり。
 command-layer agent は persona + 戦国口調 + forbidden_actions の再確立が必須。
