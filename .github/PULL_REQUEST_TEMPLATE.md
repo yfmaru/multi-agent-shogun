@@ -23,7 +23,7 @@ Axis judgment (required if the box above is checked):
 ```
 
 If you cannot write this judgment, the rule must **not** live in
-`CLAUDE.md` — consider moving it to `instructions/roles/` or another
+`CLAUDE.md` — consider moving it to `instructions/<role>.md` or another
 role-/task-specific file instead.
 
 ## Related Issues

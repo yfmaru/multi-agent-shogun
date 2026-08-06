@@ -15,7 +15,6 @@ permission:
     config/opencode-permissions.yaml: deny
     config/opencode-tui.json: deny
     dashboard.md: deny
-    instructions/generated/*: deny
     queue/inbox/*.yaml: deny
     queue/ntfy_inbox.yaml: allow
     queue/reports/*: deny

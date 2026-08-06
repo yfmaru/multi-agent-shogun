@@ -149,6 +149,9 @@ logs/
 !docs/philosophy.md
 !docs/vps_pr118_verification_plan.md
 !docs/gh_cli_setup.md
+!docs/status_reference.md
+!docs/pre_commit_gate.md
+!docs/agent_selfwatch_phases.md
 
 # Screenshots (masked — no secrets)
 !images/
