@@ -641,10 +641,15 @@ check_once() {
 
         if [ "$held_elapsed" -ge "$held_threshold" ] && [ "$BATON_HELD_NOTIFIED" -eq 0 ]; then
             if [ -n "$awaiting_ids" ]; then
-                baton_watchdog_notify_shogun "baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${awaiting_ids}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
+                held_msg="baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${awaiting_ids}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
             else
-                baton_watchdog_notify_shogun "baton_lost(human-held): unread=0 active=0 open_cmds=${open_cmds}(人待ちの印なし)が${held_threshold}s+滞留。主の手番が本当に続いているか確かめよ"
+                held_msg="baton_lost(human-held): unread=0 active=0 open_cmds=${open_cmds}(人待ちの印なし)が${held_threshold}s+滞留。主の手番が本当に続いているか確かめよ"
             fi
+            # 【cmd_208/措置B】既存の将軍宛はそのまま維持し、karo宛を追加する
+            # のみ。この文面は「印の外し忘れかを確かめよ」であり、印を実際に
+            # 外せる家老が受け取ってこそ意味を成す。
+            baton_watchdog_notify_inbox karo "$held_msg"
+            baton_watchdog_notify_shogun "$held_msg"
             BATON_HELD_NOTIFIED=1
         fi
     else

@@ -131,9 +131,12 @@ DEFAULT_BATON_WATCHDOG = {
     # cmd_197: cmd側の任意フィールド `awaiting: lord` による除外(check_once)
     # 専用の長い安全網。除外は「発報を止める」のではなく「急かす間隔を
     # 延ばす」だけであることの実体——印が付いたまま丸1日超放置されたら
-    # 印の正誤にかかわらず必ず発火する。baton_b4c_machine_stale_after_sec
-    # と同じ考え方(主の長期ご不在を想定した網)であり、既定値も揃える。
-    "baton_lost_human_held_after_sec": 86400,
+    # 印の正誤にかかわらず必ず発火する。
+    # 【cmd_208/措置B是正】既定を86400→3600へ。実測失敗尺（cmd_203/cmd_204
+    # の人待ち印が実は機械の手番だったまま12時間09分すり抜けた件）が
+    # 24時間の網より小さく、従来の既定ではこの型の失敗を原理的に
+    # 捕まえられなかった（gunshi_design_208.yaml G-2）。
+    "baton_lost_human_held_after_sec": 3600,
     "usage_warn_pct": 80,
     "usage_resume_below_pct": 50,
     "usage_check_interval_sec": 300,
