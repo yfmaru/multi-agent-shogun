@@ -353,7 +353,7 @@ Actions after recovery:
 
 ## Branch & PR Policy — 将軍の責務
 
-ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
+ブランチ運用の全条文は CONTRIBUTING.md「エージェント運用のブランチ・PR規約」を正とする（禁止事項の定義はCLAUDE.md「Git Branch & PR Policy」）。
 将軍の職掌は以下に限る。
 
 - **ブランチ戦略そのものの決定**と、主への説明責任を負う。

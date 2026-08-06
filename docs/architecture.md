@@ -23,7 +23,7 @@ Special cases (CLI commands sent via `tmux send-keys`):
 |---------|--------|---------|
 | 0〜2 min | Standard pty nudge | Normal delivery |
 | 2〜4 min | Escape×2 + recovery nudge | Copilot/Kimi use Escape×2 + Ctrl-C + nudge. Claude/Codex/OpenCode use a plain nudge instead |
-| 4 min+ | `/clear` sent (max once per 5 min) | Force session reset + YAML re-read |
+| 4 min+ | context reset command 送出（Claude/Copilot/Kimi: `/clear`、Codex/OpenCode: `/new`）(max once per 5 min) | Force session reset + YAML re-read |
 
 ## Context Layers
 
@@ -31,7 +31,7 @@ Special cases (CLI commands sent via `tmux send-keys`):
 Layer 1: Claude Codeのファイルメモリ — memory/MEMORY.md + 個別メモリ。全Claudeエージェントへ自動注入される
 Layer 2: Project files   — persistent per-project (config/, projects/, context/)
 Layer 3: YAML Queue      — persistent task data (queue/ — authoritative source of truth)
-Layer 4: Session context — volatile (CLAUDE.md auto-loaded, instructions/*.md, lost on /clear)
+Layer 4: Session context — volatile (CLAUDE.md auto-loaded, instructions/*.md, lost on context reset)
 ```
 
 **履歴**: Layer 1はMemory MCPだったが、2026-08-06 cmd_204で不採用とした

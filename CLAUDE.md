@@ -65,9 +65,8 @@ language:
 **This is ONE procedure for ALL situations**: fresh start, compaction, session continuation, or any state where you see CLAUDE.md. You cannot distinguish these cases, and you don't need to. **Always follow the same steps.**
 
 1. Identify self: `tmux display-message -t "$TMUX_PANE" -p '#{@agent_id}'`
-2. `mcp__memory__read_graph` — restore rules, preferences, lessons **(shogun/karo/gunshi only. ashigaru skip this step — task YAML is sufficient)**
-3. **Read `memory/MEMORY.md`** (shogun only) — persistent cross-session memory. If file missing, skip. *Claude Code users: this file is also auto-loaded via Claude Code's memory feature.*
-4. **Read your instructions file**: shogun→`instructions/shogun.md`, karo→`instructions/karo.md`, ashigaru→`instructions/ashigaru.md`, gunshi→`instructions/gunshi.md`. **NEVER SKIP** — even if a conversation summary exists. Summaries do NOT preserve persona, speech style, or forbidden actions.
+2. **Read `memory/MEMORY.md`** — persistent cross-session memory. Claude Code使用時は全Claudeエージェントのセッションへ自動注入されるため明示的なReadは不要。他CLI（Codex/OpenCode/Kimi等）では自動注入されぬため、将軍のみ明示的にReadせよ。
+3. **Read your instructions file**: shogun→`instructions/shogun.md`, karo→`instructions/karo.md`, ashigaru→`instructions/ashigaru.md`, gunshi→`instructions/gunshi.md`. **NEVER SKIP** — even if a conversation summary exists. Summaries do NOT preserve persona, speech style, or forbidden actions.
 4. Rebuild state from primary YAML data (queue/, tasks/, reports/)
 5. Review forbidden actions, then start work
 
@@ -142,28 +141,7 @@ bash scripts/inbox_write.sh ashigaru3 'タスクYAMLを読んで作業開始せ�
 Delivery is handled by `inbox_watcher.sh` (infrastructure layer).
 **Agents NEVER call tmux send-keys directly.**
 
-## Delivery Mechanism
-
-Two layers:
-1. **Message persistence**: `inbox_write.sh` writes to `queue/inbox/{agent}.yaml` with flock. Guaranteed.
-2. **Wake-up signal**: `inbox_watcher.sh` detects file change via `inotifywait` → wakes agent:
-   - **優先度1**: Agent self-watch (agent's own `inotifywait` on its inbox) → no nudge needed
-   - **優先度2**: `tmux send-keys` — short nudge only (text and Enter sent separately, 0.3s gap)
-
-The nudge is minimal: `inboxN` (e.g. `inbox3` = 3 unread). That's it.
-**Agent reads the inbox file itself.** Message content never travels through tmux — only a short wake-up signal.
-
-Special cases (CLI commands sent via `tmux send-keys`):
-- `type: clear_command` → sends context reset command via send-keys (Claude/Copilot/Kimi: `/clear`, Codex/OpenCode: `/new`)
-- `type: model_switch` → sends the /model command via send-keys
-
-**Escalation** (when nudge is not processed):
-
-| Elapsed | Action | Trigger |
-|---------|--------|---------|
-| 0〜2 min | Standard pty nudge | Normal delivery |
-| 2〜4 min | Escape×2 + recovery nudge | Copilot/Kimi use Escape×2 + Ctrl-C + nudge. Claude/Codex/OpenCode use a plain nudge instead |
-| 4 min+ | `/clear` sent (max once per 5 min) | Force session reset + YAML re-read |
+機構の解説（配送の二層構造・Context Layers・Project Management）は `docs/architecture.md` を見よ。
 
 ## Inbox Processing Protocol (karo/ashigaru/gunshi)
 
@@ -184,16 +162,7 @@ When you receive `inboxN` (e.g. `inbox3`):
 This is NOT optional. If you skip this and a redo message is waiting,
 you will be stuck idle until the next escalation or task reassignment.
 
-## Redo Protocol
-
-When Karo determines a task needs to be redone:
-
-1. Karo writes new task YAML with new task_id (e.g., `subtask_097d` → `subtask_097d2`), adds `redo_of` field
-2. Karo sends `clear_command` type inbox message (NOT `task_assigned`)
-3. inbox_watcher delivers the CLI-appropriate context reset command to the agent → session reset
-4. Agent recovers via Session Start procedure, reads new task YAML, starts fresh
-
-Race condition is eliminated: the context reset wipes old context. Agent re-reads YAML with new task_id.
+やり直しの手順（Redo Protocol）は家老の職掌ゆえ `instructions/karo.md` 同名節を正とする。
 
 ## Report Flow (interrupt prevention)
 
@@ -303,21 +272,7 @@ fi
   存在しない）。実例4はこちらであり、これを「CIを待っている」と
   引き継げば次の者も同じ待機を繰り返すだけになる
 
-## ACが原理的に充足不能と判明した場合の完了判定 (all agents)
-
-acceptance_criteriaの一項が環境的制約等により原理的に充足不能と判明した場合、
-その事実を隠さず明記した上でcmdを完了としてよい。「充足した」と偽って記録する
-ことは、後日の誤った判断の根拠になるため禁ずる。
-
-上記「待機の上限」節の打ち切りの作法（(a)未決 / (b)永遠に偽＝計画の欠陥、の
-書き分け）と対になる規律である。
-
-**実例（cmd_172）**: 2026-07-31、"実装前後の消費量を同一条件で比較計測"という
-acceptance_criteriaの一項が、3日連続で大規模停止を挟んだため比較条件が一度も
-揃わず、原理的に充足不能と判明した（`queue/shogun_to_karo.yaml`のcmd_172
-status行参照）。家老は未充足であることを隠さず明記した上でcmdを締め、
-"効果不明"を"効果あり"にすり替えなかった。この判断を今後の同種判断の
-よりどころとする。
+ACが原理的に充足不能と判明した場合の完了判定は `instructions/karo.md` / `instructions/gunshi.md` の同名節を見よ（上記「打ち切りの作法」(a)(b) と対をなす規律である）。
 
 ## 常駐デーモンの再起動 (all agents)
 
@@ -325,54 +280,17 @@ status行参照）。家老は未充足であることを隠さず明記した�
 しない。走っているプロセスを入れ替え、新コードで動作していることを
 実測確認するまでを完了条件とする。**
 
-- `watcher_supervisor.sh`のような**自動復帰の仕組みがある場合ほど
-  注意を要する**。自動復帰は「直してから起こす」という人手の順序を
-  保証せず、**修正の着地と無関係にプロセスが起動し続ける**——古い
-  コードが勝手に生き延びる仕組みでもある
-- デーモンのプロセス起動時刻と、修正PRのマージ時刻を**必ず突き合わせよ**
-  （`ps -o etime`等でプロセスの経過時間を、`gh pr view --json mergedAt`
-  等でマージ時刻を、それぞれ実測して比較する）。数分の差でも
-  「マージ前に起動した古いプロセス」が生き残っている可能性がある
-- 実測確認の内容: (a)ログ等に新コード由来の痕跡（例: 毎サイクルの
-  ログ出力）が実際に出ていること (b)機能面でも、発火条件を満たした
-  状態で実際に通知等が届くこと。**「動いている」だけでは足りず、
-  「新しいコードで動いており、機能している」までを完了とする**
+- **自動復帰の仕組み（`watcher_supervisor.sh` 等）がある場合ほど危うい。**
+  修正の着地と無関係にプロセスが起動し続け、古いコードが生き延びる
+- **プロセス起動時刻（`ps -o etime`）と修正PRのマージ時刻
+  （`gh pr view --json mergedAt`）を必ず突き合わせよ。** 数分の差でも
+  「マージ前に起動した古いプロセス」が生き残り得る
+- 実測は (a) 新コード由来の痕跡がログ等に実際に出ていること
+  (b) 発火条件を満たした状態で機能が実際に働くこと、の**両方**を要する
 
-**実例（cmd_171）**: `baton_watchdog.sh`（常駐デーモン）の起動時刻
-（09:31:22）とその修正PR #17のマージ時刻（09:37:16）が**わずか6分差**
-であったため、supervisorが自動起動した番犬が「修正が入る前のコード」
-を掴んだまま6時間以上走り続けた。証拠: `logs/baton_watchdog.log`が
-毎サイクルのログ出力を追加したはずのPR #17後もなお0バイトのまま
-だったこと。
-
-**【将軍の落ち度として記録する事実】** 将軍は前夜「マージしたことと
-動いているものが新しくなったことは別」という教訓を既に申し渡していた
-が、今朝その番犬が起きた時刻と修正の着地時刻を突き合わせず、6分の差を
-見落とした。**教訓を条文化するよう命じた当人が、その教訓を自ら実行
-しなかった実例**であり、これを以て本条の重みとする。
-
-# Context Layers
-
-```
-Layer 1: Memory MCP     — persistent across sessions (preferences, rules, lessons)
-Layer 2: Project files   — persistent per-project (config/, projects/, context/)
-Layer 3: YAML Queue      — persistent task data (queue/ — authoritative source of truth)
-Layer 4: Session context — volatile (CLAUDE.md auto-loaded, instructions/*.md, lost on /clear)
-```
-
-# Project Management
-
-System manages ALL white-collar work, not just self-improvement. Project folders can be external (outside this repo). `projects/` is git-ignored (contains secrets).
-
-# Shogun Mandatory Rules
-
-1. **Dashboard**: Karo + Gunshi update. Gunshi: QC results aggregation. Karo: task status/streaks/action items. Shogun reads it, never writes it.
-2. **Chain of command**: Shogun → Karo → Ashigaru/Gunshi. Never bypass Karo.
-3. **Reports**: Check `queue/reports/ashigaru{N}_report.yaml` and `queue/reports/gunshi_report.yaml` when waiting.
-4. **Karo state**: Before sending commands, verify karo isn't busy: `tmux capture-pane -t multiagent:0.0 -p | tail -20`
-5. **Screenshots**: See `config/settings.yaml` → `screenshot.path`
-6. **Skill candidates**: Ashigaru reports include `skill_candidate:`. Karo collects → dashboard. Shogun approves → creates design doc.
-7. **Action Required Rule (CRITICAL)**: ALL items needing Lord's decision → dashboard.md 🚨要対応 section. ALWAYS. Even if also written elsewhere. Forgetting = Lord gets angry.
+経緯と実例（cmd_171 — 番犬が起動6分後にマージされた修正を掴み損ね
+6時間以上古いコードで走った件。および、前夜に同じ教訓を申し渡された
+将軍ご自身がその突き合わせを見落とされた事実）は `docs/incidents.md`。
 
 # Test Rules (all agents)
 
@@ -385,28 +303,9 @@ System manages ALL white-collar work, not just self-improvement. Project folders
 
 # Batch Processing Protocol (all agents)
 
-When processing large datasets (30+ items requiring individual web search, API calls, or LLM generation), follow this protocol. Skipping steps wastes tokens on bad approaches that get repeated across all batches.
-
-## Default Workflow (mandatory for large-scale tasks)
-
-```
-① Strategy → Gunshi review → incorporate feedback
-② Execute batch1 ONLY → Shogun QC
-③ QC NG → Stop all agents → Root cause analysis → Gunshi review
-   → Fix instructions → Restore clean state → Go to ②
-④ QC OK → Execute batch2+ (no per-batch QC needed)
-⑤ All batches complete → Final QC
-⑥ QC OK → Next phase (go to ①) or Done
-```
-
-## Rules
-
-1. **Never skip batch1 QC gate.** A flawed approach repeated 15 batches = 15× wasted tokens.
-2. **Batch size limit**: 30 items/session (20 if file is >60K tokens). Reset session (/new or /clear) between batches.
-3. **Detection pattern**: Each batch task MUST include a pattern to identify unprocessed items, so restart after /new can auto-skip completed items.
-4. **Quality template**: Every task YAML MUST include quality rules (web search mandatory, no fabrication, fallback for unknown items). Never omit — this caused 100% garbage output in past incidents.
-5. **State management on NG**: Before retry, verify data state (git log, entry counts, file integrity). Revert corrupted data if needed.
-6. **Gunshi review scope**: Strategy review (step ①) covers feasibility, token math, failure scenarios. Post-failure review (step ③) covers root cause and fix verification.
+30件以上の個別処理（web検索・API呼び出し・LLM生成）を伴う大量処理は
+`instructions/karo.md`「Batch Processing Protocol」節に従え。**batch1 の
+QCゲートを飛ばすと、誤った方法が全バッチ分繰り返される。**
 
 # Critical Thinking Rule (all agents)
 
@@ -416,58 +315,15 @@ When processing large datasets (30+ items requiring individual web search, API c
 4. **過剰批判の禁止**: 批判だけで停止しない。判断不能でない限り、最善案を選んで前進する。
 5. **実行バランス**: 「批判的検討」と「実行速度」の両立を常に優先する。
 
-# Git Branch & PR Policy (all agents, all repositories)
+# Git Branch & PR Policy — 禁止事項（全リポジトリ共通・無条件）
 
-本ルールは multi-agent-shogun 自身に限らず、主が指示する**あらゆる GitHub リポジトリ**への
-実装タスクに適用される。**D001〜D008（破壊的操作禁止）は本ルールに優先する。**
-
-## 適用判定 — 「GitHub実装タスク」とは
-
-**判定基準: 変更対象に git 追跡下のファイルが1つでも含まれるか。**
-
-| 判定 | 条件 | 手順 |
-|------|------|------|
-| **適用（PR必須）** | git 追跡下のファイルを1つでも変更・追加・削除する | 基点ブランチ起点の作業ブランチ → PR |
-| **非適用** | 変更が git 管理外ファイル（.gitignore 対象）のみ | 通常どおりその場で編集。ブランチ・PR 不要 |
-
-判定コマンド（変更後に実行。出力が空なら非適用）:
-
-```bash
-git -C <repo> status --porcelain
-```
-
-`.gitignore` 対象のファイルはこの出力に現れない。ゆえに「出力が空 = 追跡ファイルへの
-変更なし = 非適用」と機械的に判定できる。対象リポジトリごとの例外表は不要であり、
-外部リポジトリでも同じ基準がそのまま機能する。
-
-本リポジトリでの具体例:
-- **非適用**: `queue/**`（tasks / inbox / reports / shogun_to_karo.yaml）、`dashboard.md`、
-  `logs/**`、`projects/**` — いずれも .gitignore 対象。日常運用で常時更新されるため
-  PR を要求すると運用が止まる。
-- **適用**: `CLAUDE.md`、`instructions/**`、`scripts/**`、`lib/**`、`tests/**`、
-  `config/*.sample`、`README*.md`、`.github/**`
-
-例外は設けぬ。緊急修正であっても PR を経る。主の明示指示がある場合のみ例外とし、
-その旨を報告 YAML または PR 本文に記録すること。
-
-## 基点ブランチ解決規則
-
-作業ブランチの切り出し元、かつ PR の base（= 基点ブランチ）を、対象リポジトリごとに
-以下の優先順で決定する。
-
-1. **主が明示的に指定したブランチ**（最優先）
-   — `config/projects.yaml` の `git.base_branch` は、過去に主が裁可した指定の
-     永続形として本項に含める。未設定なら次項へ進む。
-2. **対象リポジトリの規約**（`CONTRIBUTING.md` / `PULL_REQUEST_TEMPLATE` 等）が定める base
-3. **`origin/develop` が存在すれば `develop`**
-4. いずれも無ければ**対象リポジトリの既定ブランチ**（`origin/HEAD` の指す先）
-
-**他者所有リポジトリに develop を勝手に新設してはならぬ。** 新設が妥当と判断した場合は、
-家老経由で将軍へ上申し、主の裁可を得ること。
-
-multi-agent-shogun 自身は develop を持つため、常に規則 3 に該当する（base = `develop`）。
-
-## 全リポジトリ共通・無条件の禁止事項
+**適用判定**: 変更対象に git 追跡下のファイルが1つでも含まれるなら適用。
+`git -C <repo> status --porcelain` の出力に現れるか否かで機械的に決まる
+（`.gitignore` 対象は非適用ゆえ `queue/**`・`dashboard.md`・`logs/**`・
+`projects/**` の日常更新に PR は要らぬ）。**手順・ブランチ命名規約・
+基点ブランチ解決規則・ブランチ排他所有・外部リポジトリ調査・EOLガード・
+裁可表の全条文は `CONTRIBUTING.md`「エージェント運用のブランチ・PR規約」
+節を正とする。** D001〜D008（破壊的操作禁止）は本ルールに優先する。
 
 | ID | 禁止事項 |
 |----|---------|
@@ -477,95 +333,7 @@ multi-agent-shogun 自身は develop を持つため、常に規則 3 に該当�
 | B004 | 他エージェント／他者の作業ブランチへの割り込み commit・push |
 | B005 | 他者のブランチへの force push。`--force-with-lease` であっても禁止（D003 準拠） |
 | B006 | PR の自己マージ。マージ可否の判定は家老・将軍の職掌 |
-| B007 | 長寿命ブランチ（develop / main / master 等）を head とする PR のマージに `--delete-branch` を付すこと。head が `branch_policy.allowed_long_lived` に含まれる場合は必ず外す |
-
-## ブランチ命名規約
-
-```
-<type>/<cmd_or_task_id>-<slug>
-```
-
-- `<type>`: `feat` | `fix` | `chore` | `docs` | `test` | `refactor` | `perf` | `ci`
-- `<cmd_or_task_id>`: `cmd_163` / `subtask_163b` 等。**必ず含める**
-- `<slug>`: 英小文字・数字・ハイフンのみ。3〜5 語程度
-- 例: `feat/cmd_163-branch-policy` / `fix/subtask_170a-inbox-race` / `chore/cmd_163-eol-normalize`
-
-**制約**: 本規約に従う名前は、`config/settings.yaml` の
-`branch_policy.short_lived_pattern` に**マッチしてはならぬ**。マッチすると
-`scripts/auto_merge_short_lived.sh` によりレビュー前に自動マージ・自動削除される
-（B001 / B006 違反）。命名規約と pattern は互いに素に保つこと。
-
-## ブランチ排他所有
-
-- **1ブランチ = 1エージェント。** 同一ブランチに複数の足軽を割り当ててはならぬ。
-- 同一 cmd を複数足軽で並行処理する場合は、家老がファイル領域の重ならぬ単位に分割し、
-  足軽ごとに**独立ブランチ・独立 PR** とする。
-- 理由: エージェントはポーリング禁止（F004）ゆえ互いの push を検知できず、共有ブランチでは
-  non-fast-forward 衝突の解消に force push が必要となり B005 と衝突する。
-
-## 作業開始前の必須調査（外部リポジトリ）
-
-作業ブランチを切る前に確認し、報告 YAML に記載する:
-
-```bash
-git -C <repo> symbolic-ref refs/remotes/origin/HEAD    # 既定ブランチ
-git -C <repo> ls-remote --heads origin develop         # develop の有無
-gh repo view <owner>/<repo> --json viewerPermission    # write 権限
-ls CONTRIBUTING.md .github/PULL_REQUEST_TEMPLATE.md    # 規約の有無
-```
-
-- write 権限が無ければ **fork 経由 PR** に切り替える。fork 要否は家老が決定する。
-- コミットメッセージ規約（Conventional Commits 等）の有無も確認する。
-- **対象リポジトリ側の規約が本ルールと矛盾する場合は、対象リポジトリ側を優先する。**
-  その旨を報告 YAML に明記すること。判断に迷えば作業を止めて家老へ上げよ。
-
-## 標準手順（足軽）
-
-```bash
-# 1. 作業ツリーが clean であることを確認（空でなければ着手せず家老へ報告）
-git -C <repo> status --porcelain
-
-# 2. 基点ブランチから作業ブランチを切る
-git -C <repo> fetch origin
-git -C <repo> switch -c <type>/<cmd_id>-<slug> origin/<base>
-
-# 3. 実装。commit は変更ファイルを名指しで add する
-git -C <repo> add path/to/changed_file    # `git add -A` / `git add .` は禁止
-git -C <repo> commit -m "<type>: <要約> (<cmd_id>)"
-
-# 4. push 前セルフチェック（必須）
-test "$(git -C <repo> branch --show-current)" != "<base>" || { echo "ABORT: 基点ブランチ上にいる"; exit 1; }
-
-# 5. push → draft PR
-git -C <repo> push -u origin <branch>
-gh pr create --draft --base <base> --title "..." --body "..."
-```
-
-PR 本文には **背景 / 変更点 / 検証手順 / 関連 cmd_id** を必ず含める。
-PR は draft で作成し、軍師の QC PASS と家老の承認を得てから `gh pr ready` で
-ready に上げる。**足軽が自ら merge してはならぬ（B006）。**
-
-## 裁可が必要な事項
-
-| 事項 | 判定者 |
-|------|--------|
-| 自リポジトリの基点ブランチ宛 PR のマージ | 家老（軍師 QC PASS が前提） |
-| develop → main のマージ（リリース） | 主（将軍が上申） |
-| 他者所有リポジトリへの PR 提出 | 主（将軍が上申。外部発信のため） |
-| 他者所有リポジトリへの develop 新設 | 主（将軍が上申） |
-
-## 改行コード（EOL）ガード
-
-commit 前に、ステージ済み差分が改行コードのみの差分になっていないか確認する。
-
-```bash
-a=$(git diff --cached --numstat | wc -l)
-b=$(git diff --cached --ignore-cr-at-eol --numstat | wc -l)
-[ "$a" = "$b" ] || { echo "ABORT: 改行コードのみの差分が混入している"; exit 1; }
-```
-
-乖離があれば commit を中止し、家老へ報告せよ。改行コードノイズを含む PR は
-レビュー不能であり、本ルールの目的そのものを損なう。
+| B007 | 長寿命ブランチ（develop / main / master 等）を head とする PR のマージに `--delete-branch` を付すこと |
 
 # Destructive Operation Safety (all agents)
 

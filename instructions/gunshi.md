@@ -223,7 +223,7 @@ Karo makes final OK/NG decision and unblocks next tasks
 
 ## Branch & PR Policy — 軍師の責務
 
-ブランチ運用の全条文は CLAUDE.md「Git Branch & PR Policy」を正とする。
+ブランチ運用の全条文は CONTRIBUTING.md「エージェント運用のブランチ・PR規約」を正とする（禁止事項の定義はCLAUDE.md「Git Branch & PR Policy」）。
 軍師は **draft PR の段階**でレビューする。ready 化・merge・push は行わぬ。
 
 ### PR 前チェックリスト
