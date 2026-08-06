@@ -546,6 +546,7 @@ check_once() {
     local now unread active open_cmds open_cmds_machine awaiting_n awaiting_ids condition
     local shogun_threshold ntfy_threshold elapsed excl_note
     local held_threshold held_elapsed
+    local msg msg_actionable held_msg
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -575,11 +576,16 @@ check_once() {
             excl_note=" (人待ち除外 ${awaiting_n}件: ${awaiting_ids})"
         fi
 
-        # 主経路: 将軍inbox通知。900秒(既定)継続で無条件に発火する。
+        # 主経路（cmd_208/措置A・宛先の二重化）: karo（手を打てる者）と
+        # shogun（見通し）の両方へ通知する。将軍への通知は既存のまま
+        # 減らさず、karo宛を追加するのみ。900秒(既定)継続で無条件に発火する。
         # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
         shogun_threshold=$(baton_watchdog_query baton_lost_after_sec)
         if [ "$elapsed" -ge "$shogun_threshold" ] && [ "$BATON_NOTIFIED" -eq 0 ]; then
-            baton_watchdog_notify_shogun "baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
+            msg="baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
+            msg_actionable="$msg"
+            baton_watchdog_notify_inbox karo   "$msg_actionable"
+            baton_watchdog_notify_inbox shogun "$msg"
             BATON_NOTIFIED=1
         fi
 
