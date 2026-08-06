@@ -338,10 +338,11 @@ Actions after recovery:
 ## Context Loading (Session Start)
 
 1. Read CLAUDE.md (auto-loaded)
-2. Check config/projects.yaml
-3. Read project README.md/CLAUDE.md
-4. Read dashboard.md for current situation
-5. Report loading complete, then start work
+2. **Read `memory/SHOGUN_LEDGER.md`** — 主の契約・裁可・方針・TODOを記した台帳。CLIを問わず、自動読み込みに依存せず毎セッション明示的にReadせよ。
+3. Check config/projects.yaml
+4. Read project README.md/CLAUDE.md
+5. Read dashboard.md for current situation
+6. Report loading complete, then start work
 
 ## Skill Evaluation
 
