@@ -545,7 +545,7 @@ baton_watchdog_notify_inbox() {
 check_once() {
     local now unread active open_cmds open_cmds_machine awaiting_n awaiting_ids condition
     local shogun_threshold ntfy_threshold elapsed excl_note
-    local held_threshold held_elapsed
+    local held_threshold held_elapsed repeat_threshold
     local msg msg_actionable held_msg
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
@@ -580,13 +580,23 @@ check_once() {
         # shogun（見通し）の両方へ通知する。将軍への通知は既存のまま
         # 減らさず、karo宛を追加するのみ。900秒(既定)継続で無条件に発火する。
         # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
+        #
+        # 【cmd_208/措置C・再武装】BATON_NOTIFIEDは0/1のスカラではなく
+        # 「最後に通知したepoch」を保持する。0は「この継続ではまだ
+        # 通知していない」ことを表す（elseブランチでのリセットと同じ
+        # 意味を保つ）。同一の連続停止がbaton_lost_repeat_after_sec
+        # （既定900秒）を超えて続く場合は再通知する——従来「一度吠えたら
+        # 条件が崩れるまで永久に黙る」潜在欠陥（措置Aの節で確認済みの
+        # 自己給餌しない性質により、警報自体は条件を崩さない）への手当て。
         shogun_threshold=$(baton_watchdog_query baton_lost_after_sec)
-        if [ "$elapsed" -ge "$shogun_threshold" ] && [ "$BATON_NOTIFIED" -eq 0 ]; then
+        repeat_threshold=$(baton_watchdog_query baton_lost_repeat_after_sec)
+        if [ "$elapsed" -ge "$shogun_threshold" ] \
+            && { [ "$BATON_NOTIFIED" -eq 0 ] || [ $((now - BATON_NOTIFIED)) -ge "$repeat_threshold" ]; }; then
             msg="baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
             msg_actionable="$msg"
             baton_watchdog_notify_inbox karo   "$msg_actionable"
             baton_watchdog_notify_inbox shogun "$msg"
-            BATON_NOTIFIED=1
+            BATON_NOTIFIED=$now
         fi
 
         # 副経路: ntfy（主のスマホ）。長引いた場合のみ・独立した閾値
