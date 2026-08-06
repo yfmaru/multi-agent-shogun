@@ -4,15 +4,12 @@
 # instructions/roles/<role>_role.md + instructions/common/*.md の
 # 見出し食い違いを機械的に検出するスクリプトのテスト。
 #
-# baseline (a=85 / b=20) について:
+# baseline (a=85 / b=26) について:
 #   cmd_203 の内容突合（T2）が未着手の現時点における「既知の食い違い」
 #   の件数である。ゼロであることは検査しない——ゼロを求めるのはT2の
 #   職掌であり、本テストの役目は「これ以上こっそり増えていないか」を
 #   機械的に見張ることにある（再発防止）。T2でreconciliationが進めば、
 #   このbaseline自体を該当PRで更新すること。
-#   （2026-08-06 cmd_203 T2b: gunshiのgen-only 8→2の解消によりb=26→20。
-#   T2a/T2c/T2d着地時も同様の更新が要る。並行ブランチ間でこの数値行が
-#   競合する可能性があるため、マージ時に実測し直すこと）
 
 setup_file() {
     export PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
@@ -51,12 +48,12 @@ setup() {
     [ "$a_count" = "85" ] || { echo "expected 85, got: $total_line"; false; }
 }
 
-@test "parity: known drift baseline — gen-only(b) total is 20" {
+@test "parity: known drift baseline — gen-only(b) total is 26" {
     run bash "$SCRIPT"
     total_line=$(printf '%s\n' "$output" | grep '=== TOTAL ===')
     [ -n "$total_line" ] || { printf '%s\n' "$output"; false; }
     b_count=$(printf '%s\n' "$total_line" | sed -n 's/.*gen-only(b)=\([0-9]*\).*/\1/p')
-    [ "$b_count" = "20" ] || { echo "expected 20, got: $total_line"; false; }
+    [ "$b_count" = "26" ] || { echo "expected 26, got: $total_line"; false; }
 }
 
 @test "parity: --role shogun limits output to a single role section" {
