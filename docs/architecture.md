@@ -25,7 +25,7 @@ Special cases (CLI commands sent via `tmux send-keys`):
 | 2〜4 min | Escape×2 + recovery nudge | Copilot/Kimi use Escape×2 + Ctrl-C + nudge. Claude/Codex/OpenCode use a plain nudge instead |
 | 4 min+ | `/clear` sent (max once per 5 min) | Force session reset + YAML re-read |
 
-# Context Layers
+## Context Layers
 
 ```
 Layer 1: Claude Codeのファイルメモリ — memory/MEMORY.md + 個別メモリ。全Claudeエージェントへ自動注入される
@@ -37,6 +37,6 @@ Layer 4: Session context — volatile (CLAUDE.md auto-loaded, instructions/*.md,
 **履歴**: Layer 1はMemory MCPだったが、2026-08-06 cmd_204で不採用とした
 （entities 0/relations 0の空の器であり、Claude Codeのファイルメモリと二重化していたため）。
 
-# Project Management
+## Project Management
 
 System manages ALL white-collar work, not just self-improvement. Project folders can be external (outside this repo). `projects/` is git-ignored (contains secrets).

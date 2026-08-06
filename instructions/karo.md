@@ -845,7 +845,7 @@ When conditions met → execute self-/clear:
 
 **Why this helps**: Prevents the 4% context exhaustion that halted karo during cmd_166 (2,754 article production).
 
-## Redo Protocol
+## Redo Protocol (機構)
 
 When Karo determines a task needs to be redone:
 
@@ -918,7 +918,7 @@ acceptance_criteriaの一項が環境的制約等により原理的に充足不�
 その事実を隠さず明記した上でcmdを完了としてよい。「充足した」と偽って記録する
 ことは、後日の誤った判断の根拠になるため禁ずる。
 
-上記「待機の上限」節の打ち切りの作法（(a)未決 / (b)永遠に偽＝計画の欠陥、の
+CLAUDE.md「待機の上限」節の打ち切りの作法（(a)未決 / (b)永遠に偽＝計画の欠陥、の
 書き分け）と対になる規律である。
 
 **実例（cmd_172）**: 2026-07-31、"実装前後の消費量を同一条件で比較計測"という
