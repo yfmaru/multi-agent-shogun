@@ -16,7 +16,9 @@ setup_file() {
 
     export WATCHER_SCRIPT="$PROJECT_ROOT/scripts/inbox_watcher.sh"
     export INBOX_WRITE_SCRIPT="$PROJECT_ROOT/scripts/inbox_write.sh"
-    export ASHIGARU_INSTR="$PROJECT_ROOT/instructions/generated/codex-ashigaru.md"
+    # MANDATORY Post-Task Inbox Check lives in CLAUDE.md (auto-loaded by
+    # every Claude agent including ashigaru), not in instructions/ashigaru.md.
+    export ASHIGARU_INSTR="$PROJECT_ROOT/CLAUDE.md"
 
     [ -f "$WATCHER_SCRIPT" ] || return 1
     [ -f "$INBOX_WRITE_SCRIPT" ] || return 1
