@@ -273,6 +273,56 @@ for c in cmds:
 PY
 }
 
+# awaiting: lord を持たない開いた(status != done) cmd の id を1行1件で返す
+# （cmd_208・措置D）。open_cmds_machine（番犬が実際に鳴いた根拠そのもの）
+# の内訳をkaro宛の文面へ名指しで含めるために使う——「open_cmds=2」という
+# 状態の記述だけでは、受け取った者がどのcmdを見に行けばよいか分からない
+# （gunshi_design_208.yaml 措置D・premortem失敗シナリオ1）。
+# baton_watchdog_list_awaiting_lord_cmd_ids と対をなす関数であり、
+# 「除外される側」と「除外されない側」を同じ様式で返す。
+# ファイル欠損・壊れた YAML でも空を返すのみで決して非0で落ちない。
+baton_watchdog_list_open_machine_cmd_ids() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" <<'PY'
+import sys
+
+try:
+    import yaml
+except Exception:
+    raise SystemExit(0)
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+cmds = data.get("commands")
+if cmds is None:
+    cmds = data.get("cmds")
+if isinstance(cmds, dict):
+    cmds = list(cmds.values())
+if not isinstance(cmds, list):
+    cmds = []
+
+for c in cmds:
+    if not isinstance(c, dict):
+        continue
+    if c.get("status") == "done":
+        continue
+    if c.get("awaiting") == "lord":
+        continue
+    cid = c.get("id")
+    if cid:
+        print(cid)
+PY
+}
+
 # awaiting: lord を持つ開いた(status != done) cmdについて、
 # "cmd_id<TAB>awaiting_sinceのepoch秒(無ければ空文字)" を1行1件で返す
 # （cmd_197/OBS-61-1是正）。安全網の計時をプロセスの生存時間ではなく
@@ -546,7 +596,7 @@ check_once() {
     local now unread active open_cmds open_cmds_machine awaiting_n awaiting_ids condition
     local shogun_threshold ntfy_threshold elapsed excl_note
     local held_threshold held_elapsed repeat_threshold
-    local msg msg_actionable held_msg
+    local msg msg_actionable held_msg open_machine_ids
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -593,7 +643,12 @@ check_once() {
         if [ "$elapsed" -ge "$shogun_threshold" ] \
             && { [ "$BATON_NOTIFIED" -eq 0 ] || [ $((now - BATON_NOTIFIED)) -ge "$repeat_threshold" ]; }; then
             msg="baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
-            msg_actionable="$msg"
+            # 【cmd_208/措置D】karo宛は状態の記述で終わらせず、対象cmd_idの
+            # 列挙と次の一手（CLAUDE.md「待機の成立条件」の実測2コマンドの
+            # 趣旨）を含める。将軍宛の$msgは従来どおり状態記述のまま
+            # （中継先である将軍向けの簡潔さを変えない）。
+            open_machine_ids=$(baton_watchdog_list_open_machine_cmd_ids | paste -sd, -)
+            msg_actionable="${msg} 対象cmd: ${open_machine_ids}。各cmdについて、待っている対象を1回実測し、成就していれば直ちに進め、未決ならバトンの保持者を明示せよ。"
             baton_watchdog_notify_inbox karo   "$msg_actionable"
             baton_watchdog_notify_inbox shogun "$msg"
             BATON_NOTIFIED=$now
