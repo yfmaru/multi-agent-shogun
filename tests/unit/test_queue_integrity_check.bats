@@ -212,18 +212,43 @@ EOF
     [[ "$output" == *"shogun_to_karo.yaml"* ]] || { echo "$output"; false; }
 }
 
-@test "runs against the real queue/shogun_to_karo.yaml within a reasonable time budget" {
-    real_file="$PROJECT_ROOT/queue/shogun_to_karo.yaml"
-    [ -f "$real_file" ] || skip "queue/shogun_to_karo.yaml not present in this checkout"
+@test "runs within a reasonable time budget on a file sized like the real queue/shogun_to_karo.yaml" {
+    # queue/shogun_to_karo.yaml is gitignored (queue/ is per-instance runtime
+    # state, not tracked), so it never exists in a clean checkout -- CI
+    # included. SKIP=FAIL policy (CLAUDE.md Test Rules) forbids skipping this
+    # test when the file is absent, so we synthesize a same-scale fixture
+    # instead: ~200 entries with multi-line prose fields, matching the real
+    # file's measured ~1900 lines / 140KB (gunshi_design_211 AC#5).
+    big_file="$TEST_TMPDIR/big.yaml"
+    {
+        echo "commands:"
+        for i in $(seq 1 200); do
+            cat <<EOF
+  - id: cmd_$i
+    timestamp: "2026-08-01T00:00:00"
+    north_star: |
+      これは実物ファイルの分量感を再現するための多行プレーンテキストである。
+      性能計測はこの規模のフィクスチャに対して行う。
+    project: multi-agent-shogun
+    priority: medium
+    status: done
+    karo_note: |
+      2026-08-01 00:00 dummy note line one.
+      2026-08-01 00:01 dummy note line two.
+EOF
+        done
+    } > "$big_file"
 
     start_ns=$(date +%s%N)
-    run run_check "$real_file"
+    run run_check "$big_file"
     end_ns=$(date +%s%N)
     elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
     echo "elapsed_ms=${elapsed_ms} exit_status=${status}"
-    # Target from gunshi_design_211 AC#5 measurement is ~15ms; a generous
-    # 2000ms bound avoids CI-runner flakiness while still catching any
-    # accidental O(n^2) blowup.
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    # Target from gunshi_design_211 AC#5 measurement against the real file is
+    # ~15-35ms of check logic; a generous 2000ms bound (incl. interpreter
+    # startup) avoids CI-runner flakiness while still catching an accidental
+    # O(n^2) blowup.
     [ "$elapsed_ms" -lt 2000 ] || { echo "too slow: ${elapsed_ms}ms"; false; }
 }
