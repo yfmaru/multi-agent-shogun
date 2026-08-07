@@ -110,6 +110,32 @@ agent_is_busy_check() {
         return 0  # busy — status bar confirms active processing
     fi
 
+    # ── Modal footer check (cmd_209 AC2 / v5) ──
+    # Claude Code paints its TUI with absolute cursor positioning, so a modal
+    # footer wider than the pane is split by the APP itself, not by tmux.
+    # -J only rejoins rows tmux itself wrapped, so the footer stays split and
+    # the last non-empty row ("cancel") carries no 'esc to' — the check above
+    # misses it. Measured blind band: pane widths 39-50 (footer is 51 cols);
+    # production ashigaru3-7/gunshi panes are 44 (queue/reports/
+    # gunshi_design_209_v5_redesign.yaml M-2/M-3).
+    #
+    # Live-verified 2026-08-08 by opening a real AskUserQuestion modal in an
+    # isolated width-44 tmux pane (subtask_209_v5_modal_footer_fix Step 0):
+    # the footer renders as its own bottom-most contiguous non-empty block —
+    # separated from the option list above it by exactly one blank line —
+    # and no other UI element (e.g. the idle-time permission hint row) is
+    # present while the modal is open. Rejoin that bottom block with NO
+    # separator (a terminal wrap inserts none; a space would split
+    # "Esc t"+"o cancel" back apart at widths 39-43) and look for a
+    # modal-footer anchor in it. These anchor strings never occur in spinner
+    # text, so T-BUSY-008's false-busy scenario stays unreachable and the
+    # last-line rule above is untouched.
+    local bottom_block
+    bottom_block=$(echo "$pane_tail" | awk 'NF{b=b $0} !NF{b=""} END{print b}')
+    if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓'; then
+        return 0  # busy — an interactive modal is waiting for input
+    fi
+
     # ── Idle checks ──
     # Codex idle prompt
     if echo "$pane_tail" | grep -qE '(\? for shortcuts|context left)'; then
