@@ -122,6 +122,9 @@ scripts/seo_qc.sh
 !scripts/stale_issue_audit.sh
 !scripts/queue_integrity_check.sh
 !scripts/queue_integrity_check.py
+!scripts/queue_integrity_snapshot.sh
+!scripts/queue_integrity_post_check.sh
+!scripts/prune_snapshots.sh
 
 # SayTask (sample template only, not actual data)
 !saytask/
