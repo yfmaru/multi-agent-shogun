@@ -273,6 +273,56 @@ for c in cmds:
 PY
 }
 
+# awaiting: lord を持たない開いた(status != done) cmd の id を1行1件で返す
+# （cmd_208・措置D）。open_cmds_machine（番犬が実際に鳴いた根拠そのもの）
+# の内訳をkaro宛の文面へ名指しで含めるために使う——「open_cmds=2」という
+# 状態の記述だけでは、受け取った者がどのcmdを見に行けばよいか分からない
+# （gunshi_design_208.yaml 措置D・premortem失敗シナリオ1）。
+# baton_watchdog_list_awaiting_lord_cmd_ids と対をなす関数であり、
+# 「除外される側」と「除外されない側」を同じ様式で返す。
+# ファイル欠損・壊れた YAML でも空を返すのみで決して非0で落ちない。
+baton_watchdog_list_open_machine_cmd_ids() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" <<'PY'
+import sys
+
+try:
+    import yaml
+except Exception:
+    raise SystemExit(0)
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+cmds = data.get("commands")
+if cmds is None:
+    cmds = data.get("cmds")
+if isinstance(cmds, dict):
+    cmds = list(cmds.values())
+if not isinstance(cmds, list):
+    cmds = []
+
+for c in cmds:
+    if not isinstance(c, dict):
+        continue
+    if c.get("status") == "done":
+        continue
+    if c.get("awaiting") == "lord":
+        continue
+    cid = c.get("id")
+    if cid:
+        print(cid)
+PY
+}
+
 # awaiting: lord を持つ開いた(status != done) cmdについて、
 # "cmd_id<TAB>awaiting_sinceのepoch秒(無ければ空文字)" を1行1件で返す
 # （cmd_197/OBS-61-1是正）。安全網の計時をプロセスの生存時間ではなく
@@ -545,7 +595,8 @@ baton_watchdog_notify_inbox() {
 check_once() {
     local now unread active open_cmds open_cmds_machine awaiting_n awaiting_ids condition
     local shogun_threshold ntfy_threshold elapsed excl_note
-    local held_threshold held_elapsed
+    local held_threshold held_elapsed repeat_threshold
+    local msg msg_actionable held_msg open_machine_ids
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -575,12 +626,32 @@ check_once() {
             excl_note=" (人待ち除外 ${awaiting_n}件: ${awaiting_ids})"
         fi
 
-        # 主経路: 将軍inbox通知。900秒(既定)継続で無条件に発火する。
+        # 主経路（cmd_208/措置A・宛先の二重化）: karo（手を打てる者）と
+        # shogun（見通し）の両方へ通知する。将軍への通知は既存のまま
+        # 減らさず、karo宛を追加するのみ。900秒(既定)継続で無条件に発火する。
         # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
+        #
+        # 【cmd_208/措置C・再武装】BATON_NOTIFIEDは0/1のスカラではなく
+        # 「最後に通知したepoch」を保持する。0は「この継続ではまだ
+        # 通知していない」ことを表す（elseブランチでのリセットと同じ
+        # 意味を保つ）。同一の連続停止がbaton_lost_repeat_after_sec
+        # （既定900秒）を超えて続く場合は再通知する——従来「一度吠えたら
+        # 条件が崩れるまで永久に黙る」潜在欠陥（措置Aの節で確認済みの
+        # 自己給餌しない性質により、警報自体は条件を崩さない）への手当て。
         shogun_threshold=$(baton_watchdog_query baton_lost_after_sec)
-        if [ "$elapsed" -ge "$shogun_threshold" ] && [ "$BATON_NOTIFIED" -eq 0 ]; then
-            baton_watchdog_notify_shogun "baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
-            BATON_NOTIFIED=1
+        repeat_threshold=$(baton_watchdog_query baton_lost_repeat_after_sec)
+        if [ "$elapsed" -ge "$shogun_threshold" ] \
+            && { [ "$BATON_NOTIFIED" -eq 0 ] || [ $((now - BATON_NOTIFIED)) -ge "$repeat_threshold" ]; }; then
+            msg="baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
+            # 【cmd_208/措置D】karo宛は状態の記述で終わらせず、対象cmd_idの
+            # 列挙と次の一手（CLAUDE.md「待機の成立条件」の実測2コマンドの
+            # 趣旨）を含める。将軍宛の$msgは従来どおり状態記述のまま
+            # （中継先である将軍向けの簡潔さを変えない）。
+            open_machine_ids=$(baton_watchdog_list_open_machine_cmd_ids | paste -sd, -)
+            msg_actionable="${msg} 対象cmd: ${open_machine_ids}。各cmdについて、待っている対象を1回実測し、成就していれば直ちに進め、未決ならバトンの保持者を明示せよ。"
+            baton_watchdog_notify_inbox karo   "$msg_actionable"
+            baton_watchdog_notify_inbox shogun "$msg"
+            BATON_NOTIFIED=$now
         fi
 
         # 副経路: ntfy（主のスマホ）。長引いた場合のみ・独立した閾値
@@ -635,10 +706,15 @@ check_once() {
 
         if [ "$held_elapsed" -ge "$held_threshold" ] && [ "$BATON_HELD_NOTIFIED" -eq 0 ]; then
             if [ -n "$awaiting_ids" ]; then
-                baton_watchdog_notify_shogun "baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${awaiting_ids}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
+                held_msg="baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${awaiting_ids}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
             else
-                baton_watchdog_notify_shogun "baton_lost(human-held): unread=0 active=0 open_cmds=${open_cmds}(人待ちの印なし)が${held_threshold}s+滞留。主の手番が本当に続いているか確かめよ"
+                held_msg="baton_lost(human-held): unread=0 active=0 open_cmds=${open_cmds}(人待ちの印なし)が${held_threshold}s+滞留。主の手番が本当に続いているか確かめよ"
             fi
+            # 【cmd_208/措置B】既存の将軍宛はそのまま維持し、karo宛を追加する
+            # のみ。この文面は「印の外し忘れかを確かめよ」であり、印を実際に
+            # 外せる家老が受け取ってこそ意味を成す。
+            baton_watchdog_notify_inbox karo "$held_msg"
+            baton_watchdog_notify_shogun "$held_msg"
             BATON_HELD_NOTIFIED=1
         fi
     else

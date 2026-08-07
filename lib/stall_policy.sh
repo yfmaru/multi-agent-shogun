@@ -131,9 +131,18 @@ DEFAULT_BATON_WATCHDOG = {
     # cmd_197: cmd側の任意フィールド `awaiting: lord` による除外(check_once)
     # 専用の長い安全網。除外は「発報を止める」のではなく「急かす間隔を
     # 延ばす」だけであることの実体——印が付いたまま丸1日超放置されたら
-    # 印の正誤にかかわらず必ず発火する。baton_b4c_machine_stale_after_sec
-    # と同じ考え方(主の長期ご不在を想定した網)であり、既定値も揃える。
-    "baton_lost_human_held_after_sec": 86400,
+    # 印の正誤にかかわらず必ず発火する。
+    # 【cmd_208/措置B是正】既定を86400→3600へ。実測失敗尺（cmd_203/cmd_204
+    # の人待ち印が実は機械の手番だったまま12時間09分すり抜けた件）が
+    # 24時間の網より小さく、従来の既定ではこの型の失敗を原理的に
+    # 捕まえられなかった（gunshi_design_208.yaml G-2）。
+    "baton_lost_human_held_after_sec": 3600,
+    # cmd_208/措置C: 同一の連続停止(baton_lost条件が崩れずに続いている間)に
+    # ついて、この秒数ごとに再通知する（再武装）。従来のBATON_NOTIFIEDは
+    # 0/1のスカラで、一度発報すると条件が崩れるまで永久に黙る潜在欠陥が
+    # あった（gunshi_design_208.yaml 措置C。今回実測した6件では継続が
+    # 15〜19分と短く発現しなかったが、潜在的には残る）。
+    "baton_lost_repeat_after_sec": 900,
     "usage_warn_pct": 80,
     "usage_resume_below_pct": 50,
     "usage_check_interval_sec": 300,
@@ -157,7 +166,7 @@ def policy_get(key):
 
 if query in ("enabled", "periodic_clear_enabled"):
     print("true" if policy_get(query) is True else "false")
-elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec"):
+elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec", "baton_lost_repeat_after_sec"):
     print(int(policy_get(query)))
 elif query == "periodic_clear_agents":
     agents = policy_get(query)
