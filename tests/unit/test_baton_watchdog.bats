@@ -91,6 +91,10 @@
 #   W-2: 外部印が揃えばexternal_wait:文面(target/checkを含む)、1件でも欠ければbaton_lost:のまま
 #   W-3a/b: 外部待ちの再通知間隔(既定3600s)未満は再通知せず、超えたら再通知する
 #   W-3c: awaiting_budget_sec超過で通常モードへ戻り、文面に予算超過が明記される
+#   W-3d【G-1回帰固定・PR#86 QC是正】: 超過→家老が予算引き上げ→予算内に戻る→
+#        再び超過、という同一継続内のシナリオでも、2度目の超過でntfyが
+#        再発火すること(BATON_EXTERNAL_BUDGET_NTFY_SENTの掃除ループが
+#        「超過0件」のtickでも走らねばならない)
 #   W-4: awaiting_target/awaiting_check/awaiting_sinceのいずれか欠落は印を無効にする(通常モードのまま)
 #
 # 【cmd_208後続 E-3: 静穏帯・gunshi_design_208_e3_quiet_hours.yaml】
@@ -3505,6 +3509,72 @@ YAML
     grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
     grep -q "外部待ち予算超過: cmd_208 が3mを超えた" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
     ! grep -q "external_wait:" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- W-3d【G-1回帰固定】: 超過→予算引上げ→再超過が同一継続内で起きても再発火する ---
+#
+# 軍師QC(PR#86)発見のG-1: BATON_EXTERNAL_BUDGET_NTFY_SENTの掃除ループが
+# 「今tick超過cmdが1件以上」のif文の内側にあったため、超過0件のtick
+# (=予算引上げで一時的に予算内へ戻った直後)では掃除が走らずフラグが
+# 残存し、次の超過で再発火しないという「静かな握り潰し」を新たな入口
+# から作り込んでいた。是正は掃除ループをif文の外へ出すことのみ。
+
+@test "W-3d: external_budget_exceeded ntfy re-fires after a budget raise brings it back under, then exceeds again (G-1 regression)" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 900 )) '+%Y-%m-%dT%H:%M:%S')"  # 900s経過で以後固定
+
+    # tick1: 予算180s → 900s経過は超過
+    cat > "$TEST_TMPDIR/tick1.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+    awaiting_budget_sec: 180
+YAML
+    # tick2: 家老が予算を1200sへ引き上げ → 900s経過は予算内に戻る
+    cat > "$TEST_TMPDIR/tick2.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+    awaiting_budget_sec: 1200
+YAML
+    # tick3: 新予算300sも超過(継続は途切れていない)
+    cat > "$TEST_TMPDIR/tick3.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+    awaiting_budget_sec: 300
+YAML
+
+    cp "$TEST_TMPDIR/tick1.yaml" "$FIXTURE_ROOT/queue/shogun_to_karo.yaml"
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+        echo TICK1_NTFY:\$(grep -c '予算.*超過' '$NOTIFY_LOG')
+        cp '$TEST_TMPDIR/tick2.yaml' '$FIXTURE_ROOT/queue/shogun_to_karo.yaml'
+        check_once
+        echo TICK2_NTFY:\$(grep -c '予算.*超過' '$NOTIFY_LOG')
+        cp '$TEST_TMPDIR/tick3.yaml' '$FIXTURE_ROOT/queue/shogun_to_karo.yaml'
+        check_once
+        echo TICK3_NTFY:\$(grep -c '予算.*超過' '$NOTIFY_LOG')
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "^TICK1_NTFY:1$" || { echo "tick1: expected 1st budget-exceeded ntfy"; echo "$output"; cat "$NOTIFY_LOG"; false; }
+    echo "$output" | grep -q "^TICK2_NTFY:1$" || { echo "tick2: budget raised back under budget, must not add a new ntfy"; echo "$output"; cat "$NOTIFY_LOG"; false; }
+    echo "$output" | grep -q "^TICK3_NTFY:2$" || { echo "G-1 regression: re-exceeding after a budget raise must re-fire ntfy, not be silently swallowed"; echo "$output"; cat "$NOTIFY_LOG"; false; }
 }
 
 # --- W-4: 必須欄(target/check/since)いずれかの欠落は印を無効にする ---

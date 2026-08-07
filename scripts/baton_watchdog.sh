@@ -1105,8 +1105,8 @@ check_once() {
         # baton_ntfy_emit_or_defer がTSVへ退避し、明けの1通に畳まれる
         # (ntfy_flush_deferred_once・呼び出しはcheck_onceの外)。
         # 同一の継続超過につき1回のみ(BATON_EXTERNAL_BUDGET_NTFY_SENT)。
+        local -A __ext_exceeded_now=()
         if [ "${#external_budget_exceeded[@]}" -gt 0 ]; then
-            local -A __ext_exceeded_now=()
             for row in "${external_budget_exceeded[@]}"; do
                 IFS=$'\t' read -r ext_cmd_id ext_target ext_check ext_elapsed ext_budget_val <<< "$row"
                 __ext_exceeded_now[$ext_cmd_id]=1
@@ -1118,12 +1118,12 @@ check_once() {
                     BATON_EXTERNAL_BUDGET_NTFY_SENT[$ext_cmd_id]=1
                 fi
             done
-            for ext_cmd_id in "${!BATON_EXTERNAL_BUDGET_NTFY_SENT[@]}"; do
-                if [ -z "${__ext_exceeded_now[$ext_cmd_id]:-}" ]; then
-                    unset 'BATON_EXTERNAL_BUDGET_NTFY_SENT[$ext_cmd_id]'
-                fi
-            done
         fi
+        for ext_cmd_id in "${!BATON_EXTERNAL_BUDGET_NTFY_SENT[@]}"; do
+            if [ -z "${__ext_exceeded_now[$ext_cmd_id]:-}" ]; then
+                unset 'BATON_EXTERNAL_BUDGET_NTFY_SENT[$ext_cmd_id]'
+            fi
+        done
 
         # 副経路: ntfy（主のスマホ）。長引いた場合のみ・独立した閾値
         # (既定1800秒)。失敗許容 — 失敗してもログに残すのみで将軍inbox
