@@ -146,11 +146,8 @@ A unified instruction build system generates CLI-specific instruction files from
 ```
 instructions/
 ├── common/              # Shared rules (all CLIs)
-├── cli_specific/        # CLI-specific tool descriptions
-│   ├── claude_tools.md  # Claude Code tools & features
-│   ├── copilot_tools.md # GitHub Copilot CLI tools & features
-│   ├── opencode_tools.md # OpenCode tools, agent frontmatter, and permission model
-│   └── cursor_tools.md  # Cursor Agent tools, skills, and session rules
+├── cli_specific/        # CLI-specific tool descriptions (only files build_instructions.sh reads belong here)
+│   └── opencode_tools.md # OpenCode tools, agent frontmatter, and permission model
 └── roles/               # Role definitions (shogun, karo, ashigaru)
     ↓ build
 CLAUDE.md / AGENTS.md / .github/copilot-instructions.md / .opencode/agents/*.md / .cursor/rules/*.md
@@ -1672,9 +1669,8 @@ multi-agent-shogun/
 │   ├── karo.md               # Karo instructions
 │   ├── ashigaru.md           # Ashigaru instructions
 │   ├── gunshi.md             # Gunshi (strategist) instructions
-│   └── cli_specific/         # CLI-specific tool descriptions
-│       ├── claude_tools.md   # Claude Code tools & features
-│       └── copilot_tools.md  # GitHub Copilot CLI tools & features
+│   └── cli_specific/         # CLI-specific tool descriptions (only files build_instructions.sh reads belong here)
+│       └── opencode_tools.md # OpenCode tools, agent frontmatter, and permission model
 │
 ├── lib/
 │   ├── agent_status.sh       # Shared busy/idle detection (Claude Code + Codex + OpenCode)

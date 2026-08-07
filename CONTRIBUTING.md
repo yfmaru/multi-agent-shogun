@@ -64,10 +64,7 @@ multi-agent-shogun/
 │   ├── shogun.md         # Shogun (commander) instructions
 │   ├── karo.md           # Karo (manager) instructions
 │   ├── ashigaru.md       # Ashigaru (worker) instructions
-│   ├── cli_specific/     # CLI-specific tool descriptions
-│   │   ├── claude_tools.md
-│   │   ├── codex_tools.md
-│   │   ├── copilot_tools.md
+│   ├── cli_specific/     # CLI-specific tool descriptions (referenced by build_instructions.sh)
 │   │   └── opencode_tools.md
 │   └── generated/        # Built from templates (do not edit manually)
 │
@@ -118,7 +115,7 @@ multi-agent-shogun/
 | Directory | Purpose | Important Notes |
 |-----------|---------|-----------------|
 | `scripts/` | Core system utilities | All scripts must pass shellcheck |
-| `instructions/` | Agent behavior | CLI-specific instructions go in `cli_specific/` |
+| `instructions/` | Agent behavior | CLI-specific instructions go in `cli_specific/`. Before adding a new file there, wire it into `scripts/build_instructions.sh` first — a file with no referrer is dead weight (cmd_213) |
 | `lib/` | Shared libraries | `cli_adapter.sh` handles CLI abstraction |
 | `queue/` | Runtime data | Git-ignored, generated at runtime |
 | `templates/` | Reusable templates | Used for reports and context files |
