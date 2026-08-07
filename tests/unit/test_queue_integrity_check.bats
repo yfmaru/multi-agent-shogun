@@ -201,6 +201,13 @@ EOF
     mkdir -p "$TEST_TMPDIR/repo/scripts" "$TEST_TMPDIR/repo/queue"
     cp "$PROJECT_ROOT/scripts/queue_integrity_check.sh" "$TEST_TMPDIR/repo/scripts/"
     cp "$PROJECT_ROOT/scripts/queue_integrity_check.py" "$TEST_TMPDIR/repo/scripts/"
+    # Reuse the real repo's PyYAML-equipped venv (set up once in CI) instead
+    # of falling back to the bare `python3` on PATH, whose PyYAML
+    # availability varies by runner (present on ubuntu-latest, absent on
+    # macos-latest -- this is exactly what broke this test before).
+    if [ -d "$PROJECT_ROOT/.venv" ]; then
+        ln -s "$PROJECT_ROOT/.venv" "$TEST_TMPDIR/repo/.venv"
+    fi
     cat > "$TEST_TMPDIR/repo/queue/shogun_to_karo.yaml" <<'EOF'
 commands:
   - id: cmd_A
