@@ -453,7 +453,7 @@ wsl --install
 | スクリプト | 用途 | 実行タイミング |
 |-----------|------|---------------|
 | `install.bat` | Windows: WSL2 + Ubuntu のセットアップ | 初回のみ |
-| `first_setup.sh` | tmux、Node.js、Claude Code CLI のインストール + Memory MCP設定 | 初回のみ |
+| `first_setup.sh` | tmux、Node.js、Claude Code CLI のインストール | 初回のみ |
 | `shutsujin_departure.sh` | tmuxセッション作成 + エージェントごとの設定済みCLI起動 + 指示書読み込み + ntfyリスナー起動 | 毎日 |
 | `scripts/switch_cli.sh` | エージェントのCLI/モデルをライブ切替（settings.yaml → /exit → 再起動） | 必要時 |
 
@@ -1489,9 +1489,8 @@ cp config/ntfy_auth.env.sample config/ntfy_auth.env
 │      │                                                              │
 │      ├── tmuxのチェック/インストール                                  │
 │      ├── Node.js v20+のチェック/インストール (nvm経由)                │
-│      ├── Claude Code CLIのチェック/インストール（ネイティブ版）       │
-│      │       ※ npm版検出時はネイティブ版への移行を提案                │
-│      └── Memory MCPサーバー設定                                      │
+│      └── Claude Code CLIのチェック/インストール（ネイティブ版）       │
+│              ※ npm版検出時はネイティブ版への移行を提案                │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                      毎日の起動（毎日実行）                           │
@@ -1669,7 +1668,7 @@ multi-agent-shogun/
 │   ├── shogun-model-switch/  # ライブCLI/モデル切替
 │   └── shogun-readme-sync/   # README同期
 │
-├── memory/                   # Memory MCP保存場所
+├── memory/                   # SHOGUN_LEDGER.md保存場所
 ├── dashboard.md              # リアルタイム状況一覧
 └── CLAUDE.md                 # システム指示書（自動読み込み）
 ```
@@ -1749,11 +1748,11 @@ MCPツールは「遅延ロード」方式で、最初にロードが必要で�
 
 ```
 # 間違い - ツールがロードされていない
-mcp__memory__read_graph()  ← エラー！
+mcp__github__get_pull_request_status()  ← エラー！
 
 # 正しい - 先にロード
-ToolSearch("select:mcp__memory__read_graph")
-mcp__memory__read_graph()  ← 動作！
+ToolSearch("select:mcp__github__get_pull_request_status")
+mcp__github__get_pull_request_status()  ← 動作！
 ```
 
 </details>
