@@ -872,31 +872,31 @@ Efficient knowledge sharing through a four-layer context system:
 | Layer 3: YAML Queue | `queue/shogun_to_karo.yaml`, `queue/tasks/`, `queue/reports/` | Task management — source of truth for instructions and reports |
 | Layer 4: Session | CLAUDE.md, instructions/*.md | Working context (wiped by `/clear`) |
 
-#### Persistent Agent Memory (`memory/MEMORY.md`)
+#### Persistent Agent Memory (`memory/SHOGUN_LEDGER.md`)
 
-Shogun reads `memory/MEMORY.md` at every session start. It contains Lord's preferences, lessons learned, and cross-session knowledge — written by Shogun, read by Shogun.
+Shogun reads `memory/SHOGUN_LEDGER.md` at every session start. It contains Lord's preferences, lessons learned, and cross-session knowledge — written by Shogun, read by Shogun.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Git Repositories                          │
-│                                                              │
-│  ┌─────────────────────┐   ┌──────────────────────────┐    │
-│  │  multi-agent-shogun │   │      shogun-private        │    │
-│  │       (public OSS)  │   │   (your private repo)      │    │
-│  │                     │   │                            │    │
-│  │ scripts/            │   │ projects/client.yaml  ←──┐ │    │
-│  │ instructions/       │   │ context/my-notes.md   ←──┤ │    │
-│  │ lib/                │   │ queue/shogun_to_karo.yaml │ │    │
-│  │ memory/             │   │ memory/MEMORY.md      ←──┘ │    │
-│  │  ├─ MEMORY.md.sample│   │ config/settings.yaml       │    │
-│  │  └─ MEMORY.md  ─────┼───┼── same file, tracked here  │    │
-│  │     (gitignored)    │   │                            │    │
-│  └─────────────────────┘   └──────────────────────────┘    │
-│         ↑ anyone can fork        ↑ your data, your repo      │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ Git Repositories                                                    │
+│                                                                     │
+│  ┌─────────────────────────────┐   ┌──────────────────────────────┐ │
+│  │ multi-agent-shogun          │   │ shogun-private               │ │
+│  │ (public OSS)                │   │ (your private repo)          │ │
+│  │                             │   │                              │ │
+│  │ scripts/                    │   │ projects/client.yaml         │ │
+│  │ instructions/               │   │ context/my-notes.md          │ │
+│  │ lib/                        │   │ queue/shogun_to_karo.yaml    │ │
+│  │ memory/                     │   │ memory/SHOGUN_LEDGER.md      │ │
+│  │ ├─ SHOGUN_LEDGER.md.sample  │   │ config/settings.yaml         │ │
+│  │ └─ SHOGUN_LEDGER.md         │   │ (same file, tracked here)    │ │
+│  │ (gitignored)                │   │                              │ │
+│  └─────────────────────────────┘   └──────────────────────────────┘ │
+│         ↑ anyone can fork                ↑ your data, your repo     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**How it works:** `memory/MEMORY.md` lives in the same working directory as the OSS repo, but is excluded from the OSS `.gitignore` (whitelist-based). You track it in a separate private repo using a bare git repo technique:
+**How it works:** `memory/SHOGUN_LEDGER.md` lives in the same working directory as the OSS repo, but is excluded from the OSS `.gitignore` (whitelist-based). You track it in a separate private repo using a bare git repo technique:
 
 ```bash
 # One-time setup (already done by first_setup.sh)
@@ -905,12 +905,12 @@ alias privategit='git --git-dir=$HOME/.shogun-private.git --work-tree=/path/to/m
 privategit remote add origin https://github.com/YOU/shogun-private.git
 
 # Daily use
-privategit add -f memory/MEMORY.md projects/my-client.yaml
+privategit add -f memory/SHOGUN_LEDGER.md projects/my-client.yaml
 privategit commit -m "update memory"
 privategit push
 ```
 
-The OSS `.gitignore` uses a **whitelist approach** (default: exclude everything, then explicitly allow OSS files). So private files like `memory/MEMORY.md` are automatically excluded without needing explicit `gitignore` entries — just don't add them to the whitelist.
+The OSS `.gitignore` uses a **whitelist approach** (default: exclude everything, then explicitly allow OSS files). So private files like `memory/SHOGUN_LEDGER.md` are automatically excluded without needing explicit `gitignore` entries — just don't add them to the whitelist.
 
 This design enables:
 - Any Ashigaru can work on any project
@@ -1427,11 +1427,6 @@ claude mcp add github -e GITHUB_PERSONAL_ACCESS_TOKEN=your_pat_here -- npx -y @m
 
 # 4. Sequential Thinking - Step-by-step reasoning for complex problems
 claude mcp add sequential-thinking -- npx -y @modelcontextprotocol/server-sequential-thinking
-
-# 5. Memory - Cross-session long-term memory (recommended!)
-# ✅ Auto-configured by first_setup.sh
-# To reconfigure manually:
-claude mcp add memory -e MEMORY_FILE_PATH="$PWD/memory/shogun_memory.jsonl" -- npx -y @modelcontextprotocol/server-memory
 ```
 
 ### Verify installation

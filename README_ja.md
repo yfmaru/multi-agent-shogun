@@ -63,7 +63,7 @@ bash shutsujin_departure.sh                # 全エージェント起動
 **なぜ使うのか？**
 - 1つの命令で、7体のAIワーカー+1体の軍師が並列で実行
 - 待ち時間なし - タスクがバックグラウンドで実行中も次の命令を出せる
-- AIがセッションを跨いであなたの好みを記憶（Memory MCP）
+- AIがセッションを跨いであなたの好みを記憶（`memory/SHOGUN_LEDGER.md`）
 - ダッシュボードでリアルタイム進捗確認
 
 ```
@@ -649,13 +649,13 @@ bash scripts/switch_cli.sh ashigaru3 --type opencode --model openrouter/minimax/
 
 | 引き継がれるもの | 保存先 | 参照タイミング |
 |------------------|--------|----------------|
-| 殿の好み・教訓 | Memory MCP（永続） | 全エージェントの Session Start 時 |
+| 殿の好み・教訓 | `memory/SHOGUN_LEDGER.md`（永続） | 全エージェントの Session Start 時 |
 | プロジェクト固有知識 | `context/{name}.md` | 該当案件の cmd 実行時 |
 | 過去の cmd 履歴 | `queue/shogun_to_karo.yaml` | 将軍が必要時に参照 |
 | カスタムスキル | `~/.claude/skills/`, `skills/` | 関連 trigger 発火時 |
 | エージェント構成 | `config/settings.yaml` | shutsujin 起動時 |
 
-特に **Memory MCP** が「経験値」の中心。殿が「次から〇〇しないで」「△△を覚えとけ」と言えば、将軍が自動的に Memory MCP に記録し、新しい案件でも継続して参照します。
+特に **`memory/SHOGUN_LEDGER.md`**（台帳）が「経験値」の中心。殿が「次から〇〇しないで」「△△を覚えとけ」と言えば、将軍が自動的に台帳へ記録し、新しい案件でも継続して参照します。
 
 ### 詳細なフロー
 
@@ -711,15 +711,15 @@ bash scripts/switch_cli.sh ashigaru3 --type opencode --model openrouter/minimax/
 
 長いタスクの完了を待つ必要はありません。
 
-### 🧠 3. セッション間記憶（Memory MCP）
+### 🧠 3. セッション間記憶（`memory/SHOGUN_LEDGER.md`）
 
 AIがあなたの好みを記憶します：
 
 ```
 セッション1: 「シンプルな方法が好き」と伝える
-            → Memory MCPに保存
+            → memory/SHOGUN_LEDGER.md に保存
 
-セッション2: 起動時にAIがメモリを読み込む
+セッション2: 起動時にAIが台帳を読み込む
             → 複雑な方法を提案しなくなる
 ```
 
@@ -868,7 +868,7 @@ screenshot:
 
 | レイヤー | 場所 | 用途 |
 |---------|------|------|
-| Layer 1: Memory MCP | `memory/shogun_memory.jsonl` | プロジェクト横断・セッションを跨ぐ長期記憶 |
+| Layer 1: 台帳 | `memory/SHOGUN_LEDGER.md` | プロジェクト横断・セッションを跨ぐ長期記憶 |
 | Layer 2: Project | `config/projects.yaml`, `projects/<id>.yaml`, `context/{project}.md` | プロジェクト固有情報・技術知見 |
 | Layer 3: YAML Queue | `queue/shogun_to_karo.yaml`, `queue/tasks/`, `queue/reports/` | タスク管理・指示と報告の正データ |
 | Layer 4: Session | CLAUDE.md, instructions/*.md | 作業中コンテキスト（/clearで破棄） |
@@ -887,7 +887,7 @@ screenshot:
 
 1. CLAUDE.md（自動読み込み）→ shogunシステムの一員と認識
 2. `tmux display-message -t "$TMUX_PANE" -p '#{@agent_id}'` → 自分の番号を確認
-3. Memory MCP 読み込み → 殿の好みを復元（~700トークン）
+3. `memory/SHOGUN_LEDGER.md` 読み込み → 殿の好みを復元（~700トークン）
 4. タスクYAML 読み込み → 次の仕事を確認（~800トークン）
 
 「何を読ませないか」の設計がコスト削減に効いている。
@@ -1352,7 +1352,6 @@ MCP（Model Context Protocol）サーバはClaudeの機能を拡張します。�
 MCPサーバはClaudeに外部ツールへのアクセスを提供します：
 - **Notion MCP** → Notionページの読み書き
 - **GitHub MCP** → PR作成、Issue管理
-- **Memory MCP** → セッション間で記憶を保持
 
 ### MCPサーバのインストール
 
@@ -1371,11 +1370,6 @@ claude mcp add github -e GITHUB_PERSONAL_ACCESS_TOKEN=your_pat_here -- npx -y @m
 
 # 4. Sequential Thinking - 複雑な問題を段階的に思考
 claude mcp add sequential-thinking -- npx -y @modelcontextprotocol/server-sequential-thinking
-
-# 5. Memory - セッション間の長期記憶（推奨！）
-# ✅ first_setup.sh で自動設定済み
-# 手動で再設定する場合:
-claude mcp add memory -e MEMORY_FILE_PATH="$PWD/memory/shogun_memory.jsonl" -- npx -y @modelcontextprotocol/server-memory
 ```
 
 ### インストール確認

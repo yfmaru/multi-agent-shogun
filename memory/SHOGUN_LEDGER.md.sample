@@ -1,0 +1,43 @@
+# Shogun Memory — Persistent Agent Context
+
+This file persists across sessions and is read by the Shogun agent at startup.
+`memory/SHOGUN_LEDGER.md` is gitignored — your private data never enters the OSS repo.
+
+---
+
+### What to put in SHOGUN_LEDGER.md
+- Your profile (GitHub, X, etc.)
+- Stable behavioral rules for Shogun
+- CLI and agent configuration
+- Active project references and URLs
+- TODO backlog
+
+---
+
+## Lord's Basic Info
+
+- **X (Twitter)**: @your_handle
+- **GitHub**: your-username
+
+## Shogun Core Rules (read every session)
+
+<!-- Add stable behavioral rules discovered through use -->
+
+## CLI Notes
+
+| CLI | Config file | Reset cmd | Notes |
+|-----|------------|-----------|-------|
+| Claude Code | CLAUDE.md | /clear | Stop hook for inbox delivery |
+
+## Agent Config
+
+<!-- Ashigaru CLI assignments, model config -->
+
+## Project Index
+
+<!-- Active projects and their YAML paths -->
+<!-- Format: - project-name: projects/foo.yaml (brief status) -->
+
+## TODO
+
+<!-- Persistent backlog items -->
