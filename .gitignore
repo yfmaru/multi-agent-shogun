@@ -120,6 +120,8 @@ scripts/seo_qc.sh
 !scripts/compute_daily_consumption.py
 !scripts/task_complete.sh
 !scripts/stale_issue_audit.sh
+!scripts/queue_integrity_check.sh
+!scripts/queue_integrity_check.py
 
 # SayTask (sample template only, not actual data)
 !saytask/
