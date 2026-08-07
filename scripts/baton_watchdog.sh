@@ -80,6 +80,12 @@ BATON_HELD_NOTIFIED=0  # 安全網通知を同一継続で二重送信しない�
 declare -A BATON_HELD_SINCE_FALLBACK=()  # cmd_id -> epoch（awaiting_sinceを持たぬ旧形式の印に対する、
                                           # このプロセス内限定のフォールバック起点。cmd_197/OBS-61-1是正）
 
+# cmd_208後続(awaiting:external): 外部待ち予算超過の際に発するE-3 ntfy
+# （baton_ntfy_emit_or_defer経由）を同一の継続超過につき1回に留めるための
+# ガード。cmd_idごと。当該cmdが超過状態でなくなれば（awaiting外れ・cmd完了・
+# since再設定等）そのキーは毎tick除去され、次の超過時は新規として扱う。
+declare -A BATON_EXTERNAL_BUDGET_NTFY_SENT=()
+
 # ─── 使用量監視 (cmd_181) プロセスローカル状態 ───
 USAGE_LAST_CHECK_AT=0
 declare -A USAGE_WARNED_WINDOW=()   # label -> 予告済み枠の reset epoch
@@ -394,6 +400,97 @@ for c in cmds:
 PY
 }
 
+# awaiting: external を持つ開いた(status != done) cmdについて、
+# "cmd_id<TAB>awaiting_target<TAB>awaiting_check<TAB>awaiting_sinceのepoch秒<TAB>awaiting_budget_sec"
+# を1行1件で返す（gunshi_design_208_awaiting_external.yaml §3.2）。
+#
+# 【必須欄・design §3.1】awaiting_target・awaiting_check・awaiting_since
+# のいずれかが欠落/解釈不能なcmdは、この関数の出力から一切除外する
+# （＝呼び出し側からは「印なし」と見分けが付かない）。「何を待ち、
+# どう確かめるか」を書けない待機に印を付けさせないための歯止めであり、
+# W-4の直接の実装対象である。awaiting: lord用の
+# baton_watchdog_list_awaiting_lord_with_since と異なり、awaiting_since
+# 欠落時のフォールバック計時は行わない——外部待ちは「予算超過で必ず
+# 通常モードへ戻る」性質を持つため、起点が不明なまま予算判定を続ける
+# 方が「欠落は印を無効にする」というW-4の規律に反する。
+# ファイル欠損・壊れた YAML でも空を返すのみで決して非0で落ちない。
+baton_watchdog_list_external_wait_cmds() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" <<'PY'
+import sys
+from datetime import datetime, timezone
+
+try:
+    import yaml
+except Exception:
+    raise SystemExit(0)
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+cmds = data.get("commands")
+if cmds is None:
+    cmds = data.get("cmds")
+if isinstance(cmds, dict):
+    cmds = list(cmds.values())
+if not isinstance(cmds, list):
+    cmds = []
+
+
+def parse_ts(value):
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc)
+
+
+def clean(v):
+    # TAB・改行は列(TSV)を壊すため除去する
+    if not isinstance(v, str):
+        return ""
+    return v.replace("\t", " ").replace("\n", " ").strip()
+
+
+for c in cmds:
+    if not isinstance(c, dict):
+        continue
+    if c.get("status") == "done":
+        continue
+    if c.get("awaiting") != "external":
+        continue
+    cid = c.get("id")
+    if not cid:
+        continue
+    target = clean(c.get("awaiting_target"))
+    check = clean(c.get("awaiting_check"))
+    dt = parse_ts(c.get("awaiting_since"))
+    if not target or not check or dt is None:
+        continue
+    epoch = str(int(dt.timestamp()))
+    budget = c.get("awaiting_budget_sec")
+    budget_str = str(int(budget)) if isinstance(budget, (int, float)) and not isinstance(budget, bool) else ""
+    print(f"{cid}\t{target}\t{check}\t{epoch}\t{budget_str}")
+PY
+}
+
 # 印付き(awaiting: lord)の開いたcmdのうち、最も古いawaiting_sinceからの
 # 経過秒数（＝最も長く滞留している印の年齢）を返す（cmd_197/OBS-61-1是正）。
 # 計時の出所をプロセスローカル変数(BATON_HELD_SINCE)からcmd自身の
@@ -591,12 +688,285 @@ baton_watchdog_notify_inbox() {
     bash "$ROOT/scripts/inbox_write.sh" "$target" "$message" baton_alert baton_watchdog
 }
 
+# ═══════════════════════════════════════════════════════════════
+# cmd_208後続 E-3: 静穏帯付きntfy (gunshi_design_208_e3_quiet_hours.yaml)
+#
+# 主のご裁可「外部待ち予算超過はntfyで主を起こす。ただし時間帯を限って
+# 鳴らす」の実装。触ってよいのは「ntfy副経路の送信タイミング」
+# ただ1点のみ——将軍inbox主経路・open_cmds_machineの条件判定・既存の
+# ntfy経路(baton_lost/D-1/B-4b/B-4c)には一切触れない(§2 invariants)。
+#
+# 静穏帯は「延期」であって「抑止」ではない。静穏帯中に検知した事象は
+# queue/ntfy_deferred.tsv へ退避し、明けた最初のtickで必ず一度、
+# ダイジェストとして将軍inboxとntfyの両方へ出す(ntfy_flush_deferred_once)。
+# 番犬プロセスが watcher_supervisor により入れ替わっても失われない
+# よう、計時・退避内容はすべてファイル(TSV)側に持たせ、プロセスローカル
+# 変数には一切依存しない(cmd_197/OBS-61-1と同じ轍を踏まぬための選択)。
+# ═══════════════════════════════════════════════════════════════
+
+# HHMM（4桁・純関数・時計に触れない）が [start, end) の静穏帯内かを返す。
+# start==end は「静穏帯なし」の明示的な無効化手段として常に外と判定する。
+# start<end は日をまたがない通常区間、start>end は日跨ぎ(23:00-07:00等)。
+baton_ntfy_hm_in_window() {
+    # 10# を必ず付ける。付けねば "0800" が8進数と解釈され
+    # "value too great for base" で番犬が落ちる(bashの古典的な罠)。
+    local now start end
+    now=$((10#$1)) start=$((10#$2)) end=$((10#$3))
+    [ "$start" -ne "$end" ] || return 1
+    if [ "$start" -lt "$end" ]; then
+        [ "$now" -ge "$start" ] && [ "$now" -lt "$end" ]
+    else
+        [ "$now" -ge "$start" ] || [ "$now" -lt "$end" ]
+    fi
+}
+
+# HHMM同士の幅(分)を返す(純関数)。桁を跨ぐ減算を避けるため、
+# 必ず hh*60+mm へ直してから引く(design §3.3(b)の明示的な訂正)。
+baton_ntfy_window_span_min() {
+    local start="$1" end="$2" sh sm eh em start_min end_min
+    sh=$((10#${start:0:2})) sm=$((10#${start:2:2}))
+    eh=$((10#${end:0:2}))   em=$((10#${end:2:2}))
+    start_min=$((sh * 60 + sm))
+    end_min=$((eh * 60 + em))
+    echo $(( (end_min - start_min + 1440) % 1440 ))
+}
+
+# 時計を読む唯一の箇所(★)。TZは周囲の環境変数に依存させず、設定値
+# baton_ntfy_quiet_tz を TZ= として明示的に与える——番犬は
+# watcher_supervisor.shが起動する常駐プロセスであり環境のTZを暗黙に
+# 継ぐ。もしTZがUTCのままなら「23:00-07:00」はJSTの08:00-16:00を
+# 黙らせる最悪の反転が起きる(design §4)。テストはこの関数を上書きする。
+baton_ntfy_now_hm() {
+    local tz
+    tz=$(baton_watchdog_query baton_ntfy_quiet_tz)
+    TZ="$tz" date +%H%M
+}
+
+# いま静穏帯内かを返す。設定の読み取り失敗・値の破損・幅の逸脱は
+# すべて「静穏帯なし」(=鳴る側)へ倒す(§3.4のフェイルセーフの向き)。
+baton_ntfy_in_quiet_hours() {
+    [ "$(baton_watchdog_query baton_ntfy_quiet_enabled)" = "true" ] || return 1
+    local start end span max_span
+    start=$(baton_watchdog_query baton_ntfy_quiet_start | tr -d ':')
+    end=$(baton_watchdog_query baton_ntfy_quiet_end | tr -d ':')
+    span=$(baton_ntfy_window_span_min "$start" "$end")
+    max_span=$(baton_watchdog_query baton_ntfy_quiet_max_span_min)
+    if [ "$span" -ge "$max_span" ]; then
+        # 静穏帯が新しい消音装置に化けぬための歯止め。「静穏帯を24時間に
+        # 広げて黙らせる」を設定ミス・出来心の双方で不可能にする。
+        echo "[$(date '+%F %T %Z %z')] [baton_watchdog/ntfy] quiet window too wide (${span}min >= ${max_span}min); quiet hours DISABLED" >&2
+        return 1
+    fi
+    baton_ntfy_hm_in_window "$(baton_ntfy_now_hm)" "$start" "$end"
+}
+
+baton_ntfy_deferred_path() {
+    echo "$ROOT/queue/ntfy_deferred.tsv"
+}
+
+baton_ntfy_deferred_ensure() {
+    local f
+    f=$(baton_ntfy_deferred_path)
+    mkdir -p "$(dirname "$f")"
+    [ -f "$f" ] || : > "$f"
+}
+
+# 退避キューへ1行upsertする(kind+cmd_id・未送出行が対象)。tmp+mvによる
+# 原子的置換。番犬はwatcher_supervisorが単一インスタンスとして起動する
+# 設計ゆえロックは要らない。8時間の静穏帯中に毎分呼ばれても行数が
+# 増えない(occurrencesが積み増されるのみ)ことがQ-3の要である。
+# 上限(baton_ntfy_deferred_max_entries)に達した新規kind+cmd_idは、
+# 専用行 kind=overflow に畳む(§3.5)。
+baton_ntfy_deferred_upsert() {
+    local kind="$1" cmd_id="$2" message="$3"
+    local f now max_entries tmp
+    local -a out_lines=()
+    local found=0 overflow_idx=-1 open_count=0
+    local l_kind l_cmd l_det l_last l_occ l_flushed l_msg
+
+    f=$(baton_ntfy_deferred_path)
+    baton_ntfy_deferred_ensure
+    now=$(date +%s)
+    max_entries=$(baton_watchdog_query baton_ntfy_deferred_max_entries)
+
+    while IFS=$'\t' read -r l_kind l_cmd l_det l_last l_occ l_flushed l_msg; do
+        [ -n "$l_kind" ] || continue
+        if [ "$l_flushed" = "0" ]; then
+            open_count=$((open_count + 1))
+        fi
+        if [ "$l_kind" = "$kind" ] && [ "$l_cmd" = "$cmd_id" ] && [ "$l_flushed" = "0" ]; then
+            l_last=$now
+            l_occ=$((l_occ + 1))
+            found=1
+        fi
+        if [ "$l_kind" = "overflow" ] && [ "$l_flushed" = "0" ]; then
+            overflow_idx=${#out_lines[@]}
+        fi
+        out_lines+=("${l_kind}"$'\t'"${l_cmd}"$'\t'"${l_det}"$'\t'"${l_last}"$'\t'"${l_occ}"$'\t'"${l_flushed}"$'\t'"${l_msg}")
+    done < "$f"
+
+    if [ "$found" -eq 0 ]; then
+        if [ "$open_count" -ge "$max_entries" ]; then
+            if [ "$overflow_idx" -ge 0 ]; then
+                IFS=$'\t' read -r l_kind l_cmd l_det l_last l_occ l_flushed l_msg <<< "${out_lines[$overflow_idx]}"
+                l_last=$now
+                l_occ=$((l_occ + 1))
+                out_lines[$overflow_idx]="${l_kind}"$'\t'"${l_cmd}"$'\t'"${l_det}"$'\t'"${l_last}"$'\t'"${l_occ}"$'\t'"${l_flushed}"$'\t'"${l_msg}"
+            else
+                out_lines+=("overflow"$'\t'"-"$'\t'"${now}"$'\t'"${now}"$'\t'"1"$'\t'"0"$'\t'"上限到達により以後の別cmdは畳まれた")
+            fi
+        else
+            out_lines+=("${kind}"$'\t'"${cmd_id}"$'\t'"${now}"$'\t'"${now}"$'\t'"1"$'\t'"0"$'\t'"${message}")
+        fi
+    fi
+
+    tmp="${f}.tmp.$$"
+    : > "$tmp"
+    if [ "${#out_lines[@]}" -gt 0 ]; then
+        printf '%s\n' "${out_lines[@]}" >> "$tmp"
+    fi
+    mv "$tmp" "$f"
+}
+
+# 唯一の出口。呼び手は静穏帯を意識しない。静穏帯外なら即座に
+# branch_policy_notify(従来どおり失敗許容)。静穏帯内ならTSVへ退避する。
+# 将軍inboxへの通知は呼び手側で既に済んでいる(この関数はntfy専用)。
+baton_ntfy_emit_or_defer() {
+    local kind="$1" cmd_id="$2" message="$3"
+    message=$(printf '%s' "$message" | tr '\t\n' '  ')
+
+    if ! baton_ntfy_in_quiet_hours; then
+        if ! branch_policy_notify "$message"; then
+            echo "[$(date '+%F %T %Z %z')] [baton_watchdog/ntfy] emit failed (branch_policy_notify non-zero): kind=${kind} cmd_id=${cmd_id}" >&2
+        fi
+        return 0
+    fi
+
+    local end
+    end=$(baton_watchdog_query baton_ntfy_quiet_end)
+    echo "[$(date '+%F %T %Z %z')] [baton_watchdog/ntfy] deferred until ${end}: kind=${kind} cmd_id=${cmd_id}" >&2
+    baton_ntfy_deferred_upsert "$kind" "$cmd_id" "$message"
+}
+
+# 明けたら必ず一度、しかも一度だけ出す。check_once()の外(メインループ・
+# --once双方の末尾)から毎tick呼ばれる——baton条件が朝までに崩れていても
+# 明けの1通は出さねばならないため、check_onceの内側には置かない(design
+# §3.7)。将軍inboxへの1回書き込み(4)を、ntfyを試す(5)より先に置く。
+# ntfyが死んでいても「明けたら一度出す」は成立せねばならない
+# (cmd_172の二経路化の思想そのまま)。
+ntfy_flush_deferred_once() {
+    local f
+    f=$(baton_ntfy_deferred_path)
+    baton_ntfy_deferred_ensure
+
+    local l_kind l_cmd l_det l_last l_occ l_flushed l_msg
+    local has_pending=0
+    while IFS=$'\t' read -r l_kind l_cmd l_det l_last l_occ l_flushed l_msg; do
+        [ -n "$l_kind" ] || continue
+        if [ "$l_flushed" = "0" ]; then
+            has_pending=1
+            break
+        fi
+    done < "$f"
+    [ "$has_pending" -eq 1 ] || return 0
+
+    # まだ静穏帯が明けていない。退避を続ける。
+    baton_ntfy_in_quiet_hours && return 0
+
+    # ── 3. ダイジェストを組む(detected_epoch昇順・最大5件表示) ──
+    local -a rows=()
+    while IFS=$'\t' read -r l_kind l_cmd l_det l_last l_occ l_flushed l_msg; do
+        [ -n "$l_kind" ] || continue
+        [ "$l_flushed" = "0" ] || continue
+        rows+=("${l_det}"$'\t'"${l_kind}"$'\t'"${l_cmd}"$'\t'"${l_occ}"$'\t'"${l_msg}")
+    done < "$f"
+
+    local -a sorted=()
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        sorted+=("$row")
+    done < <(printf '%s\n' "${rows[@]}" | sort -t $'\t' -k1,1n)
+
+    local total=${#sorted[@]} shown i=0
+    shown=$total
+    [ "$shown" -le 5 ] || shown=5
+
+    local start end
+    start=$(baton_watchdog_query baton_ntfy_quiet_start)
+    end=$(baton_watchdog_query baton_ntfy_quiet_end)
+
+    local digest="external_wait 予算超過(静穏帯保留 ${total}件・${start}-${end}):"
+    local row det kind cmd occ msg hhmm shown_count=0 overflow_count=0
+    for row in "${sorted[@]}"; do
+        IFS=$'\t' read -r det kind cmd occ msg <<< "$row"
+        if [ "$kind" = "overflow" ]; then
+            overflow_count=$((overflow_count + occ))
+            continue
+        fi
+        i=$((i + 1))
+        [ "$i" -le "$shown" ] || continue
+        shown_count=$((shown_count + 1))
+        hhmm=$(date -d "@$det" '+%H:%M')
+        digest="${digest}
+[${shown_count}] ${cmd} ${msg} — ${hhmm}検知/以後${occ}回"
+    done
+    if [ "$total" -gt "$shown" ]; then
+        digest="${digest}
+他 $((total - shown))件（上限到達）"
+    fi
+    if [ "$overflow_count" -gt 0 ]; then
+        digest="${digest}
+（別途 上限到達により畳まれた事象 ${overflow_count}回）"
+    fi
+    digest="${digest}
+※検知時点の情報。既に決着している可能性あり。各行の「確認:」を1回実行せよ。"
+
+    # ── 4. 将軍inboxへ1回(主経路。ntfyの成否に依存しない)。5より先。──
+    baton_watchdog_notify_shogun "$digest"
+
+    # ── 5. ntfyを1回試す(副経路・失敗許容)。──
+    if ! branch_policy_notify "$digest"; then
+        echo "[$(date '+%F %T %Z %z')] [baton_watchdog/ntfy] digest notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+    fi
+
+    # ── 6・7. 全未送出行のflushed_epochを埋め、7日超の行を剪定する。──
+    local now prune_before
+    now=$(date +%s)
+    prune_before=$((now - 7 * 86400))
+    local -a final_lines=()
+    while IFS=$'\t' read -r l_kind l_cmd l_det l_last l_occ l_flushed l_msg; do
+        [ -n "$l_kind" ] || continue
+        if [ "$l_flushed" = "0" ]; then
+            l_flushed=$now
+        fi
+        [ "$l_flushed" -ge "$prune_before" ] || continue
+        final_lines+=("${l_kind}"$'\t'"${l_cmd}"$'\t'"${l_det}"$'\t'"${l_last}"$'\t'"${l_occ}"$'\t'"${l_flushed}"$'\t'"${l_msg}")
+    done < "$f"
+
+    local tmp="${f}.tmp.$$"
+    : > "$tmp"
+    if [ "${#final_lines[@]}" -gt 0 ]; then
+        printf '%s\n' "${final_lines[@]}" >> "$tmp"
+    fi
+    mv "$tmp" "$f"
+}
+
 # 1回だけ判定する。メインループ・--once どちらからも呼ばれる。
 check_once() {
     local now unread active open_cmds open_cmds_machine awaiting_n awaiting_ids condition
     local shogun_threshold ntfy_threshold elapsed excl_note
     local held_threshold held_elapsed repeat_threshold
     local msg msg_actionable held_msg open_machine_ids
+
+    # cmd_208後続(awaiting:external・gunshi_design_208_awaiting_external.yaml
+    # §3.2)専用のローカル変数。open_cmds_machineの条件判定には一切触れず、
+    # 「発報すると決めた後」の文面・間隔だけを差し替えるために使う。
+    local external_mode external_n mid row
+    local ext_cmd_id ext_t ext_c ext_since ext_budget
+    local ext_target ext_check ext_since_epoch ext_budget_val ext_elapsed
+    local ext_elapsed_min ext_budget_min ext_default_budget ext_first ext_lines
+    local -A ext_by_id=()
+    local -a external_budget_exceeded=()  # "cmd_id<TAB>target<TAB>check<TAB>elapsed<TAB>budget" 1行1件
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -626,32 +996,133 @@ check_once() {
             excl_note=" (人待ち除外 ${awaiting_n}件: ${awaiting_ids})"
         fi
 
-        # 主経路（cmd_208/措置A・宛先の二重化）: karo（手を打てる者）と
-        # shogun（見通し）の両方へ通知する。将軍への通知は既存のまま
-        # 減らさず、karo宛を追加するのみ。900秒(既定)継続で無条件に発火する。
-        # ntfy_topic の設定有無やntfy到達可否には一切影響されない。
-        #
-        # 【cmd_208/措置C・再武装】BATON_NOTIFIEDは0/1のスカラではなく
-        # 「最後に通知したepoch」を保持する。0は「この継続ではまだ
-        # 通知していない」ことを表す（elseブランチでのリセットと同じ
-        # 意味を保つ）。同一の連続停止がbaton_lost_repeat_after_sec
-        # （既定900秒）を超えて続く場合は再通知する——従来「一度吠えたら
-        # 条件が崩れるまで永久に黙る」潜在欠陥（措置Aの節で確認済みの
-        # 自己給餌しない性質により、警報自体は条件を崩さない）への手当て。
+        # ── cmd_208後続: awaiting:external（除外ではなく文面・間隔の差替）──
+        # 【最重要・除外にするな】open_cmds_machineの条件判定(直前のif)には
+        # 一切触れない。ここで判定するのは「発報すると決めた後」の文面・
+        # 間隔のみである。開いている機械側cmd(open_cmds_machineの母集合)が
+        # 全件、有効な外部印(awaiting_target・awaiting_check・
+        # awaiting_sinceの3欄すべてあり・予算内)を持つ場合に限り
+        # 外部待ちモード。1件でも印なし/予算超過があれば通常モードへ
+        # 落ちる(baton_condition=trueのままで、変わるのは文面と間隔だけ)。
+        ext_by_id=()
+        while IFS=$'\t' read -r ext_cmd_id ext_t ext_c ext_since ext_budget; do
+            [ -n "$ext_cmd_id" ] || continue
+            ext_by_id[$ext_cmd_id]="${ext_t}"$'\t'"${ext_c}"$'\t'"${ext_since}"$'\t'"${ext_budget}"
+        done < <(baton_watchdog_list_external_wait_cmds)
+
+        external_mode=true
+        external_n=0
+        external_budget_exceeded=()
+        ext_default_budget=$(baton_watchdog_query baton_external_default_budget_sec)
+
+        while IFS= read -r mid; do
+            [ -n "$mid" ] || continue
+            external_n=$((external_n + 1))
+            if [ -z "${ext_by_id[$mid]:-}" ]; then
+                external_mode=false
+                continue
+            fi
+            IFS=$'\t' read -r ext_target ext_check ext_since_epoch ext_budget_val <<< "${ext_by_id[$mid]}"
+            [ -n "$ext_budget_val" ] || ext_budget_val=$ext_default_budget
+            ext_elapsed=$((now - ext_since_epoch))
+            [ "$ext_elapsed" -ge 0 ] || ext_elapsed=0
+            if [ "$ext_elapsed" -ge "$ext_budget_val" ]; then
+                external_mode=false
+                external_budget_exceeded+=("${mid}"$'\t'"${ext_target}"$'\t'"${ext_check}"$'\t'"${ext_elapsed}"$'\t'"${ext_budget_val}")
+            fi
+        done < <(baton_watchdog_list_open_machine_cmd_ids)
+        [ "$external_n" -gt 0 ] || external_mode=false
+
         shogun_threshold=$(baton_watchdog_query baton_lost_after_sec)
-        repeat_threshold=$(baton_watchdog_query baton_lost_repeat_after_sec)
-        if [ "$elapsed" -ge "$shogun_threshold" ] \
-            && { [ "$BATON_NOTIFIED" -eq 0 ] || [ $((now - BATON_NOTIFIED)) -ge "$repeat_threshold" ]; }; then
+
+        if [ "$external_mode" = true ]; then
+            # 外部待ちモード: 文面差し替え・再通知間隔差し替え(既定3600s)。
+            ext_lines="" ext_first=true
+            while IFS= read -r mid; do
+                [ -n "$mid" ] || continue
+                IFS=$'\t' read -r ext_target ext_check ext_since_epoch ext_budget_val <<< "${ext_by_id[$mid]}"
+                [ -n "$ext_budget_val" ] || ext_budget_val=$ext_default_budget
+                ext_elapsed=$((now - ext_since_epoch))
+                [ "$ext_elapsed" -ge 0 ] || ext_elapsed=0
+                ext_elapsed_min=$((ext_elapsed / 60))
+                ext_budget_min=$((ext_budget_val / 60))
+                if [ "$ext_first" = true ]; then
+                    ext_first=false
+                else
+                    ext_lines="${ext_lines} / "
+                fi
+                ext_lines="${ext_lines}${mid} 対象: ${ext_target} 経過${ext_elapsed_min}m/予算${ext_budget_min}m 確認: ${ext_check}"
+            done < <(baton_watchdog_list_open_machine_cmd_ids)
+
+            msg="external_wait: 外部待ち${external_n}件 ${ext_lines} を1回実行せよ。決着していれば直ちに進め、未決なら予算内である旨をkaro_noteへ記せ"
+            msg_actionable="$msg"
+            repeat_threshold=$(baton_watchdog_query baton_external_repeat_after_sec)
+        else
+            # 通常モード(従来どおり)。外部待ち予算超過があれば末尾に明記する
+            # （黙って通常モードへ落とさない。design §3.2-4）。
             msg="baton_lost: unread=0 active=0 open_cmds=${open_cmds_machine}${excl_note} (${shogun_threshold}s+継続)"
+            if [ "${#external_budget_exceeded[@]}" -gt 0 ]; then
+                for row in "${external_budget_exceeded[@]}"; do
+                    IFS=$'\t' read -r ext_cmd_id ext_target ext_check ext_elapsed ext_budget_val <<< "$row"
+                    ext_budget_min=$((ext_budget_val / 60))
+                    msg="${msg} (外部待ち予算超過: ${ext_cmd_id} が${ext_budget_min}mを超えた)"
+                done
+            fi
             # 【cmd_208/措置D】karo宛は状態の記述で終わらせず、対象cmd_idの
             # 列挙と次の一手（CLAUDE.md「待機の成立条件」の実測2コマンドの
             # 趣旨）を含める。将軍宛の$msgは従来どおり状態記述のまま
             # （中継先である将軍向けの簡潔さを変えない）。
             open_machine_ids=$(baton_watchdog_list_open_machine_cmd_ids | paste -sd, -)
             msg_actionable="${msg} 対象cmd: ${open_machine_ids}。各cmdについて、待っている対象を1回実測し、成就していれば直ちに進め、未決ならバトンの保持者を明示せよ。"
+            repeat_threshold=$(baton_watchdog_query baton_lost_repeat_after_sec)
+        fi
+
+        # 主経路（cmd_208/措置A・宛先の二重化）: karo（手を打てる者）と
+        # shogun（見通し）の両方へ通知する。将軍への通知は既存のまま
+        # 減らさず、karo宛を追加するのみ。900秒(既定)継続で無条件に発火する。
+        # ntfy_topic の設定有無やntfy到達可否には一切影響されない。外部
+        # 待ちモードでも発火閾値・二重化は同一——変わるのは文面と、
+        # 直後で使う再通知間隔(repeat_threshold)のみ。
+        #
+        # 【cmd_208/措置C・再武装】BATON_NOTIFIEDは0/1のスカラではなく
+        # 「最後に通知したepoch」を保持する。0は「この継続ではまだ
+        # 通知していない」ことを表す（elseブランチでのリセットと同じ
+        # 意味を保つ）。同一の連続停止が repeat_threshold
+        # （通常900秒／外部待ち3600秒）を超えて続く場合は再通知する——
+        # 従来「一度吠えたら条件が崩れるまで永久に黙る」潜在欠陥（措置A
+        # の節で確認済みの自己給餌しない性質により、警報自体は条件を
+        # 崩さない）への手当て。
+        if [ "$elapsed" -ge "$shogun_threshold" ] \
+            && { [ "$BATON_NOTIFIED" -eq 0 ] || [ $((now - BATON_NOTIFIED)) -ge "$repeat_threshold" ]; }; then
             baton_watchdog_notify_inbox karo   "$msg_actionable"
             baton_watchdog_notify_inbox shogun "$msg"
             BATON_NOTIFIED=$now
+        fi
+
+        # ── cmd_208後続(E-3): 外部待ち予算超過のntfy(静穏帯付き) ──
+        # 予算超過ブロックの末尾。既存のntfy副経路(直後のbaton_ntfy_after_sec
+        # ブロック)には一切触れない(design 3.2-4・Q-B)。静穏帯中は
+        # baton_ntfy_emit_or_defer がTSVへ退避し、明けの1通に畳まれる
+        # (ntfy_flush_deferred_once・呼び出しはcheck_onceの外)。
+        # 同一の継続超過につき1回のみ(BATON_EXTERNAL_BUDGET_NTFY_SENT)。
+        if [ "${#external_budget_exceeded[@]}" -gt 0 ]; then
+            local -A __ext_exceeded_now=()
+            for row in "${external_budget_exceeded[@]}"; do
+                IFS=$'\t' read -r ext_cmd_id ext_target ext_check ext_elapsed ext_budget_val <<< "$row"
+                __ext_exceeded_now[$ext_cmd_id]=1
+                if [ "${BATON_EXTERNAL_BUDGET_NTFY_SENT[$ext_cmd_id]:-0}" -eq 0 ]; then
+                    ext_budget_min=$((ext_budget_val / 60))
+                    ext_elapsed_min=$((ext_elapsed / 60))
+                    baton_ntfy_emit_or_defer external_budget_exceeded "$ext_cmd_id" \
+                        "${ext_cmd_id} 対象:${ext_target} 予算${ext_budget_min}m超過(経過${ext_elapsed_min}m)。確認: ${ext_check}"
+                    BATON_EXTERNAL_BUDGET_NTFY_SENT[$ext_cmd_id]=1
+                fi
+            done
+            for ext_cmd_id in "${!BATON_EXTERNAL_BUDGET_NTFY_SENT[@]}"; do
+                if [ -z "${__ext_exceeded_now[$ext_cmd_id]:-}" ]; then
+                    unset 'BATON_EXTERNAL_BUDGET_NTFY_SENT[$ext_cmd_id]'
+                fi
+            done
         fi
 
         # 副経路: ntfy（主のスマホ）。長引いた場合のみ・独立した閾値
@@ -673,6 +1144,7 @@ check_once() {
         BATON_LOST_SINCE=0
         BATON_NOTIFIED=0
         BATON_NTFY_NOTIFIED=0
+        BATON_EXTERNAL_BUDGET_NTFY_SENT=()
     fi
 
     # ── 長い安全網（cmd_197・絶対厳守）──────────────────────
@@ -1529,6 +2001,9 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
         check_b4c_once
         periodic_clear_check_once
         check_usage_once
+        # cmd_208後続(E-3): check_onceの外。baton条件が朝までに崩れていても
+        # 静穏帯明けのダイジェストは必ず一度出さねばならないため。
+        ntfy_flush_deferred_once
         exit 0
     fi
 
@@ -1540,6 +2015,8 @@ if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
         check_b4c_once
         periodic_clear_check_once
         check_usage_once
+        # cmd_208後続(E-3): check_onceの外。理由は--once分岐と同じ。
+        ntfy_flush_deferred_once
         sleep "$(baton_watchdog_query poll_interval_sec)"
     done
 fi
