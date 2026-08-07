@@ -32,14 +32,9 @@
 !instructions/ashigaru.md
 !instructions/gunshi.md
 
-# Multi-CLI: CLI-specific tool descriptions
+# Multi-CLI: CLI-specific tool descriptions (only files build_instructions.sh reads belong here)
 !instructions/cli_specific/
-!instructions/cli_specific/claude_tools.md
-!instructions/cli_specific/codex_tools.md
-!instructions/cli_specific/copilot_tools.md
-!instructions/cli_specific/kimi_tools.md
 !instructions/cli_specific/opencode_tools.md
-!instructions/cli_specific/cursor_tools.md
 
 # Multi-CLI: CLI adapter library + ntfy auth
 !lib/
@@ -147,6 +142,7 @@ logs/
 !docs/agent_selfwatch_phases.md
 !docs/architecture.md
 !docs/incidents.md
+!docs/cli_integration_notes.md
 
 # Screenshots (masked — no secrets)
 !images/

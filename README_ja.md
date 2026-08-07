@@ -144,11 +144,8 @@ OpenCode の起動は `--agent` で生成済み `.opencode/agents/<agent_id>.md`
 ```
 instructions/
 ├── common/              # 共通ルール（全CLI共通）
-├── cli_specific/        # CLI固有のツール説明
-│   ├── claude_tools.md  # Claude Code ツール・機能
-│   ├── copilot_tools.md # GitHub Copilot CLI ツール・機能
-│   ├── opencode_tools.md # OpenCode ツール・エージェントfrontmatter・権限モデル
-│   └── cursor_tools.md  # Cursor Agent ツール・スキル・セッションルール
+├── cli_specific/        # CLI固有のツール説明（build_instructions.shが読むファイルのみ置く）
+│   └── opencode_tools.md # OpenCode ツール・エージェントfrontmatter・権限モデル
 └── roles/               # ロール定義（将軍、家老、足軽）
     ↓ ビルド
 CLAUDE.md / AGENTS.md / .github/copilot-instructions.md / .opencode/agents/*.md / .cursor/rules/*.md
@@ -1614,9 +1611,8 @@ multi-agent-shogun/
 │   ├── karo.md               # 家老の指示書
 │   ├── ashigaru.md           # 足軽の指示書
 │   ├── gunshi.md             # 軍師の指示書
-│   └── cli_specific/         # CLI固有のツール説明
-│       ├── claude_tools.md   # Claude Code ツール・機能
-│       └── copilot_tools.md  # GitHub Copilot CLI ツール・機能
+│   └── cli_specific/         # CLI固有のツール説明（build_instructions.shが読むファイルのみ置く）
+│       └── opencode_tools.md # OpenCode ツール・エージェントfrontmatter・権限モデル
 │
 ├── lib/
 │   ├── agent_status.sh       # 共有 稼働/待機 判定（Claude Code + Codex + OpenCode）
