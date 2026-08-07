@@ -146,6 +146,20 @@ DEFAULT_BATON_WATCHDOG = {
     "usage_warn_pct": 80,
     "usage_resume_below_pct": 50,
     "usage_check_interval_sec": 300,
+    # cmd_208後続(gunshi_design_208_awaiting_external.yaml §3.3): 印
+    # `awaiting: external`の再通知間隔・既定予算。除外ではなく文面と
+    # 間隔の差し替えに使う（open_cmds_machineの条件判定には無関係）。
+    "baton_external_repeat_after_sec": 3600,
+    "baton_external_default_budget_sec": 10800,
+    # cmd_208後続(gunshi_design_208_e3_quiet_hours.yaml §1・§3.1): E-3
+    # (外部待ち予算超過ntfy)専用の静穏帯。将軍inbox主経路には一切影響
+    # しない（触るのはntfy副経路の送信タイミングのみ）。
+    "baton_ntfy_quiet_enabled": True,
+    "baton_ntfy_quiet_start": "23:00",
+    "baton_ntfy_quiet_end": "07:00",
+    "baton_ntfy_quiet_tz": "Asia/Tokyo",
+    "baton_ntfy_quiet_max_span_min": 720,
+    "baton_ntfy_deferred_max_entries": 20,
 }
 
 try:
@@ -164,10 +178,12 @@ def policy_get(key):
         return DEFAULT_BATON_WATCHDOG[key]
     return value
 
-if query in ("enabled", "periodic_clear_enabled"):
+if query in ("enabled", "periodic_clear_enabled", "baton_ntfy_quiet_enabled"):
     print("true" if policy_get(query) is True else "false")
-elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec", "baton_lost_repeat_after_sec"):
+elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec", "baton_lost_repeat_after_sec", "baton_external_repeat_after_sec", "baton_external_default_budget_sec", "baton_ntfy_quiet_max_span_min", "baton_ntfy_deferred_max_entries"):
     print(int(policy_get(query)))
+elif query in ("baton_ntfy_quiet_start", "baton_ntfy_quiet_end", "baton_ntfy_quiet_tz"):
+    print(str(policy_get(query)))
 elif query == "periodic_clear_agents":
     agents = policy_get(query)
     if not isinstance(agents, list) or not agents:

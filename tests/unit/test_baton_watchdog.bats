@@ -83,6 +83,31 @@
 #   TC-208-V3【必須・回帰固定】: 番犬自身がkaro宛に書いた警報はunreadに数えない
 #   TC-208-V4: 印付きcmdが(新既定)3600秒超でhuman-held警報がkaroにも届く（措置B）
 #   TC-208-V4b: 旧既定(86400s)を明示指定すれば4000s経過では発火しない（既定値是正の直接確認）
+#
+# 【cmd_208後続: awaiting:external・gunshi_design_208_awaiting_external.yaml】
+# 除外(案A)ではなく「発報すると決めた後」の文面・間隔の差し替え(案B)。
+# open_cmds_machineの条件判定には一切触れない。
+#   W-1【最重要・回帰固定】: 外部印があってもopen_cmds_machineが減らずbaton_condition=trueになること
+#   W-2: 外部印が揃えばexternal_wait:文面(target/checkを含む)、1件でも欠ければbaton_lost:のまま
+#   W-3a/b: 外部待ちの再通知間隔(既定3600s)未満は再通知せず、超えたら再通知する
+#   W-3c: awaiting_budget_sec超過で通常モードへ戻り、文面に予算超過が明記される
+#   W-3d【G-1回帰固定・PR#86 QC是正】: 超過→家老が予算引き上げ→予算内に戻る→
+#        再び超過、という同一継続内のシナリオでも、2度目の超過でntfyが
+#        再発火すること(BATON_EXTERNAL_BUDGET_NTFY_SENTの掃除ループが
+#        「超過0件」のtickでも走らねばならない)
+#   W-4: awaiting_target/awaiting_check/awaiting_sinceのいずれか欠落は印を無効にする(通常モードのまま)
+#
+# 【cmd_208後続 E-3: 静穏帯・gunshi_design_208_e3_quiet_hours.yaml】
+# 主のご裁可「時間帯を限って鳴らす」。静穏帯は延期であって抑止ではない
+# ——将軍inbox主経路は一切止めず、ntfy副経路のみ退避し明けに必ず一度出す。
+#   Q-1: baton_ntfy_hm_in_window純関数の境界判定(0800/0900で8進罠を踏まぬこと含む)
+#   Q-2: 静穏帯中はbranch_policy_notifyを呼ばず退避キューへ1行できる
+#   Q-3: 連続呼び出しで行数が増えない(occurrencesが積算される)
+#   Q-4: 明けたら将軍inboxへ1件・ntfyへ1回、両cmd_idと確認コマンドを含み、再送されない
+#   Q-5: プロセス入替(シェル変数を引き継がぬ新プロセス)を跨いでも明けの1通が出る
+#   Q-6: ntfyが死んでいても明けの1通(将軍inbox)は出る
+#   Q-7【回帰固定・最重要】: 静穏帯の内外でcheck_onceの将軍inbox出力が完全一致する(主経路無影響)
+#   Q-8: 静穏帯の幅が上限(既定720分)以上なら無効化され鳴る側へ倒れる
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHDOG_SCRIPT="$PROJECT_ROOT/scripts/baton_watchdog.sh"
@@ -274,6 +299,26 @@ write_usage_response_broken() {
     cat > "$USAGE_RESPONSE_FILE" <<'EOF'
 not json
 EOF
+}
+
+# cmd_208後続(E-3静穏帯)専用の設定追記ヘルパー。write_settingsの直後に
+# 呼ぶこと（同一のbaton_watchdog:マッピングへキーを追記する。YAMLは
+# 同一トップレベルキー配下ならブロック途中の追記を許す）。
+# $1=quiet_enabled(true/false) $2=quiet_start(HH:MM) $3=quiet_end(HH:MM)
+# $4=quiet_max_span_min(省略時はコード側の既定720に委ねる)
+# $5=deferred_max_entries(省略時はコード側の既定20に委ねる)
+write_quiet_settings() {
+    {
+        echo "  baton_ntfy_quiet_enabled: $1"
+        echo "  baton_ntfy_quiet_start: \"$2\""
+        echo "  baton_ntfy_quiet_end: \"$3\""
+        if [ -n "${4:-}" ]; then
+            echo "  baton_ntfy_quiet_max_span_min: $4"
+        fi
+        if [ -n "${5:-}" ]; then
+            echo "  baton_ntfy_deferred_max_entries: $5"
+        fi
+    } >> "$FIXTURE_ROOT/config/settings.yaml"
 }
 
 # --- TC-BATON-001: 未読0・active0・未完cmdあり が閾値継続 → 検知 ---
@@ -3323,4 +3368,455 @@ YAML
     "
     [ "$status" -eq 0 ]
     ! grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_208後続: awaiting:external (gunshi_design_208_awaiting_external.yaml)
+# ═══════════════════════════════════════════════════════════════
+
+# --- W-1【最重要・回帰固定】: 外部印はopen_cmds_machineを減らさない ---
+
+@test "W-1: an awaiting:external marker does not shrink open_cmds_machine and baton_condition stays true" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "open_cmds_machine=1" || { echo "$output"; false; }
+    echo "$output" | grep -q "baton_condition=true" || { echo "$output"; false; }
+}
+
+# --- W-2: 印が揃えばexternal_wait:文面(target/checkを含む) ---
+
+@test "W-2: a complete external marker produces external_wait: text containing the target and check command" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "external_wait:" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "PR#84 run 123" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "gh pr checks 84" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ "$(grep -c 'INBOX_WRITE: shogun ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- W-3a/b: 再通知間隔(既定3600s)の差し替え ---
+
+@test "W-3a: no repeat notification for external_wait while under baton_external_repeat_after_sec" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+YAML
+
+    # BATON_NOTIFIEDは100秒前(既定3600s未満) → 再通知させない
+    run bash -c "
+        source '$TEST_HARNESS'
+        now=\$(date +%s)
+        BATON_LOST_SINCE=\$((now - 10))
+        BATON_NOTIFIED=\$((now - 100))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { echo "expected no repeat notification yet"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "W-3b: repeat notification fires once baton_external_repeat_after_sec is exceeded" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+YAML
+
+    # BATON_NOTIFIEDは4000秒前(既定3600s超) → 再通知させる
+    run bash -c "
+        source '$TEST_HARNESS'
+        now=\$(date +%s)
+        BATON_LOST_SINCE=\$((now - 10))
+        BATON_NOTIFIED=\$((now - 4000))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "external_wait:" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- W-3c: awaiting_budget_sec超過は通常モードへ戻り、超過を明記する ---
+
+@test "W-3c: awaiting_budget_sec exceeded falls back to normal mode with an explicit overrun note" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 900 )) '+%Y-%m-%dT%H:%M:%S')"  # 900s経過
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+    awaiting_budget_sec: 180
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "外部待ち予算超過: cmd_208 が3mを超えた" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "external_wait:" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- W-3d【G-1回帰固定】: 超過→予算引上げ→再超過が同一継続内で起きても再発火する ---
+#
+# 軍師QC(PR#86)発見のG-1: BATON_EXTERNAL_BUDGET_NTFY_SENTの掃除ループが
+# 「今tick超過cmdが1件以上」のif文の内側にあったため、超過0件のtick
+# (=予算引上げで一時的に予算内へ戻った直後)では掃除が走らずフラグが
+# 残存し、次の超過で再発火しないという「静かな握り潰し」を新たな入口
+# から作り込んでいた。是正は掃除ループをif文の外へ出すことのみ。
+
+@test "W-3d: external_budget_exceeded ntfy re-fires after a budget raise brings it back under, then exceeds again (G-1 regression)" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 900 )) '+%Y-%m-%dT%H:%M:%S')"  # 900s経過で以後固定
+
+    # tick1: 予算180s → 900s経過は超過
+    cat > "$TEST_TMPDIR/tick1.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+    awaiting_budget_sec: 180
+YAML
+    # tick2: 家老が予算を1200sへ引き上げ → 900s経過は予算内に戻る
+    cat > "$TEST_TMPDIR/tick2.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+    awaiting_budget_sec: 1200
+YAML
+    # tick3: 新予算300sも超過(継続は途切れていない)
+    cat > "$TEST_TMPDIR/tick3.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+    awaiting_budget_sec: 300
+YAML
+
+    cp "$TEST_TMPDIR/tick1.yaml" "$FIXTURE_ROOT/queue/shogun_to_karo.yaml"
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+        echo TICK1_NTFY:\$(grep -c '予算.*超過' '$NOTIFY_LOG')
+        cp '$TEST_TMPDIR/tick2.yaml' '$FIXTURE_ROOT/queue/shogun_to_karo.yaml'
+        check_once
+        echo TICK2_NTFY:\$(grep -c '予算.*超過' '$NOTIFY_LOG')
+        cp '$TEST_TMPDIR/tick3.yaml' '$FIXTURE_ROOT/queue/shogun_to_karo.yaml'
+        check_once
+        echo TICK3_NTFY:\$(grep -c '予算.*超過' '$NOTIFY_LOG')
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "^TICK1_NTFY:1$" || { echo "tick1: expected 1st budget-exceeded ntfy"; echo "$output"; cat "$NOTIFY_LOG"; false; }
+    echo "$output" | grep -q "^TICK2_NTFY:1$" || { echo "tick2: budget raised back under budget, must not add a new ntfy"; echo "$output"; cat "$NOTIFY_LOG"; false; }
+    echo "$output" | grep -q "^TICK3_NTFY:2$" || { echo "G-1 regression: re-exceeding after a budget raise must re-fire ntfy, not be silently swallowed"; echo "$output"; cat "$NOTIFY_LOG"; false; }
+}
+
+# --- W-4: 必須欄(target/check/since)いずれかの欠落は印を無効にする ---
+
+@test "W-4: a marker missing awaiting_target, awaiting_check, or awaiting_since is treated as no marker (normal mode)" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+
+    # (a) awaiting_target 欠落
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_check: "gh pr checks 84"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { echo "(a) awaiting_target欠落で発火せず"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "external_wait:" "$SHOGUN_NOTIFY_LOG" || { echo "(a) 欠落した印がexternal_waitとして扱われた"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # (b) awaiting_check 欠落
+    > "$SHOGUN_NOTIFY_LOG"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#84 run 123"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { echo "(b) awaiting_check欠落で発火せず"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "external_wait:" "$SHOGUN_NOTIFY_LOG" || { echo "(b) 欠落した印がexternal_waitとして扱われた"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # (c) awaiting_since 欠落
+    > "$SHOGUN_NOTIFY_LOG"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_208
+    status: in_progress
+    awaiting: external
+    awaiting_target: "PR#84 run 123"
+    awaiting_check: "gh pr checks 84"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { echo "(c) awaiting_since欠落で発火せず"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "external_wait:" "$SHOGUN_NOTIFY_LOG" || { echo "(c) 欠落した印がexternal_waitとして扱われた"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_208後続 E-3: 静穏帯付きntfy (gunshi_design_208_e3_quiet_hours.yaml)
+# ═══════════════════════════════════════════════════════════════
+
+# --- Q-1: baton_ntfy_hm_in_window純関数の境界判定(8進罠を含む) ---
+
+@test "Q-1: baton_ntfy_hm_in_window boundary judgement including the 0800/0900 octal-literal trap" {
+    write_settings true 5 60
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_hm_in_window 2259 2300 0700; echo \"2259:\$?\"
+        baton_ntfy_hm_in_window 2300 2300 0700; echo \"2300:\$?\"
+        baton_ntfy_hm_in_window 0300 2300 0700; echo \"0300:\$?\"
+        baton_ntfy_hm_in_window 0659 2300 0700; echo \"0659:\$?\"
+        baton_ntfy_hm_in_window 0700 2300 0700; echo \"0700:\$?\"
+        baton_ntfy_hm_in_window 0701 2300 0700; echo \"0701:\$?\"
+        baton_ntfy_hm_in_window 0800 0000 0900; echo \"0800:\$?\"
+        baton_ntfy_hm_in_window 0900 0000 0900; echo \"0900:\$?\"
+        baton_ntfy_hm_in_window 1200 0000 0000; echo \"eq:\$?\"
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "^2259:1$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^2300:0$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^0300:0$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^0659:0$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^0700:1$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^0701:1$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^0800:0$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^0900:1$" || { echo "$output"; false; }
+    echo "$output" | grep -q "^eq:1$" || { echo "$output"; false; }
+}
+
+# --- Q-2: 静穏帯中はbranch_policy_notifyを呼ばず退避キューへ1行できる ---
+
+@test "Q-2: during quiet hours, branch_policy_notify is not called and one deferred row is written" {
+    write_settings true 5 60
+    write_quiet_settings true 23:00 07:00
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_now_hm() { echo 0300; }
+        baton_ntfy_emit_or_defer external_budget_exceeded cmd_208 'message text'
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$NOTIFY_LOG" ] || { cat "$NOTIFY_LOG"; false; }
+    [ -f "$FIXTURE_ROOT/queue/ntfy_deferred.tsv" ] || { echo "deferred TSV not created"; false; }
+    [ "$(grep -c '^external_budget_exceeded' "$FIXTURE_ROOT/queue/ntfy_deferred.tsv")" -eq 1 ] || { cat "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"; false; }
+}
+
+# --- Q-3: 連続呼び出しで行数が増えず、occurrencesが積算される ---
+
+@test "Q-3: repeated calls in the same window keep the row count at 1, incrementing occurrences" {
+    write_settings true 5 60
+    write_quiet_settings true 23:00 07:00
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_now_hm() { echo 0300; }
+        for i in \$(seq 1 10); do
+            baton_ntfy_emit_or_defer external_budget_exceeded cmd_208 'msg'
+        done
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '^external_budget_exceeded' "$FIXTURE_ROOT/queue/ntfy_deferred.tsv")" -eq 1 ] || { cat "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"; false; }
+    occ=$(awk -F'\t' '$1=="external_budget_exceeded"{print $5}' "$FIXTURE_ROOT/queue/ntfy_deferred.tsv")
+    [ "$occ" = "10" ] || { echo "occurrences=$occ"; cat "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"; false; }
+}
+
+# --- Q-4: 明けたら将軍inbox1件・ntfy1回、両cmd_idと確認コマンドを含み、再送されない ---
+
+@test "Q-4: after quiet hours end, a digest reaches shogun inbox and ntfy once, contains both cmd_ids and confirm commands, and is not resent" {
+    write_settings true 5 60
+    write_quiet_settings true 23:00 07:00
+    local now
+    now=$(date +%s)
+    printf 'external_budget_exceeded\tcmd_208\t%s\t%s\t3\t0\tcmd_208 対象:PR#84。確認: gh pr checks 84\n' "$now" "$now" > "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"
+    printf 'external_budget_exceeded\tcmd_210\t%s\t%s\t1\t0\tcmd_210 対象:PR#85。確認: gh pr checks 85\n' "$now" "$now" >> "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_now_hm() { echo 0700; }
+        ntfy_flush_deferred_once
+        ntfy_flush_deferred_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: shogun external_wait 予算超過' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    [ "$(grep -c 'external_wait 予算超過' "$NOTIFY_LOG")" -eq 1 ] || { cat "$NOTIFY_LOG"; false; }
+    grep -q "cmd_208" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_210" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "確認:" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- Q-5【本設計の要】: プロセス入替(シェル変数を引き継がぬ新プロセス)を跨いでも明けの1通が出る ---
+
+@test "Q-5: the flush survives a fresh process with no inherited shell state (file-based deferral, not process-local)" {
+    write_settings true 5 60
+    write_quiet_settings true 23:00 07:00
+    local now
+    now=$(date +%s)
+    printf 'external_budget_exceeded\tcmd_208\t%s\t%s\t5\t0\tcmd_208 対象:PR#84。確認: gh pr checks 84\n' "$now" "$now" > "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"
+
+    # 退避を書いた側のプロセスとは無関係な、シェル変数を一切引き継がぬ
+    # 新プロセスでflushする(番犬プロセスがwatcher_supervisorにより
+    # 入れ替わる実運用を模す。cmd_197/OBS-61-1と同じ轍を踏まぬための
+    # 要件そのもの)。
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_now_hm() { echo 0700; }
+        ntfy_flush_deferred_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun external_wait 予算超過" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_208" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- Q-6: ntfyが死んでいても明けの1通(将軍inbox)は出る ---
+
+@test "Q-6: the digest still reaches shogun inbox even when ntfy itself fails, and flushed_epoch is set (no infinite retry)" {
+    write_settings true 5 60
+    write_quiet_settings true 23:00 07:00
+    local now
+    now=$(date +%s)
+    printf 'external_budget_exceeded\tcmd_208\t%s\t%s\t1\t0\tcmd_208 対象:PR#84。確認: gh pr checks 84\n' "$now" "$now" > "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        branch_policy_notify() { return 1; }
+        baton_ntfy_now_hm() { echo 0700; }
+        ntfy_flush_deferred_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun external_wait 予算超過" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    flushed=$(awk -F'\t' '$1=="external_budget_exceeded"{print $6}' "$FIXTURE_ROOT/queue/ntfy_deferred.tsv")
+    [ "$flushed" != "0" ] || { echo "flushed_epoch not set; would retry forever"; cat "$FIXTURE_ROOT/queue/ntfy_deferred.tsv"; false; }
+}
+
+# --- Q-7【回帰固定・最重要】: 静穏帯は将軍inbox主経路に一切影響しない ---
+
+@test "Q-7: shogun inbox output from check_once is byte-identical whether quiet hours are in effect or not" {
+    write_settings true 5 60
+    write_quiet_settings true 23:00 07:00
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_now_hm() { echo 0300; }
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    cp "$SHOGUN_NOTIFY_LOG" "$TEST_TMPDIR/quiet_on.log"
+    > "$SHOGUN_NOTIFY_LOG"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_now_hm() { echo 1200; }
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    diff "$TEST_TMPDIR/quiet_on.log" "$SHOGUN_NOTIFY_LOG" || { echo "quiet hours leaked into the shogun-inbox primary path"; false; }
+}
+
+# --- Q-8: 静穏帯の幅が上限を超えると無効化され鳴る側へ倒れる ---
+
+@test "Q-8: a quiet window wider than the span cap is disabled (falls to the noisy side) and logs a warning" {
+    write_settings true 5 60
+    write_quiet_settings true 00:00 13:00   # 780min >= 既定720min
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_ntfy_in_quiet_hours
+        echo \"RESULT:\$?\"
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "RESULT:1" || { echo "$output"; false; }
+    echo "$output" | grep -q "quiet window too wide" || { echo "$output"; false; }
 }
