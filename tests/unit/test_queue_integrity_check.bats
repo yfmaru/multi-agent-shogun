@@ -186,6 +186,26 @@ EOF
     [ "$status" -eq 0 ] || { echo "expected pass when removal is recorded: $output"; false; }
 }
 
+@test "C-2 is skipped, not failed, on a healthy document with neither 'commands' nor 'queue' (F-2 regression)" {
+    # gunshi QC on PR#90 (queue/reports/gunshi_qc_211_pr90.yaml F-2) found
+    # C-2 false-positiving on healthy single-slot files that use neither top-
+    # level key, e.g. the real queue/reports/gunshi_report.yaml and
+    # queue/inbox/karo.yaml -- both named by cmd_211's own purpose as in-
+    # scope targets. C-3 already skips this same "no such structure" shape;
+    # C-2 must match, not report it as a problem.
+    cat > "$TEST_TMPDIR/no_commands_key.yaml" <<'EOF'
+worker_id: gunshi
+task_id: some_task
+status: done
+result:
+  type: quality_check
+  summary: "no commands or queue key anywhere in this document"
+EOF
+
+    run run_check "$TEST_TMPDIR/no_commands_key.yaml"
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
 @test "C-3 is skipped when no .snapshots directory exists yet (P-211-B not wired)" {
     cat > "$TEST_TMPDIR/target.yaml" <<'EOF'
 commands:

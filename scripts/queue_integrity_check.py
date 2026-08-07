@@ -125,10 +125,10 @@ def check_entry_count(raw_text, parsed):
 
     key = _entries_key(parsed)
     if key is None:
-        return [
-            "C-2: parsed document has neither a 'commands' nor a 'queue' "
-            "top-level list; cannot compare against raw heading count."
-        ]
+        # No 'commands'/'queue' top-level list means this document is out of
+        # scope for entry-count reconciliation -- same skip C-3 applies when
+        # no snapshot exists yet, not a problem to report.
+        return []
 
     entries = parsed.get(key)
     if not isinstance(entries, list):
