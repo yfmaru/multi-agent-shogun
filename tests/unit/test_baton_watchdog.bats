@@ -3561,6 +3561,7 @@ YAML
     cp "$TEST_TMPDIR/tick1.yaml" "$FIXTURE_ROOT/queue/shogun_to_karo.yaml"
     run bash -c "
         source '$TEST_HARNESS'
+        baton_ntfy_now_hm() { echo 1200; }
         BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
         check_once
         echo TICK1_NTFY:\$(grep -c '予算.*超過' '$NOTIFY_LOG')
