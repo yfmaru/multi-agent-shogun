@@ -116,6 +116,7 @@ multi-agent-shogun/
 |-----------|---------|-----------------|
 | `scripts/` | Core system utilities | All scripts must pass shellcheck |
 | `instructions/` | Agent behavior | CLI-specific instructions go in `cli_specific/`. Before adding a new file there, wire it into `scripts/build_instructions.sh` first — a file with no referrer is dead weight (cmd_213) |
+| `docs/cli_integration_notes.md` | Per-CLI integration research | Unwired, kept for future reference (cmd_213) |
 | `lib/` | Shared libraries | `cli_adapter.sh` handles CLI abstraction |
 | `queue/` | Runtime data | Git-ignored, generated at runtime |
 | `templates/` | Reusable templates | Used for reports and context files |

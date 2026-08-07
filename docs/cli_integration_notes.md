@@ -14,8 +14,6 @@ kimi}_tools.md`として個別ファイルで存在していた内容を、要�
 
 ## Codex
 
-# Codex CLI Tools
-
 This section describes OpenAI Codex CLI-specific tools and features.
 
 ### Tool Usage
@@ -252,8 +250,6 @@ Model is set by `build_cli_command()` in cli_adapter.sh based on settings.yaml. 
 
 ## Copilot
 
-# GitHub Copilot CLI Tools
-
 This section describes GitHub Copilot CLI-specific tools and features.
 
 ### Overview
@@ -431,8 +427,6 @@ Location customizable via `XDG_CONFIG_HOME` environment variable.
 
 ## Cursor
 
-# Cursor Agent CLI — 固有の操作ルール
-
 これは Cursor Agent CLI 環境でのみ適用される操作ルール。
 共有プロトコル（CLAUDE.md / AGENTS.md）と role 指示書と組み合わせて使う。
 
@@ -493,8 +487,6 @@ Cursor Agent は以下のツールを提供する：
 - **Web 検索**: 組み込みの検索機能
 
 ## Kimi K2
-
-# Kimi Code CLI Tools
 
 This section describes MoonshotAI Kimi Code CLI-specific tools and features.
 
