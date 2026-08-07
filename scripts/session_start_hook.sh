@@ -45,7 +45,8 @@ case "$AGENT_ID" in
 以下を順番に実行せよ (省略禁止、ユーザ応答/inbox 処理はこの後):
 
 1. \`tmux display-message -t "\$TMUX_PANE" -p '#{@agent_id}'\` で自己識別を再確認
-2. \`memory/MEMORY.md\` — Claude Code 使用時は全エージェントのセッションへ自動注入されるため明示的な Read は不要。他CLI（Codex/OpenCode/Kimi 等）では自動注入されぬため、将軍のみ明示的に Read せよ
+2a. **個別メモリ**（過去の教訓・落とし穴を記した個別ファイル群） — persistent cross-session memory。このファイルを自動読み込みするCLIが、メモリも自動で注入するとは限らない。注入される環境では明示的なReadは不要だが、注入の有無はCLI・実行環境に依存し保証されない。個別メモリはClaude Code私有の領域（\`~/.claude/projects/<作業ディレクトリのslug>/memory/\`）に在り、注入されぬCLIからは実質的に読む術が無い。その環境では2bの台帳が唯一の記憶である
+2b. **台帳**（\`memory/SHOGUN_LEDGER.md\`） — 主の契約・裁可・方針・TODOを記した文書。**将軍は毎セッション明示的にReadせよ（CLIを問わず必須）**。自動注入には依存しない
 3. \`instructions/${AGENT_ID}.md\` を最後まで必読 — persona・戦国口調・forbidden_actions 再確立 **(絶対省略禁止)**
 4. \`queue/\` 配下 (tasks/, inbox/, reports/) から state 再構築
 

@@ -65,7 +65,8 @@ language:
 **This is ONE procedure for ALL situations**: fresh start, compaction, session continuation, or any state where you see agents/default/system.md. You cannot distinguish these cases, and you don't need to. **Always follow the same steps.**
 
 1. Identify self: `tmux display-message -t "$TMUX_PANE" -p '#{@agent_id}'`
-2. **Read `memory/MEMORY.md`** — persistent cross-session memory. Kimi K2 CLI使用時は全Claudeエージェントのセッションへ自動注入されるため明示的なReadは不要。他CLI（Codex/OpenCode/Kimi等）では自動注入されぬため、将軍のみ明示的にReadせよ。
+2a. **個別メモリ**（過去の教訓・落とし穴を記した個別ファイル群） — persistent cross-session memory。このファイルを自動読み込みするCLIが、メモリも自動で注入するとは限らない。注入される環境では明示的なReadは不要だが、注入の有無はCLI・実行環境に依存し保証されない。個別メモリは注入を行うCLIが管理するユーザ領域（リポジトリ外）に在り、注入されぬ環境からは事実上読めぬ。**注入が無ければ2bの台帳が唯一の記憶である——その場合は台帳を必ず明示的にReadせよ。**
+2b. **台帳**（`memory/SHOGUN_LEDGER.md`） — 主の契約・裁可・方針・TODOを記した文書。**将軍は毎セッション明示的にReadせよ（CLIを問わず必須）**。自動注入には依存しない。
 3. **Read your instructions file**: shogun→`instructions/shogun.md`, karo→`instructions/karo.md`, ashigaru→`instructions/ashigaru.md`, gunshi→`instructions/gunshi.md`. **NEVER SKIP** — even if a conversation summary exists. Summaries do NOT preserve persona, speech style, or forbidden actions.
 4. Rebuild state from primary YAML data (queue/, tasks/, reports/)
 5. Review forbidden actions, then start work

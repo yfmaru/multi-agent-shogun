@@ -28,7 +28,7 @@ Special cases (CLI commands sent via `tmux send-keys`):
 ## Context Layers
 
 ```
-Layer 1: Claude Codeのファイルメモリ — memory/MEMORY.md + 個別メモリ。全Claudeエージェントへ自動注入される
+Layer 1: 個別メモリ（Claude Codeのファイルメモリ。全Claudeエージェントへ自動注入される） + 台帳（memory/SHOGUN_LEDGER.md。将軍がCLIを問わず毎セッション明示的にRead）
 Layer 2: Project files   — persistent per-project (config/, projects/, context/)
 Layer 3: YAML Queue      — persistent task data (queue/ — authoritative source of truth)
 Layer 4: Session context — volatile (CLAUDE.md auto-loaded, instructions/*.md, lost on context reset)
