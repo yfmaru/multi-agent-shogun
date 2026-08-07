@@ -34,6 +34,14 @@ setup() {
     cp "$SCRIPT_DIR/scripts/queue_integrity_check.sh" "$TEST_TMP/scripts/"
     cp "$SCRIPT_DIR/scripts/queue_integrity_check.py" "$TEST_TMP/scripts/"
 
+    # Reuse the real repo's PyYAML-equipped venv (set up once in CI) instead
+    # of falling back to the bare `python3` on PATH, whose PyYAML
+    # availability varies by runner (present on ubuntu-latest, absent on
+    # macos-latest). Same fix as test_queue_integrity_check.bats.
+    if [ -d "$SCRIPT_DIR/.venv" ]; then
+        ln -s "$SCRIPT_DIR/.venv" "$TEST_TMP/.venv"
+    fi
+
     cat > "$TEST_TMP/scripts/inbox_write.sh" << 'MOCK'
 #!/bin/bash
 echo "$@" >> "$(dirname "$0")/../inbox_write_calls.log"
