@@ -1,15 +1,15 @@
 # Shogun Memory — Persistent Agent Context
 
 This file persists across sessions and is read by the Shogun agent at startup.
-`memory/MEMORY.md` is gitignored — your private data never enters the OSS repo.
+`memory/SHOGUN_LEDGER.md` is gitignored — your private data never enters the OSS repo.
 
 ---
 
-## How to Use: MEMORY.md vs Memory MCP
+## How to Use: SHOGUN_LEDGER.md vs Memory MCP
 
 Two memory systems exist. Use them for different purposes:
 
-| | MEMORY.md | Memory MCP (graph) |
+| | SHOGUN_LEDGER.md | Memory MCP (graph) |
 |---|---|---|
 | **Loaded** | Auto at session start | Only when you call `read_graph` |
 | **Cost** | Free (already in context) | Tokens per call |
@@ -17,10 +17,10 @@ Two memory systems exist. Use them for different purposes:
 | **Best for** | Rules, settings, current state | Lessons, decisions, relationships |
 
 **Rule of thumb:**
-- "I need this every session" → **MEMORY.md**
+- "I need this every session" → **SHOGUN_LEDGER.md**
 - "I need to query: what caused X / what's related to Y" → **Memory MCP**
 
-### What to put in MEMORY.md
+### What to put in SHOGUN_LEDGER.md
 - Your profile (GitHub, X, etc.)
 - Stable behavioral rules for Shogun
 - CLI and agent configuration

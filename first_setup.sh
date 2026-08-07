@@ -669,14 +669,21 @@ else
     log_info "config/projects.yaml は既に存在します"
 fi
 
-# memory/MEMORY.md（Shogun 永続メモリ — 既存ファイルは上書きしない）
-if [ ! -f "$SCRIPT_DIR/memory/MEMORY.md" ]; then
-    log_info "memory/MEMORY.md を作成中..."
-    cp "$SCRIPT_DIR/memory/MEMORY.md.sample" "$SCRIPT_DIR/memory/MEMORY.md"
-    log_success "memory/MEMORY.md を作成しました（MEMORY.md.sample からコピー）"
-    log_info "memory/MEMORY.md を編集して、あなたの情報を記入してください"
+# memory/SHOGUN_LEDGER.md（Shogun 永続台帳 — 既存ファイルは上書きしない）
+# 旧名 memory/MEMORY.md が既に存在する環境向けの移行（rename）
+if [ -f "$SCRIPT_DIR/memory/MEMORY.md" ] && [ ! -f "$SCRIPT_DIR/memory/SHOGUN_LEDGER.md" ]; then
+    log_info "旧名 memory/MEMORY.md を新名 memory/SHOGUN_LEDGER.md へ移行中..."
+    mv "$SCRIPT_DIR/memory/MEMORY.md" "$SCRIPT_DIR/memory/SHOGUN_LEDGER.md"
+    log_success "memory/MEMORY.md → memory/SHOGUN_LEDGER.md に移行しました"
+fi
+
+if [ ! -f "$SCRIPT_DIR/memory/SHOGUN_LEDGER.md" ]; then
+    log_info "memory/SHOGUN_LEDGER.md を作成中..."
+    cp "$SCRIPT_DIR/memory/SHOGUN_LEDGER.md.sample" "$SCRIPT_DIR/memory/SHOGUN_LEDGER.md"
+    log_success "memory/SHOGUN_LEDGER.md を作成しました（SHOGUN_LEDGER.md.sample からコピー）"
+    log_info "memory/SHOGUN_LEDGER.md を編集して、あなたの情報を記入してください"
 else
-    log_info "memory/MEMORY.md は既に存在します（スキップ）"
+    log_info "memory/SHOGUN_LEDGER.md は既に存在します（スキップ）"
 fi
 
 # memory/global_context.md（システム全体のコンテキスト）

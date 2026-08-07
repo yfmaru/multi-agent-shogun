@@ -128,9 +128,9 @@ scripts/seo_qc.sh
 # Reports (private — not tracked)
 logs/
 
-# Memory (MEMORY.md is private; only the sample template is OSS)
+# Memory (SHOGUN_LEDGER.md is private; only the sample template is OSS)
 !memory/
-!memory/MEMORY.md.sample
+!memory/SHOGUN_LEDGER.md.sample
 
 # Docs
 !docs/
