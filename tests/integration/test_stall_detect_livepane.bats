@@ -57,9 +57,14 @@ FOOTER_TEXT='  Enter to select · ↑/↓ to navigate · Esc to cancel'
         tmux new-session -d -s "$name" -x "$w" -y 12 \
             "printf '%s' '$FOOTER_TEXT'; sleep 15"
         # Give tmux a moment to render before capturing.
-        sleep 0.05
-        agent_is_busy_check "$name" claude
-        rc=$?
+        sleep 0.15
+        # `if` guards the call so a nonzero (idle) result doesn't trip bats'
+        # errexit and abort the loop before we can record which width failed.
+        if agent_is_busy_check "$name" claude; then
+            rc=0
+        else
+            rc=$?
+        fi
         if [ "$rc" -ne 0 ]; then
             fail_widths+=("${w}:rc=${rc}")
         fi
@@ -131,15 +136,16 @@ split_modal_footer_cmd() {
     [ "$status" -eq 0 ]
 }
 
-# T-MODAL-02: width sweep 39-50 — the measured blind band (M-2: the footer
-# is 49 columns wide, so pane widths 39-50 are exactly where it splits
-# without fitting on one row). Every width in this band must report busy;
-# this is the regression guard for the blind band itself, mirroring V-3's
-# role for the (already-working) -J rejoin case.
-@test "T-MODAL-02: agent_is_busy_check reports busy across the measured blind band (widths 39-50) for an APP-side split modal footer" {
+# T-MODAL-02: width sweep 37-50 — 2026-08-06's measurement found a
+# 51-column footer form (with a 2-column leading indent), and 2026-08-08's
+# found a 49-column form; sweeping 37-50 covers the true blind band for
+# both observed forms. Every width in this band must report busy; this is
+# the regression guard for the blind band itself, mirroring V-3's role for
+# the (already-working) -J rejoin case.
+@test "T-MODAL-02: agent_is_busy_check reports busy across the measured blind band (widths 37-50) for an APP-side split modal footer" {
     local fail_widths=()
     local w name rc
-    for w in $(seq 39 50); do
+    for w in $(seq 37 50); do
         name="tmodal02_w${w}_${SESSION_SUFFIX}"
         tmux new-session -d -s "$name" -x "$w" -y 12 "$(split_modal_footer_cmd "$w")"
         sleep 0.15
