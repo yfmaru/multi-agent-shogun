@@ -938,33 +938,6 @@ else
 fi
 
 # ============================================================
-# STEP 11: Memory MCP セットアップ
-# ============================================================
-log_step "STEP 11: Memory MCP セットアップ"
-
-if command -v claude &> /dev/null; then
-    # Memory MCP が既に設定済みか確認
-    if claude mcp list 2>/dev/null | grep -q "memory"; then
-        log_info "Memory MCP は既に設定済みです"
-        RESULTS+=("Memory MCP: OK (設定済み)")
-    else
-        log_info "Memory MCP を設定中..."
-        if claude mcp add memory \
-            -e MEMORY_FILE_PATH="$SCRIPT_DIR/memory/shogun_memory.jsonl" \
-            -- npx -y @modelcontextprotocol/server-memory 2>/dev/null; then
-            log_success "Memory MCP 設定完了"
-            RESULTS+=("Memory MCP: 設定完了")
-        else
-            log_warn "Memory MCP の設定に失敗しました（手動で設定可能）"
-            RESULTS+=("Memory MCP: 設定失敗 (手動設定可能)")
-        fi
-    fi
-else
-    log_warn "claude コマンドが見つからないため Memory MCP 設定をスキップ"
-    RESULTS+=("Memory MCP: スキップ (claude未インストール)")
-fi
-
-# ============================================================
 # 結果サマリー
 # ============================================================
 echo ""

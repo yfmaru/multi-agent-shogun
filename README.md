@@ -63,7 +63,7 @@ You watch the dashboard. That's it.
 **Why use it?**
 - One command spawns 7 AI workers + 1 strategist executing in parallel
 - Zero wait time — give your next order while tasks run in the background
-- AI remembers your preferences across sessions (Memory MCP)
+- AI remembers your preferences across sessions (`memory/SHOGUN_LEDGER.md`)
 - Real-time progress on a dashboard
 
 ```
@@ -451,7 +451,7 @@ Then restart your computer and run `install.bat` again.
 | Script | Purpose | When to run |
 |--------|---------|-------------|
 | `install.bat` | Windows: WSL2 + Ubuntu setup | First time only |
-| `first_setup.sh` | Install tmux, Node.js, Claude Code CLI + Memory MCP config | First time only |
+| `first_setup.sh` | Install tmux, Node.js, Claude Code CLI | First time only |
 | `shutsujin_departure.sh` | Create tmux sessions + launch the configured CLI for each agent + load instructions + start ntfy listener | Daily |
 | `scripts/switch_cli.sh` | Live switch agent CLI/model (settings.yaml → /exit → relaunch) | As needed |
 
@@ -647,13 +647,13 @@ What carries forward to future projects:
 
 | What carries forward | Stored in | Referenced when |
 |----------------------|-----------|-----------------|
-| Lord's preferences and lessons | Memory MCP (persistent) | All agents at Session Start |
+| Lord's preferences and lessons | `memory/SHOGUN_LEDGER.md` (persistent) | All agents at Session Start |
 | Project-specific knowledge | `context/{name}.md` | When running the project's cmds |
 | Past cmd history | `queue/shogun_to_karo.yaml` | When the Shogun needs it |
 | Custom skills | `~/.claude/skills/`, `skills/` | When matching triggers fire |
 | Agent formation | `config/settings.yaml` | At shutsujin startup |
 
-**Memory MCP** is the heart of "experience." When you tell the Shogun "don't do X next time" or "remember Y," the Shogun records it in Memory MCP, and all future projects see it.
+**`memory/SHOGUN_LEDGER.md`** (the ledger) is the heart of "experience." When you tell the Shogun "don't do X next time" or "remember Y," the Shogun records it in the ledger, and all future projects see it.
 
 ### Detailed flow
 
@@ -709,13 +709,13 @@ You: Command → Shogun: Delegates → You: Give next command immediately
 
 No waiting for long tasks to finish.
 
-### 🧠 3. Cross-Session Memory (Memory MCP)
+### 🧠 3. Cross-Session Memory (`memory/SHOGUN_LEDGER.md`)
 
 Your AI remembers your preferences:
 
 ```
 Session 1: Tell it "I prefer simple approaches"
-            → Saved to Memory MCP
+            → Saved to memory/SHOGUN_LEDGER.md
 
 Session 2: AI loads memory on startup
             → Stops suggesting complex solutions
@@ -867,7 +867,7 @@ Efficient knowledge sharing through a four-layer context system:
 
 | Layer | Location | Purpose |
 |-------|----------|---------|
-| Layer 1: Memory MCP | `memory/shogun_memory.jsonl` | Cross-project, cross-session long-term memory |
+| Layer 1: Ledger | `memory/SHOGUN_LEDGER.md` | Cross-project, cross-session long-term memory |
 | Layer 2: Project | `config/projects.yaml`, `projects/<id>.yaml`, `context/{project}.md` | Project-specific information and technical knowledge |
 | Layer 3: YAML Queue | `queue/shogun_to_karo.yaml`, `queue/tasks/`, `queue/reports/` | Task management — source of truth for instructions and reports |
 | Layer 4: Session | CLAUDE.md, instructions/*.md | Working context (wiped by `/clear`) |
@@ -926,7 +926,7 @@ Recovery cost after `/clear`: **~6,800 tokens** (42% improved from v1 — CLAUDE
 
 1. CLAUDE.md (auto-loaded) → recognizes itself as part of the Shogun System
 2. `tmux display-message -t "$TMUX_PANE" -p '#{@agent_id}'` → identifies its own number
-3. Memory MCP read → restores the Lord's preferences (~700 tokens)
+3. `memory/SHOGUN_LEDGER.md` read → restores the Lord's preferences (~700 tokens)
 4. Task YAML read → picks up the next assignment (~800 tokens)
 
 The key insight: designing **what not to load** is what drives cost savings.
@@ -1408,7 +1408,6 @@ MCP (Model Context Protocol) servers extend Claude's capabilities. Here's how to
 MCP servers give Claude access to external tools:
 - **Notion MCP** → Read and write Notion pages
 - **GitHub MCP** → Create PRs, manage issues
-- **Memory MCP** → Persist memory across sessions
 
 ### Installing MCP Servers
 
@@ -1548,9 +1547,8 @@ Priority: Token > Basic > None. If neither is set, no auth headers are sent (bac
 │      │                                                              │
 │      ├── Check/install tmux                                         │
 │      ├── Check/install Node.js v20+ (via nvm)                      │
-│      ├── Check/install Claude Code CLI (native version)             │
-│      │       ※ Proposes migration if npm version detected           │
-│      └── Configure Memory MCP server                                │
+│      └── Check/install Claude Code CLI (native version)             │
+│              ※ Proposes migration if npm version detected           │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                    Daily Startup (run every day)                     │
@@ -1728,7 +1726,7 @@ multi-agent-shogun/
 │   ├── shogun-model-switch/  # Live CLI/model switching
 │   └── shogun-readme-sync/   # README sync
 │
-├── memory/                   # Memory MCP persistent storage
+├── memory/                   # SHOGUN_LEDGER.md persistent storage
 ├── dashboard.md              # Real-time status board
 └── CLAUDE.md                 # System instructions (auto-loaded)
 ```
@@ -1938,7 +1936,7 @@ Even if you're not comfortable with keyboard shortcuts, you can switch, scroll, 
 - **Multi-CLI as first-class architecture** — `lib/cli_adapter.sh` dynamically selects CLI per agent. Change one line in `settings.yaml` to swap any worker between Claude Code, Codex, Copilot, or Kimi
 - **OpenAI Codex CLI integration** — GPT-5.3-codex with `--dangerously-bypass-approvals-and-sandbox` for true autonomous execution. `--no-alt-screen` makes agent activity visible in tmux
 - **CLI bypass flag discovery** — `--full-auto` is NOT fully automatic (it's `-a on-request`). Documented the correct flags for all 4 CLIs
-- **Hybrid architecture** — Command layer (Shogun + Karo) stays on Claude Code for Memory MCP and mailbox integration. Worker layer (Ashigaru) is CLI-agnostic
+- **Hybrid architecture** — Command layer (Shogun + Karo) stays on Claude Code for mailbox integration. Worker layer (Ashigaru) is CLI-agnostic
 - **Community-contributed CLI adapters** — Thanks to [@yuto-ts](https://github.com/yuto-ts) (cli_adapter.sh), [@circlemouth](https://github.com/circlemouth) (Codex support), [@koba6316](https://github.com/koba6316) (task routing)
 
 <details>
