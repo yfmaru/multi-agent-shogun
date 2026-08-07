@@ -62,6 +62,14 @@ setup_file() {
 build_tmp_project() {
     local root="$1"
     mkdir -p "$root/scripts" "$root/queue"/{inbox,tasks,reports,archive,reports,archive/reports}
+    # slim_yaml.py now shells out to queue_integrity_check.sh (cmd_211
+    # P-211-C), which resolves its own PYTHON_BIN relative to itself. Reuse
+    # the real repo's PyYAML-equipped venv here rather than relying on the
+    # bare `python3` fallback having PyYAML on PATH -- same reasoning as
+    # test_queue_integrity_check.bats's "default target path" test.
+    if [ -d "$PROJECT_ROOT/.venv" ]; then
+        ln -s "$PROJECT_ROOT/.venv" "$root/.venv"
+    fi
 }
 
 run_slim_yaml() {
@@ -80,6 +88,8 @@ seed_yaml() {
     root="$(mktemp -d "/tmp/e2e_slim_retention_XXXXXX")"
     build_tmp_project "$root"
     cp "$PROJECT_ROOT/scripts/slim_yaml.py" "$root/scripts/"
+    cp "$PROJECT_ROOT/scripts/queue_integrity_check.sh" "$root/scripts/"
+    cp "$PROJECT_ROOT/scripts/queue_integrity_check.py" "$root/scripts/"
 
     seed_yaml "$root/queue/shogun_to_karo.yaml" $'commands:\n  - id: cmd_test\n    status: pending\n'
     seed_yaml "$root/queue/reports/ashigaru1_cmd_test_report.yaml" $'parent_cmd: cmd_test\nstatus: done\n'
@@ -104,6 +114,8 @@ seed_yaml() {
     root="$(mktemp -d "/tmp/e2e_slim_retention_XXXXXX")"
     build_tmp_project "$root"
     cp "$PROJECT_ROOT/scripts/slim_yaml.py" "$root/scripts/"
+    cp "$PROJECT_ROOT/scripts/queue_integrity_check.sh" "$root/scripts/"
+    cp "$PROJECT_ROOT/scripts/queue_integrity_check.py" "$root/scripts/"
 
     seed_yaml "$root/queue/shogun_to_karo.yaml" $'commands:\n  - id: cmd_test\n    status: done\n'
     seed_yaml "$root/queue/reports/ashigaru1_cmd_test_report.yaml" $'parent_cmd: cmd_test\nstatus: done\n'
@@ -129,6 +141,8 @@ seed_yaml() {
     root="$(mktemp -d "/tmp/e2e_slim_retention_XXXXXX")"
     build_tmp_project "$root"
     cp "$PROJECT_ROOT/scripts/slim_yaml.py" "$root/scripts/"
+    cp "$PROJECT_ROOT/scripts/queue_integrity_check.sh" "$root/scripts/"
+    cp "$PROJECT_ROOT/scripts/queue_integrity_check.py" "$root/scripts/"
 
     seed_yaml "$root/queue/shogun_to_karo.yaml" $'commands:\n  - id: cmd_test\n    status: done\n'
     seed_yaml "$root/queue/reports/ashigaru1_report.yaml" $'parent_cmd: cmd_done\nstatus: done\n'
