@@ -8,6 +8,7 @@ Removes completed/archived items from YAML queue files to maintain performance.
 """
 
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -353,6 +354,20 @@ def slim_inbox(agent_id, dry_run=False):
     return True
 
 
+def _integrity_check_passes(target_path):
+    """Run queue_integrity_check.sh (cmd_211 P-211-A) against target_path.
+    This is the L3 amplification guard (cmd_211 P-211-C): it runs
+    immediately before a load-then-dump cycle, since that cycle is what
+    turns a still-recoverable silent corruption into a permanent one."""
+    script = Path(__file__).resolve().parent / 'queue_integrity_check.sh'
+    result = subprocess.run(['bash', str(script), str(target_path)],
+                             capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+        return False
+    return True
+
+
 def slim_shugun_to_karo(dry_run=False):
     """Archive done/cancelled commands from shogun_to_karo.yaml."""
     queue_dir = get_queue_dir()
@@ -362,6 +377,11 @@ def slim_shugun_to_karo(dry_run=False):
     if not shogun_file.exists():
         print(f"Warning: {shogun_file} not found", file=sys.stderr)
         return True
+
+    if not _integrity_check_passes(shogun_file):
+        print(f"Error: {shogun_file} failed integrity check; aborting before load "
+              f"(no archive or main file changes written)", file=sys.stderr)
+        return False
 
     data = load_yaml(shogun_file)
     # Support both 'commands' and 'queue' keys for backwards compatibility

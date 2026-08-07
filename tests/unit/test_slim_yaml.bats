@@ -52,7 +52,7 @@ PY
 }
 
 @test "dry-run does not mutate commands tasks reports inbox migration or create archive dir" {
-    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'queue:\n- id: cmd_done\n  status: done\n- id: cmd_pending\n  status: pending\n'
+    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'queue:\n  - id: cmd_done\n    status: done\n  - id: cmd_pending\n    status: pending\n'
     write_yaml "$SHOGUN_QUEUE_DIR/tasks/ashigaru1.yaml" $'worker_id: ashigaru1\nstatus: done\n'
     write_yaml "$SHOGUN_QUEUE_DIR/reports/ashigaru1_cmd_done.yaml" $'parent_cmd: cmd_done\nstatus: done\n'
     touch -d "2 days ago" "$SHOGUN_QUEUE_DIR/reports/ashigaru1_cmd_done.yaml"
@@ -73,7 +73,7 @@ PY
 }
 
 @test "wrapper dry-run does not create queue lock file" {
-    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'queue:\n- id: cmd_done\n  status: done\n'
+    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'queue:\n  - id: cmd_done\n    status: done\n'
 
     run run_slim_wrapper karo --dry-run
     assert_success
@@ -88,7 +88,7 @@ PY
 }
 
 @test "archives terminal commands using canonical statuses and keeps non-terminal commands" {
-    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'queue:\n- id: cmd_done\n  status: done\n- id: cmd_cancelled\n  status: cancelled\n- id: cmd_paused\n  status: paused\n- id: cmd_pending\n  status: pending\n- id: cmd_in_progress\n  status: in_progress\n- id: cmd_blocked\n  status: blocked\n'
+    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'queue:\n  - id: cmd_done\n    status: done\n  - id: cmd_cancelled\n    status: cancelled\n  - id: cmd_paused\n    status: paused\n  - id: cmd_pending\n    status: pending\n  - id: cmd_in_progress\n    status: in_progress\n  - id: cmd_blocked\n    status: blocked\n'
 
     run run_slim karo
     assert_success
@@ -102,6 +102,41 @@ assert ids == ["cmd_pending", "cmd_in_progress", "cmd_blocked"], ids
 PY
     archive_count="$(find "$SHOGUN_QUEUE_DIR/archive" -name 'shogun_to_karo_*.yaml' | wc -l)"
     [ "$archive_count" -eq 1 ]
+}
+
+@test "L3 guard passes a healthy commands-keyed fixture through unchanged behavior (no regression)" {
+    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'commands:\n  - id: cmd_done\n    status: done\n  - id: cmd_pending\n    status: pending\n'
+
+    run run_slim karo
+    assert_success
+
+    "$TEST_PYTHON" - "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" <<'PY'
+import sys, yaml
+data = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+ids = [item["id"] for item in data["commands"]]
+assert ids == ["cmd_pending"], ids
+PY
+    archive_count="$(find "$SHOGUN_QUEUE_DIR/archive" -name 'shogun_to_karo_*.yaml' | wc -l)"
+    [ "$archive_count" -eq 1 ]
+}
+
+@test "L3 guard aborts before load on duplicate-key corruption: no archive file, no main-file mutation, non-zero exit" {
+    # cmd_201-style corruption (gunshi_design_211 section 2(1)): karo_note
+    # appears twice within the same commands[] entry. This is valid YAML (no
+    # parser error) and the heading-line count still matches the parsed
+    # entry count, so only C-1 (duplicate-key detection) catches it.
+    write_yaml "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" $'commands:\n  - id: cmd_A\n    status: done\n    timestamp: "2026-08-01T00:00:00"\n    karo_note: original detailed note\n    timestamp: "2026-08-02T00:00:00"\n    karo_note: overwritten short note\n  - id: cmd_B\n    status: pending\n'
+
+    before_sha="$(sha256sum "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" | awk '{print $1}')"
+
+    run run_slim karo
+    assert_failure
+    assert_output --partial "integrity check"
+
+    after_sha="$(sha256sum "$SHOGUN_QUEUE_DIR/shogun_to_karo.yaml" | awk '{print $1}')"
+    [ "$before_sha" = "$after_sha" ]
+    archive_count="$(find "$SHOGUN_QUEUE_DIR/archive" -name 'shogun_to_karo_*.yaml' 2>/dev/null | wc -l)"
+    [ "$archive_count" -eq 0 ]
 }
 
 @test "supports current top-level task status and resets canonical task to top-level idle" {
