@@ -248,6 +248,21 @@ STALL_HASH=${STALL_HASH:-}
 STALL_HASH_SINCE=${STALL_HASH_SINCE:-0}
 STALL_ACTED_AT=${STALL_ACTED_AT:-0}
 
+# ─── Liveness/notify state (cmd_218) ───
+# STALL_ACTION_TAKEN: set by attempt_stall_recovery() the instant it actually
+# sends keys; consumed by the main loop to defer delivery one tick (SE-2).
+# STALL_UNRESPONSIVE_ATTEMPTS / STALL_USAGE_LIMITED_STREAK: per-episode
+# counters feeding stall_maybe_notify()'s stall_notify_after_attempts gate.
+# STALL_USAGE_LIMITED_LAST: cooldown timestamp so the usage_limited streak
+# advances at the same ~stall_retry_cooldown_sec cadence as the ladder path,
+# not once per liveness_tick. All reset to 0 the instant is_stalled_pane()
+# reports the pane moved (one episode = one continuous stall).
+STALL_ACTION_TAKEN=${STALL_ACTION_TAKEN:-0}
+STALL_UNRESPONSIVE_ATTEMPTS=${STALL_UNRESPONSIVE_ATTEMPTS:-0}
+STALL_USAGE_LIMITED_STREAK=${STALL_USAGE_LIMITED_STREAK:-0}
+STALL_USAGE_LIMITED_LAST=${STALL_USAGE_LIMITED_LAST:-0}
+STALL_NTFY_SENT=${STALL_NTFY_SENT:-0}
+
 # ─── Metrics hooks (FR-006 / NFR-003) ───
 # unread_latency_sec / read_count / estimated_tokens are intentionally explicit
 READ_COUNT=${READ_COUNT:-0}
@@ -1306,6 +1321,27 @@ send_wakeup_with_escape() {
     return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
 }
 
+# ─── Stall notify (cmd_218 residual_hole) ───
+# An Escape-proof stall (or a persistent usage_limited verdict) never gets
+# reported to anyone otherwise — the ladder just keeps firing into the void.
+# Fires branch_policy_notify() exactly once per episode (STALL_NTFY_SENT),
+# reset by attempt_stall_recovery() the instant is_stalled_pane() reports the
+# pane moved. Never returns non-zero — set -euo pipefail would kill the
+# watcher daemon.
+stall_maybe_notify() {
+    local agent="$1" kind="$2" count="$3"
+    [ "${STALL_NTFY_SENT:-0}" = "1" ] && return 0
+
+    local threshold
+    threshold=$(stall_policy_query stall_notify_after_attempts 2>/dev/null) || threshold=3
+    if [ "$count" -ge "$threshold" ] 2>/dev/null; then
+        STALL_NTFY_SENT=1
+        echo "[$(date)] [STALL-NTFY] $agent: $kind unresolved after $count attempts — notifying" >&2
+        branch_policy_notify "${agent} が固着（${kind}）。自動復帰不能——${count}回試行後も未解消" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # ─── Stall recovery (cmd_171 / T1) ───
 # Escalation ladder for a detected type-A stall: Escape×2 -> (30s) nudge ->
 # (30s) /clear. Re-checks is_stalled_pane() before each step and aborts the
@@ -1334,6 +1370,12 @@ attempt_stall_recovery() {
     # of the VERDICT below did not: a stalled+limited pane still falls
     # through to the Gate 1 check and returns without action.
     if ! is_stalled_pane; then
+        # cmd_218: pane moved (or was never stalled) — episode over, reset
+        # the notify counters so the next stall starts a fresh episode.
+        STALL_UNRESPONSIVE_ATTEMPTS=0
+        STALL_USAGE_LIMITED_STREAK=0
+        STALL_USAGE_LIMITED_LAST=0
+        STALL_NTFY_SENT=0
         return 0
     fi
 
@@ -1345,6 +1387,17 @@ attempt_stall_recovery() {
     usage_state=$(usage_limit_state "$AGENT_ID" 2>/dev/null) || usage_state="unknown"
     if [ "$usage_state" = "limited" ]; then
         echo "[$(date)] [STALL] $AGENT_ID: type_C usage_limited — no action taken" >&2
+        # cmd_218: count at the same ~stall_retry_cooldown_sec cadence as the
+        # ladder path below, not once per liveness_tick (would reach the
+        # notify threshold in under two minutes otherwise).
+        local ul_now ul_cooldown
+        ul_now=$(date +%s)
+        ul_cooldown=$(stall_policy_query stall_retry_cooldown_sec 2>/dev/null) || ul_cooldown=600
+        if [ "${STALL_USAGE_LIMITED_LAST:-0}" -eq 0 ] || [ "$((ul_now - STALL_USAGE_LIMITED_LAST))" -ge "$ul_cooldown" ]; then
+            STALL_USAGE_LIMITED_LAST=$ul_now
+            STALL_USAGE_LIMITED_STREAK=$((${STALL_USAGE_LIMITED_STREAK:-0} + 1))
+            stall_maybe_notify "$AGENT_ID" "usage_limited" "$STALL_USAGE_LIMITED_STREAK"
+        fi
         return 0
     fi
 
@@ -1372,6 +1425,9 @@ attempt_stall_recovery() {
     fi
 
     STALL_ACTED_AT=$now
+    STALL_ACTION_TAKEN=1
+    STALL_UNRESPONSIVE_ATTEMPTS=$((${STALL_UNRESPONSIVE_ATTEMPTS:-0} + 1))
+    stall_maybe_notify "$AGENT_ID" "unresponsive" "$STALL_UNRESPONSIVE_ATTEMPTS"
     echo "[$(date)] [STALL] $AGENT_ID: type-A stall detected (usage=$usage_state, policy=$policy) — Escape x2" >&2
     timeout 5 tmux send-keys -t "$PANE_TARGET" Escape Escape 2>/dev/null || true
 
@@ -1423,6 +1479,52 @@ attempt_stall_recovery() {
     return 0
 }
 
+# ─── Liveness tick (cmd_218 案C) ───
+# attempt_stall_recovery() used to be called from inside process_unread()'s
+# unread==0 else-branch — reachable only when an inbox write actually fired
+# an event (or the single tick right after unread drains to 0). Three gates
+# stacked in front of that call site over cmd_171/cmd_209's lifetime — the
+# oldest (2026-02-10 fast-path early-return) predates stall detection itself
+# by five and a half months — so the watcher's only periodic clock (the 30s
+# timeout tick) never reached it during steady-state idle
+# (queue/reports/gunshi_design_209_stall_unread_deadlock.yaml §1).
+#
+# liveness_tick() is called directly from the main loop instead (after the
+# testing guard, ahead of the rc branch that dispatches process_unread), so
+# stall detection now runs on a wall-clock timer independent of unread state
+# or trigger type — structurally immune to future process_unread edits.
+# Defined outside the testing guard (like attempt_stall_recovery itself) so
+# bats can call it directly without sourcing the (guarded) main loop.
+LIVENESS_LAST_TS=${LIVENESS_LAST_TS:-0}
+LIVENESS_MIN_INTERVAL=${LIVENESS_MIN_INTERVAL:-20}
+
+liveness_tick() {
+    local now
+    now=$(date +%s)
+    [ "$((now - LIVENESS_LAST_TS))" -ge "$LIVENESS_MIN_INTERVAL" ] || return 0
+    LIVENESS_LAST_TS=$now
+    attempt_stall_recovery
+    return 0   # Never return 1 — set -euo pipefail would kill the watcher
+}
+
+# liveness_tick_and_defer: wraps liveness_tick() with the SE-2 one-tick-defer
+# contract — if the ladder just sent recovery keys (STALL_ACTION_TAKEN=1),
+# the caller (main loop) must skip this iteration's delivery dispatch
+# (process_unread) rather than risk landing nudge+Enter on the same tick a
+# stalled modal's Escape did (see gunshi_design_209 §2 why_defer_one_tick).
+# Returns 1 when the caller should `continue`, 0 otherwise. Split out as its
+# own function — rather than inlined in the (testing-guard-skipped) main
+# loop — so bats can exercise the defer contract directly.
+liveness_tick_and_defer() {
+    liveness_tick
+    if [ "${STALL_ACTION_TAKEN:-0}" = "1" ]; then
+        STALL_ACTION_TAKEN=0
+        echo "[$(date)] [STALL] $AGENT_ID: recovery keys sent — deferring delivery one tick" >&2
+        return 1
+    fi
+    return 0
+}
+
 # ─── Process cycle ───
 process_unread() {
     local trigger="${1:-event}"
@@ -1435,10 +1537,12 @@ process_unread() {
     fast_count=$(echo "$fast_info" | "$SCRIPT_DIR/.venv/bin/python3" -c "import sys,json; print(json.load(sys.stdin).get('count',0))" 2>/dev/null)
 
     if no_idle_full_read "$trigger" && [ "$fast_count" -eq 0 ] 2>/dev/null; then
-        # no_idle_full_read guard: unread=0 and timeout path → no full inbox read
-        if [ "$FIRST_UNREAD_SEEN" -ne 0 ]; then
-            echo "[$(date)] All messages read for $AGENT_ID — escalation reset (fast-path)" >&2
-        fi
+        # no_idle_full_read guard: unread=0 and timeout path → no full inbox read.
+        # (Historical note: this branch used to also carry an unreachable
+        # "escalation reset (fast-path)" log guarded by FIRST_UNREAD_SEEN != 0
+        # — dead code, since no_idle_full_read() itself requires
+        # FIRST_UNREAD_SEEN == 0 to enter this branch. Removed cmd_218; see
+        # gunshi_design_209_stall_unread_deadlock.yaml finding_1_4_corroboration.)
         FIRST_UNREAD_SEEN=0
         reset_shogun_defer_state  # QC40-F1/F2: 未読0になったので延期状態を解除
         NEW_CONTEXT_SENT=0
@@ -1671,11 +1775,10 @@ for s in data.get('specials', []):
         reset_shogun_defer_state  # QC40-F1/F2: 未読0になったので延期状態を解除
 
         # ─── Stall detection (cmd_171 / T1) ───
-        # Must run before the idle-flag touch below: for claude, touching the
-        # flag first would make agent_is_busy() report idle on the spot, so
-        # is_stalled_pane() would see "not busy" and reset its tracking state
-        # before stall_after_sec is ever reached.
-        attempt_stall_recovery
+        # cmd_218: attempt_stall_recovery() moved out of process_unread()
+        # entirely — it now runs from liveness_tick() in the main loop,
+        # ahead of process_unread() each iteration, independent of unread
+        # state. See gunshi_design_209_stall_unread_deadlock.yaml §2 (案C).
 
         # Ensure idle flag exists when all messages are read.
         # Recovers from stop_hook_inbox.sh flag loss during block cycles.
@@ -1769,6 +1872,13 @@ while true; do
     # rc=2: timeout (30s safety net for WSL2 inotify gaps / macOS fswatch timeout)
     # All cases: check for unread, then loop back (re-watches new inode)
     sleep 0.3
+
+    # cmd_218: liveness_tick runs on its own wall-clock timer, ahead of and
+    # independent of the unread-driven dispatch below — see liveness_tick's
+    # and liveness_tick_and_defer's definitions for why.
+    if ! liveness_tick_and_defer; then
+        continue
+    fi
 
     if [ "$rc" -eq 2 ]; then
         if should_process_timeout_tick; then
