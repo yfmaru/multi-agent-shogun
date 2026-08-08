@@ -43,6 +43,11 @@ DEFAULT_STALL_POLICY = {
     "unknown_policy": "escape_only",
     "usage_limit_threshold_pct": 95,
     "usage_cache_ttl_sec": 120,
+    # cmd_218 residual_hole: an Escape-proof stall (or a persistent
+    # usage_limited verdict) otherwise never reaches a human. 3 attempts at
+    # the default stall_retry_cooldown_sec (600s) cadence ≈ 30 minutes
+    # before the first (and only, per episode) notify fires.
+    "stall_notify_after_attempts": 3,
     "usage_limit_pane_patterns": [
         "usage limit",
         "rate limit",
@@ -75,6 +80,7 @@ elif query in (
     "stall_retry_cooldown_sec",
     "usage_limit_threshold_pct",
     "usage_cache_ttl_sec",
+    "stall_notify_after_attempts",
 ):
     print(int(policy_get(query)))
 elif query in ("recovery_level", "unknown_policy"):
