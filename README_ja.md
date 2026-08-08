@@ -766,7 +766,7 @@ Step 3: エージェントが自分のinboxを読む
 | **Phase 2** | **busy→抑止、idle→nudge** | busy: stop hookがターン終了時に配信。idle: nudge（不可避） | Claude Codeエージェント＋stop hook環境（推奨） |
 | **Phase 3** | `FINAL_ESCALATION_ONLY` | 最終リカバリ時のみsend-keys | 完全に安定した環境 |
 
-Phase 2はidleフラグファイル（`/tmp/shogun_idle_{agent}`）でbusy/idle状態を判定する。Stop hookがターン境界でフラグを作成/削除する。作業中のnudge割り込みを排除しつつ、idle時の起床は維持する。
+Phase 2はidleフラグファイル（`/tmp/shogun_idle_{agent}`）でbusy/idle状態を判定する——`claude`向けの`agent_is_busy()`にとってこのフラグは**唯一の入力**であり、他CLIと異なりpane内容は一切参照しない。`inbox_watcher.sh`はpane自体が独立にidleと判定できた時にのみフラグをtouchする（cmd_209 subtask_209_modal_gate_fix）。通常運用中にこのフラグを**削除する箇所は無く**、唯一の一括削除は出陣（shutsujin）時の`rm -f /tmp/shogun_idle_*`のみである。セッション中に削除されないため、エージェントが実際に作業中であってもフラグは存在し続け（＝`agent_is_busy()`はidleを返し続け）得る。真にbusyな、あるいはモーダル表示中のpaneへ送出してはならない経路（nudge・`/clear`・startup prompt）は、このフラグに頼らず各々が独立したゲート（[`pane_has_open_modal()`](lib/agent_status.sh)）を持つ。
 
 > **なぜnudge完全撲滅できないのか？** Claude CodeのStop hookはターン終了時にしか発火しない。idleのエージェント（プロンプトで待機中）はターンが終了しないため、inboxチェックを発火させるhookがない。将来 `Notification` hookの `idle_prompt` タイプがブロック対応になるか、定期タイマーhookが追加されれば解決可能。
 

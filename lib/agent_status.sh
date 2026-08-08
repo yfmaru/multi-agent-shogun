@@ -159,6 +159,41 @@ agent_is_busy_check() {
     return 1  # idle (default)
 }
 
+# pane_has_open_modal <pane_target>
+# agent_is_busy_check() 内のモーダル脚注アンカー検査部分のみを切り出した
+# 狭い専用述語。Enter送出直前の最終ゲートとして使うことを目的とする
+# （cmd_209 subtask_209_modal_gate_fix）。
+# Returns: 0=モーダル表示中, 1=それ以外（pane不在を含む）
+#
+# なぜagent_is_busy_check()全体を使わぬか: busy全体をゲートに使うと、
+# spinner残骸や描画揺れで一瞬busyに転んだだけでEnter送出が恒久停止し、
+# フラグ方式が元々恐れていたデッドロックを配送経路へ持ち込む。モーダル
+# 脚注アンカーはspinner文には出現しないため、この述語に絞ることで
+# T-BUSY-008の誤busy面を再び開かない。
+pane_has_open_modal() {
+    local pane_target="$1"
+
+    if ! tmux display-message -t "$pane_target" -p '#{pane_id}' &>/dev/null; then
+        return 1  # pane不在はモーダル表示中ではない
+    fi
+
+    local full_capture pane_tail
+    full_capture=$(timeout 2 tmux capture-pane -t "$pane_target" -p -J 2>/dev/null)
+    pane_tail=$(echo "$full_capture" | tail -5)
+
+    if [[ -z "$pane_tail" ]]; then
+        return 1
+    fi
+
+    local bottom_block
+    bottom_block=$(echo "$pane_tail" | awk 'NF{b=b $0} !NF{b=""} END{print b}')
+    if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓'; then
+        return 0  # モーダル表示中
+    fi
+
+    return 1
+}
+
 # opencode_has_busy_animation <capture_text>
 # OpenCode paneの busy animation (`[■⬝]{8}`) を検出する。
 opencode_has_busy_animation() {

@@ -1561,3 +1561,38 @@ YAML
     ! grep -q "send-keys.*Escape" "$MOCK_LOG"
     ! grep -q "send-keys.*C-c" "$MOCK_LOG"
 }
+
+# --- T-MODAL-GATE-01 (cmd_209 subtask_209_modal_gate_fix) ---
+#
+# Reproduces the live bug from gunshi_rca_209_modal_autoclose.yaml: for
+# claude, agent_is_busy() consults ONLY the idle flag file, never pane
+# content (L2). The flag is never deleted during normal operation (L3), so
+# it reads "idle" even while an AskUserQuestion modal is open in the pane —
+# and send_wakeup's nudge Enter confirms the modal's first option (L1).
+#
+# setup() already touches the idle flag for test_agent (line ~176), so
+# agent_is_busy() reports idle here exactly as it wrongly did in production.
+# MOCK_CAPTURE_PANE carries a modal footer split across two lines the way
+# T-MODAL-01 (tests/integration/test_stall_detect_livepane.bats) reproduces
+# the real footer — this is what pane_has_open_modal() must catch where the
+# idle flag cannot.
+#
+# Before this fix: send_wakeup has no modal-aware gate at all, so it falls
+# straight to the send-keys nudge (Enter included). After this fix: the
+# pane_has_open_modal() gate added ahead of the send-keys block intercepts
+# it and no keys are sent (verified: reverting the send_wakeup gate hunk
+# alone reproduces a failing run of this test against otherwise-current
+# code).
+@test "T-MODAL-GATE-01: send_wakeup suppresses Enter into an open modal even though the idle flag says idle" {
+    export MOCK_CAPTURE_PANE="Enter to select · ↑/↓ to navigate · Esc to
+cancel"
+    run bash -c "source '$TEST_HARNESS' && send_wakeup 1"
+    [ "$status" -eq 0 ]
+
+    echo "$output" | grep -q "SKIP-MODAL" \
+        || { echo "expected a [SKIP-MODAL] log line; output: $output"; false; }
+    ! grep -q "send-keys.*inbox1" "$MOCK_LOG" \
+        || { echo "nudge text must not reach the pane while a modal is open"; cat "$MOCK_LOG"; false; }
+    ! grep -q "send-keys.*Enter" "$MOCK_LOG" \
+        || { echo "Enter must not reach the pane while a modal is open (would confirm the modal's first option)"; cat "$MOCK_LOG"; false; }
+}

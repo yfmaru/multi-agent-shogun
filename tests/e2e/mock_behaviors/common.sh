@@ -165,6 +165,14 @@ show_busy() {
     local cli_type="${1:-claude}"
     local seconds="${2:-0}"
     # Simulate Stop hook: remove idle flag when Claude mock starts processing
+    # NOTE (cmd_209 subtask_209_modal_gate_fix, gunshi_rca_209_modal_autoclose.yaml
+    # L5): this rm diverges from production. In production nothing deletes this
+    # flag mid-session — the only deletion is the fleet-wide rm at shutsujin
+    # departure — so this mock exercises a busy/idle round-trip the real flag
+    # never performs. Delivery paths that must not fire on a truly busy pane
+    # rely on pane_has_open_modal()/agent_is_busy_check() (pane content), not
+    # on this flag, precisely because the flag cannot be trusted to reflect
+    # busy state in production.
     if [[ "${MOCK_CLI_TYPE:-claude}" == "claude" ]] && [[ -n "${MOCK_AGENT_ID:-}" ]]; then
         local _flag_dir="${IDLE_FLAG_DIR:-/tmp}"
         rm -f "${_flag_dir}/shogun_idle_${MOCK_AGENT_ID}" 2>/dev/null || true

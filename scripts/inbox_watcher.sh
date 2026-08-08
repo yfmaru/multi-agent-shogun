@@ -580,6 +580,18 @@ send_cli_command() {
     local effective_cli
     effective_cli=$(get_effective_cli_type)
 
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix): this function sends
+    # C-c (line ~716) in addition to Enter. C-c during an open modal is a
+    # different kind of destruction (turn interruption) than Enter, so the
+    # entire route is gated here rather than gating Enter alone. Uses the
+    # narrow pane_has_open_modal() predicate, NOT agent_is_busy_check() —
+    # gating on busy-in-general would reintroduce the nudge-deadlock the
+    # idle-flag design already fears (spinner flicker → permanent stall).
+    if pane_has_open_modal "$PANE_TARGET"; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing CLI command ($cmd)" >&2
+        return 1
+    fi
+
     # cli_restart: delegate to switch_cli.sh (full /exit → relaunch cycle)
     if [[ "$cmd" == __CLI_RESTART__:* ]]; then
         local restart_args="${cmd#__CLI_RESTART__:}"
@@ -759,6 +771,16 @@ send_startup_prompt() {
         echo "[$(date)] [STARTUP] $AGENT_ID still busy after 15s — proceeding with startup prompt anyway" >&2
     fi
 
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix): the busy-poll above
+    # proceeds anyway after 15s even if still busy, so it cannot be relied
+    # on to stop an Enter into an open modal. Check the narrow modal
+    # predicate right before sending — NOT agent_is_busy_check() (that would
+    # reintroduce the nudge-deadlock the idle-flag design already fears).
+    if pane_has_open_modal "$PANE_TARGET"; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing startup prompt" >&2
+        return 1
+    fi
+
     local startup_prompt=""
     if type get_startup_prompt &>/dev/null; then
         startup_prompt=$(get_startup_prompt "$AGENT_ID" 2>/dev/null || true)
@@ -800,6 +822,14 @@ send_context_reset() {
     if [ "$AGENT_ID" = "shogun" ] || [ "$AGENT_ID" = "karo" ] || [ "$AGENT_ID" = "gunshi" ]; then
         echo "[$(date)] [SKIP] $AGENT_ID: suppressing context reset (command-layer agent)" >&2
         return 0
+    fi
+
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix): this function had no
+    # busy guard at all before this fix. Use the narrow pane_has_open_modal()
+    # predicate, not agent_is_busy_check() (see send_cli_command for why).
+    if pane_has_open_modal "$PANE_TARGET"; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing context reset" >&2
+        return 1
     fi
 
     local reset_cmd
@@ -1118,6 +1148,18 @@ send_wakeup() {
         return 0
     fi
 
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix): the busy-check at
+    # 優先度3 above (agent_is_busy) is a no-op for claude agents — see RCA
+    # gunshi_rca_209_modal_autoclose.yaml. Add a narrow, separate gate here
+    # using pane_has_open_modal(), NOT agent_is_busy_check() (gating on
+    # busy-in-general would reintroduce the nudge-deadlock the idle-flag
+    # design already fears). Do NOT clear unread here — this only skips
+    # delivery, it does not mean delivery completed.
+    if pane_has_open_modal "$PANE_TARGET"; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing nudge" >&2
+        return 0
+    fi
+
     # Shogun: deliver nudge via send-keys like other agents.
     # ntfy messages must reach Claude Code directly.
 
@@ -1233,6 +1275,15 @@ send_wakeup_with_escape() {
     # Phase 2 still skips if agent is busy — Escape during Working would interrupt
     if agent_is_busy; then
         echo "[$(date)] [SKIP] Agent $AGENT_ID is busy (Working), deferring Phase 2 nudge" >&2
+        return 0
+    fi
+
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix): claude/codex/opencode/
+    # antigravity already fall back to send_wakeup() above (gated there).
+    # This is the remaining raw path (copilot/kimi/etc.) — same narrow
+    # pane_has_open_modal() predicate, not agent_is_busy_check().
+    if pane_has_open_modal "$PANE_TARGET"; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing Escape+nudge" >&2
         return 0
     fi
 
@@ -1380,8 +1431,25 @@ process_unread() {
         reset_shogun_defer_state  # QC40-F1/F2: 未読0になったので延期状態を解除
         NEW_CONTEXT_SENT=0
         reset_nudge_throttle
-        # Ensure idle flag exists (fast-path recovery)
-        touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
+        # Ensure idle flag exists (fast-path recovery).
+        # cmd_209 subtask_209_modal_gate_fix: this touch was previously
+        # unconditional, defeating the pane-based guard at the slow-path
+        # touch below (~agent_is_busy_check) every tick — for claude, the
+        # idle flag is the SOLE input to agent_is_busy(), so an unconditional
+        # touch here made the flag a permanent lie ("idle") regardless of
+        # actual pane state. Apply the same guard used there: only touch if
+        # the pane itself independently agrees the agent is idle. Non-claude
+        # CLIs never consult this flag for busy detection, so their touch
+        # stays unconditional.
+        local fastpath_idle_flag_cli
+        fastpath_idle_flag_cli=$(get_effective_cli_type)
+        if [ "$fastpath_idle_flag_cli" = "claude" ]; then
+            if ! agent_is_busy_check "$PANE_TARGET" "$fastpath_idle_flag_cli"; then
+                touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
+            fi
+        else
+            touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
+        fi
         if ! agent_is_busy; then
             # Shogun: only clear input when pane is not active (Lord is away)
             if [ "$AGENT_ID" = "shogun" ] && pane_is_active; then
