@@ -763,7 +763,7 @@ Step 3: Agent reads its own inbox
 | **Phase 2** | **Busy → suppressed, Idle → nudge** | busy: stop hook delivers at turn end. idle: nudge (unavoidable) | Claude Code agents with stop hook (recommended) |
 | **Phase 3** | `FINAL_ESCALATION_ONLY` | send-keys only as last-resort recovery | Fully stable environments |
 
-Phase 2 uses the idle flag file (`/tmp/shogun_idle_{agent}`) to distinguish busy vs idle agents. The Stop hook creates/removes this flag at turn boundaries. This eliminates nudge interruptions during active work while still waking idle agents.
+Phase 2 uses the idle flag file (`/tmp/shogun_idle_{agent}`) to distinguish busy vs idle agents for Claude Code agents — this flag is the *sole* input to `agent_is_busy()` for `claude`; unlike other CLIs, no pane content is consulted. `inbox_watcher.sh` creates/touches the flag once the pane itself independently looks idle (cmd_209 subtask_209_modal_gate_fix); nothing removes it during normal operation — the only unconditional deletion is the fleet-wide `rm -f /tmp/shogun_idle_*` at shutsujin departure. Because the flag is never deleted mid-session, it stays present (and `agent_is_busy()` keeps reporting idle) even while the agent is actively working; delivery paths that must not fire during a truly busy or modal-blocked pane (nudge, `/clear`, startup prompt) each carry their own independent gate ([`pane_has_open_modal()`](lib/agent_status.sh)) rather than relying on this flag.
 
 > **Why can't nudges be fully eliminated?** Claude Code's Stop hook only fires at turn end. An idle agent (sitting at the prompt) has no turn ending, so there's no hook to trigger inbox checks. A future `Notification` hook with `idle_prompt` blocking support or a periodic timer hook could solve this.
 
