@@ -106,6 +106,17 @@ wait_for_log() {
     local ashigaru_idle_flag="$flag_dir/shogun_idle_ashigaru1"
     first_unread_seen=$(( $(date +%s) - 420 ))
 
+    # cmd_217 (two-marker busy/idle): claude's busy verdict no longer comes
+    # from "idle印 absent" (that was the old presence-only design this PR
+    # replaces) — it comes from a busy印 that outlives any idle印. Seed one
+    # so the watcher genuinely reads this agent as busy from the moment it
+    # starts, the same way the old absent-idle-flag default used to. Without
+    # this, the pane's cached @agent_cli can drift to "claude" (leftover
+    # from an earlier test in this shared tmux session) and the agent reads
+    # as idle by the new default, so the 300s stale-busy net this test
+    # exercises never fires within its wait window.
+    touch "$flag_dir/shogun_busy_ashigaru1"
+
     # Start mock in busy state before unread messages arrive.
     send_to_pane "$ashigaru1_pane" "busy_hold 12"
     sleep 1
