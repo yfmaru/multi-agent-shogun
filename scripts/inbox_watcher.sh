@@ -1386,6 +1386,18 @@ attempt_stall_recovery() {
     fi
 
     echo "[$(date)] [STALL] $AGENT_ID: still stalled after Escape — nudge" >&2
+
+    # Modal gate (cmd_216 F-3 ii): this route sends "inbox?" + Enter directly
+    # via tmux send-keys, bypassing send_wakeup entirely — so PR#97's 5-route
+    # gate table never covered it (gunshi QC finding, the 6th route). Enter
+    # into an open modal confirms/selects an option exactly as it would via
+    # send_wakeup (see T-MODAL-GATE-01) — gate it the same way, before
+    # sending anything.
+    if pane_has_open_modal "$PANE_TARGET"; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing stall-ladder nudge" >&2
+        return 0
+    fi
+
     timeout 5 tmux send-keys -t "$PANE_TARGET" "inbox?" 2>/dev/null || true
     sleep 0.3
     timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null || true

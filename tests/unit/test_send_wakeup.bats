@@ -1596,3 +1596,30 @@ cancel"
     ! grep -q "send-keys.*Enter" "$MOCK_LOG" \
         || { echo "Enter must not reach the pane while a modal is open (would confirm the modal's first option)"; cat "$MOCK_LOG"; false; }
 }
+
+# --- T-MODAL-GATE-02 (cmd_216 F-4) ---
+#
+# Live-measured (gunshi QC, cmd_209 PR#97 F-4): claude's first-run folder
+# trust dialog footer reads "Enter to confirm · Esc to cancel" — none of
+# pane_has_open_modal()'s pre-existing anchors ('enter to select' / 'to
+# navigate' / '↑/↓') match it, so the dialog passed through this predicate
+# undetected even though agent_is_busy_check() already caught it separately
+# via its own 'esc to' last-line rule. This adds the missing 'enter to
+# confirm' anchor.
+@test "T-MODAL-GATE-02: send_wakeup suppresses Enter into an open folder-trust dialog (enter to confirm)" {
+    export MOCK_CAPTURE_PANE="Do you trust the files in this folder?
+
+❯ 1. Yes, proceed
+  2. No, exit
+
+Enter to confirm · Esc to cancel"
+    run bash -c "source '$TEST_HARNESS' && send_wakeup 1"
+    [ "$status" -eq 0 ]
+
+    echo "$output" | grep -q "SKIP-MODAL" \
+        || { echo "expected a [SKIP-MODAL] log line; output: $output"; false; }
+    ! grep -q "send-keys.*inbox1" "$MOCK_LOG" \
+        || { echo "nudge text must not reach the pane while the trust dialog is open"; cat "$MOCK_LOG"; false; }
+    ! grep -q "send-keys.*Enter" "$MOCK_LOG" \
+        || { echo "Enter must not reach the pane while the trust dialog is open (would confirm it)"; cat "$MOCK_LOG"; false; }
+}
