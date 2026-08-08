@@ -589,7 +589,7 @@ send_cli_command() {
     # idle-flag design already fears (spinner flicker → permanent stall).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing CLI command ($cmd)" >&2
-        return 1
+        return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
     # cli_restart: delegate to switch_cli.sh (full /exit → relaunch cycle)
@@ -778,7 +778,7 @@ send_startup_prompt() {
     # reintroduce the nudge-deadlock the idle-flag design already fears).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing startup prompt" >&2
-        return 1
+        return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
     local startup_prompt=""
@@ -829,7 +829,7 @@ send_context_reset() {
     # predicate, not agent_is_busy_check() (see send_cli_command for why).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing context reset" >&2
-        return 1
+        return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
     local reset_cmd
@@ -1386,6 +1386,18 @@ attempt_stall_recovery() {
     fi
 
     echo "[$(date)] [STALL] $AGENT_ID: still stalled after Escape — nudge" >&2
+
+    # Modal gate (cmd_216 F-3 ii): this route sends "inbox?" + Enter directly
+    # via tmux send-keys, bypassing send_wakeup entirely — so PR#97's 5-route
+    # gate table never covered it (gunshi QC finding, the 6th route). Enter
+    # into an open modal confirms/selects an option exactly as it would via
+    # send_wakeup (see T-MODAL-GATE-01) — gate it the same way, before
+    # sending anything.
+    if pane_has_open_modal "$PANE_TARGET"; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing stall-ladder nudge" >&2
+        return 0
+    fi
+
     timeout 5 tmux send-keys -t "$PANE_TARGET" "inbox?" 2>/dev/null || true
     sleep 0.3
     timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null || true

@@ -496,6 +496,36 @@ seed_stalled_hash() {
     [ "$nudge_line" -lt "$clear_line" ]
 }
 
+# ─── TC-STALL-012 (cmd_216 F-3 ii): raw nudge Enter gated by open modal ───
+
+@test "TC-STALL-012: attempt_stall_recovery suppresses the raw nudge Enter while a modal is open" {
+    # This route (the "inbox?" + Enter mid-ladder step) sends via raw tmux
+    # send-keys, bypassing send_wakeup entirely — PR#97's 5-route gate table
+    # never covered it (gunshi QC's 6th-route finding). REAL_BUSY_TAIL_WRAPPED_JOINED
+    # carries both an 'esc to' busy marker (keeps is_stalled_pane true across
+    # the ladder) and a modal anchor ('enter to select'/'to navigate'/'↑/↓'),
+    # so this exercises the same live footer that made TC-STALL-010 necessary.
+    # Escape is unaffected (it is the intended way to dismiss a modal and is
+    # never gated); only the nudge's Enter must be suppressed.
+    run bash -c "
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL_WRAPPED_JOINED'
+        MOCK_USAGE_STATE=ok
+        MOCK_RECOVERY_LEVEL=full
+        source '$TEST_HARNESS'
+        $(seed_stalled_hash "$REAL_BUSY_TAIL_WRAPPED_JOINED" 500)
+        attempt_stall_recovery
+    "
+    [ "$status" -eq 0 ]
+    grep -q "send-keys.*Escape.*Escape" "$MOCK_LOG" \
+        || { echo "expected Escape x2 to still fire (never modal-gated)"; cat "$MOCK_LOG"; false; }
+    ! grep -q "send-keys.*inbox" "$MOCK_LOG" \
+        || { echo "nudge text must not reach the pane while a modal is open"; cat "$MOCK_LOG"; false; }
+    ! grep -q "send-keys.*Enter" "$MOCK_LOG" \
+        || { echo "nudge Enter must not reach the pane while a modal is open (would confirm the modal's first option)"; cat "$MOCK_LOG"; false; }
+    ! grep -q "send-keys.*/clear" "$MOCK_LOG" \
+        || { echo "/clear must not fire when the ladder never reached it"; cat "$MOCK_LOG"; false; }
+}
+
 # ─── TC-USAGE-007: usage_limit_state=limited (regardless of source) is honored ───
 
 @test "TC-USAGE-007: attempt_stall_recovery treats any 'limited' usage_limit_state as limited (source-agnostic)" {

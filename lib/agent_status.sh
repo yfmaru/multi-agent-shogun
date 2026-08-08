@@ -170,6 +170,13 @@ agent_is_busy_check() {
 # フラグ方式が元々恐れていたデッドロックを配送経路へ持ち込む。モーダル
 # 脚注アンカーはspinner文には出現しないため、この述語に絞ることで
 # T-BUSY-008の誤busy面を再び開かない。
+#
+# cmd_216 F-4: claude初回起動時のフォルダ信頼ダイアログ（脚注 "Enter to
+# confirm · Esc to cancel"）は上記アンカーのいずれにも一致せず、この述語
+# だけが当該ダイアログを見落としていた（agent_is_busy_check()側は末尾行の
+# 'esc to'規則で別途busyと拾えている）。'enter to confirm'を追加して塞ぐ。
+# 両関数の脚注検査は「同等ロジックの二重定義」のままであり、片方だけ
+# 広げた本コミットにより乖離が残る——統合は別cmdの範囲（cmd_216スコープ外）。
 pane_has_open_modal() {
     local pane_target="$1"
 
@@ -187,7 +194,7 @@ pane_has_open_modal() {
 
     local bottom_block
     bottom_block=$(echo "$pane_tail" | awk 'NF{b=b $0} !NF{b=""} END{print b}')
-    if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓'; then
+    if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓|enter to confirm'; then
         return 0  # モーダル表示中
     fi
 
