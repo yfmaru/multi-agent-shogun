@@ -589,7 +589,7 @@ send_cli_command() {
     # idle-flag design already fears (spinner flicker → permanent stall).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing CLI command ($cmd)" >&2
-        return 1
+        return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
     # cli_restart: delegate to switch_cli.sh (full /exit → relaunch cycle)
@@ -778,7 +778,7 @@ send_startup_prompt() {
     # reintroduce the nudge-deadlock the idle-flag design already fears).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing startup prompt" >&2
-        return 1
+        return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
     local startup_prompt=""
@@ -829,7 +829,7 @@ send_context_reset() {
     # predicate, not agent_is_busy_check() (see send_cli_command for why).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing context reset" >&2
-        return 1
+        return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
     local reset_cmd
