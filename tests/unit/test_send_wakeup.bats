@@ -427,8 +427,8 @@ MOCK
 
 # --- T-BUSY-001: agent_is_busy detects "Working" ---
 
-@test "T-BUSY-001: agent_is_busy returns 0 (busy) when no idle flag — claude CLI" {
-    rm -f "$TEST_TMPDIR/shogun_idle_test_agent"
+@test "T-BUSY-001: agent_is_busy returns 0 (busy) when busy印 is newer than idle印 — claude CLI (cmd_217 two-marker)" {
+    touch "$TEST_TMPDIR/shogun_busy_test_agent"
     run bash -c '
         source "'"$TEST_HARNESS"'"
         LAST_CLEAR_TS=0
@@ -452,7 +452,7 @@ MOCK
 # --- T-BUSY-003: send_wakeup skips when agent is busy ---
 
 @test "T-BUSY-003: send_wakeup skips nudge when agent is busy" {
-    rm -f "$TEST_TMPDIR/shogun_idle_test_agent"
+    touch "$TEST_TMPDIR/shogun_busy_test_agent"
     run bash -c '
         source "'"$TEST_HARNESS"'"
         send_wakeup 3
@@ -467,7 +467,7 @@ MOCK
 # --- T-BUSY-004: send_wakeup_with_escape skips when agent is busy ---
 
 @test "T-BUSY-004: send_wakeup_with_escape skips when agent is busy" {
-    rm -f "$TEST_TMPDIR/shogun_idle_test_agent"
+    touch "$TEST_TMPDIR/shogun_busy_test_agent"
     run bash -c '
         source "'"$TEST_HARNESS"'"
         send_wakeup_with_escape 2
@@ -597,7 +597,7 @@ MOCK
 # --- T-CODEX-004: C-u NOT sent when agent is busy ---
 
 @test "T-CODEX-004: C-u cleanup NOT sent when agent is busy" {
-    rm -f "$TEST_TMPDIR/shogun_idle_test_agent"
+    touch "$TEST_TMPDIR/shogun_busy_test_agent"
     run bash -c '
         source "'"$TEST_HARNESS"'"
         FIRST_UNREAD_SEEN=12345

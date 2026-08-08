@@ -8,6 +8,9 @@
 #   2. Auto-notifies karo via inbox_write (background, non-blocking)
 #   3. Checks the agent's inbox for unread messages
 #   4. If unread messages exist, BLOCKs the stop and feeds them back
+#      (cmd_217: this block path touches shogun_busy_<agent> — a BLOCK
+#      is a turn continuation, not an idle event, under the two-marker
+#      busy/idle design read by lib/agent_status.sh:agent_turn_state)
 #
 # Usage: Registered as a Stop hook in .claude/settings.json
 #   The hook receives JSON on stdin; outputs JSON to stdout.
@@ -164,6 +167,15 @@ fi
 # （touch箇所のみ。削除は出陣時のshutsujin_departure.shの一括rmだけ）。
 # cmd_209 P-2で新設したstall_busy()はこの点を承知の上、agent_is_busy()
 # が依存するフラグ方式とは別に、pane解析を直接見る形でstall検知を行う。
+
+# cmd_217: about to BLOCK (feed unread back so the agent keeps going).
+# This is a turn-continuation event, not an idle event — touch busy印 so
+# agent_turn_state() reads busy even though an idle印 may already sit here
+# from an earlier stop_hook_active=True pass (line ~60) or from the
+# now-idle path above. Newer mtime wins (§2 design), so this must be
+# touched AFTER any idle touch on this same invocation, immediately before
+# the block decision is emitted.
+touch "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}" 2>/dev/null || true
 
 # ─── Extract unread message summaries and build block JSON ───
 # Use a single python3 call with env vars to avoid shell quoting issues.

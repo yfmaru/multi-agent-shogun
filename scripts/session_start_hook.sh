@@ -34,6 +34,14 @@ mkdir -p "$LOG_DIR" || true
 echo "[$(date -Iseconds)] $AGENT_ID session_start_hook fired" \
     >> "$LOG_DIR/session_start_hook.log" || true
 
+# cmd_217: session開始直後は必ず作業に入る（Session Start手順の実行）ので
+# busy印を打つ。二枚の印の新旧mtime比較方式 (lib/agent_status.sh:
+# agent_turn_state) の入力の一つ。既存のwatcher起動時idle印touch
+# (inbox_watcher.sh) と競合しても、本hookのほうが後段（起動→watcher起動
+# より後にsessionが立ち上がる順）なのでbusy側が勝つのが自然だが、順序が
+# 逆転しても同秒同着はbusy側に倒す設計のため安全側に働く。
+touch "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}" 2>/dev/null || true
+
 case "$AGENT_ID" in
     shogun|karo|gunshi)
         # command-layer agents: full Session Start (Step 1-5)

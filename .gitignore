@@ -105,6 +105,7 @@ scripts/seo_qc.py
 scripts/seo_qc.sh
 !scripts/stop_hook_inbox.sh
 !scripts/session_start_hook.sh
+!scripts/user_prompt_submit_hook.sh
 !scripts/agent_status.sh
 !scripts/ratelimit_check.sh
 !scripts/switch_cli.sh

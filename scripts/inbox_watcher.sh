@@ -167,11 +167,17 @@ SHOGUN_DEFER_PENDING=${SHOGUN_DEFER_PENDING:-0}
 # not every 30s once QC40-F1 reopens the timeout branch.
 SHOGUN_DEFER_NTFY_SENT=${SHOGUN_DEFER_NTFY_SENT:-0}
 
+# cmd_217: one-shot guard for the 300s stale-busy safety net's ntfy
+# (§3/AC3'). Reset alongside the other unread-episode one-shots so the
+# next stale-busy episode can notify again.
+STALE_BUSY_NTFY_SENT=${STALE_BUSY_NTFY_SENT:-0}
+
 # Clears shogun-defer state. Call when a nudge actually reaches the pane
 # (send-keys success) or when the inbox goes back to zero unread.
 reset_shogun_defer_state() {
     SHOGUN_DEFER_PENDING=0
     SHOGUN_DEFER_NTFY_SENT=0
+    STALE_BUSY_NTFY_SENT=0
 }
 
 # QC40-F1: whether the main loop's 30s timeout tick should call
@@ -295,13 +301,60 @@ estimated_tokens: $ESTIMATED_TOKENS_TOTAL
 EOF
 }
 
+# cmd_217 §2-3: 装填検査（自己申告する機構）。
+# watcherは「busy印が一度でも現れたか」を自ら数える。nudge送出
+# （＝ターンを起こしたはずの出来事）を N 回行ってもなお busy印が
+# 一度も現れなければ、UserPromptSubmit hook が未装填の可能性を
+# [HOOK-UNARMED] として一度だけログ＋通知する。逆に現れれば
+# [HOOK-ARMED] を一度だけログする。claude以外のCLIは busy印を
+# 使わぬため対象外。
+HOOK_ARMED_CHECK_N=${HOOK_ARMED_CHECK_N:-3}
+NUDGE_SEND_COUNT=${NUDGE_SEND_COUNT:-0}
+HOOK_ARMED_LOGGED=${HOOK_ARMED_LOGGED:-0}
+HOOK_UNARMED_LOGGED=${HOOK_UNARMED_LOGGED:-0}
+
+check_hook_armed() {
+    local cli
+    cli=$(get_effective_cli_type)
+    [[ "$cli" == "claude" ]] || return 0
+
+    NUDGE_SEND_COUNT=$((NUDGE_SEND_COUNT + 1))
+
+    if [ -f "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}" ]; then
+        if [ "$HOOK_ARMED_LOGGED" -eq 0 ]; then
+            echo "[$(date)] [HOOK-ARMED] $AGENT_ID: UserPromptSubmit hook busy印を確認 (nudge x${NUDGE_SEND_COUNT})" >&2
+            HOOK_ARMED_LOGGED=1
+        fi
+        return 0
+    fi
+
+    if [ "$NUDGE_SEND_COUNT" -ge "$HOOK_ARMED_CHECK_N" ] && [ "$HOOK_UNARMED_LOGGED" -eq 0 ]; then
+        echo "[$(date)] [HOOK-UNARMED] $AGENT_ID: UserPromptSubmit hook が未装填の可能性 (nudge x${NUDGE_SEND_COUNT}, busy印一度も出現せず)" >&2
+        type branch_policy_notify &>/dev/null && branch_policy_notify "[HOOK-UNARMED] ${AGENT_ID}: UserPromptSubmit hook 未装填の疑い(nudge x${NUDGE_SEND_COUNT})" 2>/dev/null || true
+        HOOK_UNARMED_LOGGED=1
+    fi
+}
+
 disable_normal_nudge() {
     # Phase 2+: suppress nudge ONLY when agent is busy.
     # If agent is idle, nudge is needed (stop hook won't fire for idle agents).
     if [ "${ASW_DISABLE_NORMAL_NUDGE:-0}" != "1" ]; then
         return 1  # Phase 1: never suppress
     fi
-    # Phase 2+: check if agent is idle via flag file
+    # Phase 2+: check if agent is idle.
+    # cmd_217: route claude through the shared two-marker judgment
+    # (agent_turn_state) instead of re-deriving "idle" from flag presence
+    # here — a second presence-only definition would silently reproduce
+    # the same lie agent_is_busy() used to tell if this path is ever
+    # switched on (currently dead: ASW_DISABLE_NORMAL_NUDGE=0).
+    local cli
+    cli=$(get_effective_cli_type)
+    if [[ "$cli" == "claude" ]]; then
+        if [[ "$(agent_turn_state "$AGENT_ID")" == "idle" ]]; then
+            return 1  # Agent is IDLE → don't suppress, send nudge
+        fi
+        return 0  # Agent is BUSY → suppress, stop hook will deliver
+    fi
     if [ -f "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" ]; then
         return 1  # Agent is IDLE → don't suppress, send nudge
     fi
@@ -842,9 +895,23 @@ send_context_reset() {
     # Modal gate (cmd_209 subtask_209_modal_gate_fix): this function had no
     # busy guard at all before this fix. Use the narrow pane_has_open_modal()
     # predicate, not agent_is_busy_check() (see send_cli_command for why).
+    # cmd_217: modal-skip now returns 1 (defer) instead of 0 — the sole
+    # caller wraps this call in `if send_context_reset; then ...` so a
+    # non-zero return here means "retry next cycle", not "watcher dies".
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing context reset" >&2
-        return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
+        return 1
+    fi
+
+    # cmd_217: busy guard. Previously omitted deliberately — agent_is_busy()
+    # for claude was a presence-only lie (§1-2, gunshi_design_217), so
+    # gating on it here would have reintroduced the nudge/reset deadlock the
+    # idle-flag design feared. Now that agent_is_busy() reflects the real
+    # two-marker judgment, this guard finally means something: sending
+    # /clear into a mid-turn agent destroys in-progress context.
+    if agent_is_busy; then
+        echo "[$(date)] [SKIP] $AGENT_ID: busy — deferring context reset to next cycle" >&2
+        return 1
     fi
 
     local reset_cmd
@@ -958,8 +1025,10 @@ agent_is_busy() {
     local effective_cli
     effective_cli=$(get_effective_cli_type)
     if [[ "$effective_cli" == "claude" ]]; then
-        # フラグファイル方式: フラグなし=busy(return 0)、あり=idle(return 1)
-        [ ! -f "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" ]
+        # cmd_217: 二枚の印（busy印/idle印）の新旧mtime比較方式へ移行。
+        # 存在のみを見る旧方式（フラグなし=busy）は、touchに門を付けても
+        # 判定を1ミリも変えぬ死に体だった（§1-2, gunshi_design_217参照）。
+        [[ "$(agent_turn_state "$AGENT_ID")" == "busy" ]]
     else
         # 従来のpane解析（Codex等フォールバック）
         agent_is_busy_check "$PANE_TARGET" "$effective_cli"
@@ -1231,6 +1300,7 @@ send_wakeup() {
         # フラグを消すと agent_is_busy()=true → 以降のnudge全スキップ → デッドロック。
         # フラグはエージェントが実際に作業開始した時に自然消滅する（stop_hook設計と整合）。
         reset_shogun_defer_state  # QC40-F1/F2: 実際に届いたので延期状態を解除
+        check_hook_armed  # cmd_217 §2-3: 装填検査カウント
         echo "[$(date)] Wake-up sent to $AGENT_ID (${unread_count} unread, attempt $((attempt+1)))" >&2
         return 0
     done
@@ -1548,22 +1618,19 @@ process_unread() {
         NEW_CONTEXT_SENT=0
         reset_nudge_throttle
         # Ensure idle flag exists (fast-path recovery).
-        # cmd_209 subtask_209_modal_gate_fix: this touch was previously
-        # unconditional, defeating the pane-based guard at the slow-path
-        # touch below (~agent_is_busy_check) every tick — for claude, the
-        # idle flag is the SOLE input to agent_is_busy(), so an unconditional
-        # touch here made the flag a permanent lie ("idle") regardless of
-        # actual pane state. Apply the same guard used there: only touch if
-        # the pane itself independently agrees the agent is idle. Non-claude
-        # CLIs never consult this flag for busy detection, so their touch
-        # stays unconditional.
+        # cmd_217: for claude, idle/busy is now read from the two-marker
+        # mtime comparison (agent_turn_state) fed by hooks, not from this
+        # flag's mere presence — so touching it here would no longer change
+        # agent_is_busy()'s verdict, and pane-gating it (as cmd_209 did) was
+        # only ever a mitigation for the presence-only design that design
+        # replaces. Skip the touch entirely for claude; the idle印 is now
+        # exclusively hook-owned (stop_hook_inbox.sh / watcher startup /
+        # the 300s stale-busy net below). Non-claude CLIs still don't
+        # consult this flag for busy detection, so their touch stays
+        # unconditional (unchanged).
         local fastpath_idle_flag_cli
         fastpath_idle_flag_cli=$(get_effective_cli_type)
-        if [ "$fastpath_idle_flag_cli" = "claude" ]; then
-            if ! agent_is_busy_check "$PANE_TARGET" "$fastpath_idle_flag_cli"; then
-                touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
-            fi
-        else
+        if [ "$fastpath_idle_flag_cli" != "claude" ]; then
             touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
         fi
         if ! agent_is_busy; then
@@ -1666,7 +1733,19 @@ for s in data.get('specials', []):
             # deadlock where stop_hook failed to create the flag.
             local stale_busy_limit=300  # 5 minutes
             if [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ] && [ "$((now - FIRST_UNREAD_SEEN))" -ge "$stale_busy_limit" ]; then
-                echo "[$(date)] WARNING: $AGENT_ID busy for $((now - FIRST_UNREAD_SEEN))s with $normal_count unread — forcing idle flag (stale busy recovery)" >&2
+                # cmd_217 AC3/§3: this is the SOLE upper bound on permanent-busy
+                # under the two-marker design (Stop hook不発 is the only failure
+                # mode that can produce it). Wording + one-shot ntfy make the
+                # hook-unarmed suspicion visible instead of silently recovering.
+                if [[ "$busy_cli" == "claude" ]]; then
+                    echo "[$(date)] WARNING: $AGENT_ID busy for $((now - FIRST_UNREAD_SEEN))s with $normal_count unread — forcing idle flag (stale busy recovery; hook不発の疑い)" >&2
+                    if [ "${STALE_BUSY_NTFY_SENT:-0}" -eq 0 ]; then
+                        type branch_policy_notify &>/dev/null && branch_policy_notify "${AGENT_ID}: ${stale_busy_limit}秒busy継続のため強制idle化(hook不発の疑い)" 2>/dev/null || true
+                        STALE_BUSY_NTFY_SENT=1
+                    fi
+                else
+                    echo "[$(date)] WARNING: $AGENT_ID busy for $((now - FIRST_UNREAD_SEEN))s with $normal_count unread — forcing idle flag (stale busy recovery)" >&2
+                fi
                 touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}"
                 # Fall through to normal nudge/escalation below
             else
@@ -1694,8 +1773,13 @@ for s in data.get('specials', []):
         # Skip if: (1) already sent this batch, (2) clear_command already handled above,
         #          (3) agent is shogun (human-controlled).
         if [ "$has_task_assigned" = "1" ] && [ "$NEW_CONTEXT_SENT" -eq 0 ] && [ "$clear_seen" -eq 0 ]; then
-            send_context_reset
-            NEW_CONTEXT_SENT=1
+            # cmd_217: send_context_reset now returns 1 when it defers
+            # (busy/modal) instead of always 0 — only mark NEW_CONTEXT_SENT
+            # on an actual send, so a busy agent gets retried next cycle
+            # instead of the reset being silently skipped forever.
+            if send_context_reset; then
+                NEW_CONTEXT_SENT=1
+            fi
         fi
 
         # If startup prompt was just sent (Codex), skip follow-up nudge this cycle.
@@ -1781,23 +1865,21 @@ for s in data.get('specials', []):
         # state. See gunshi_design_209_stall_unread_deadlock.yaml §2 (案C).
 
         # Ensure idle flag exists when all messages are read.
-        # Recovers from stop_hook_inbox.sh flag loss during block cycles.
-        # cmd_171/C1-4: for claude, agent_is_busy() treats "flag present" as
-        # authoritative idle. Touching it unconditionally here — as before —
-        # would mask a genuine stall (agent stuck mid-turn, Stop hook never
-        # fired): the very next tick would see the flag and conclude idle,
-        # permanently hiding the stall from is_stalled_pane(). Condition the
-        # touch on the pane-based check (agent_is_busy_check) independently
-        # agreeing the agent is idle. Non-claude CLIs never consult this flag
-        # for busy detection, so their touch stays unconditional (existing
+        # cmd_217: claude no longer touches idle印 here at all — this
+        # pane-gated touch (cmd_171/C1-4, cmd_209 gate) was the ONE thing
+        # that could manufacture a permanent false-idle under the old
+        # presence-only design (§1-2/§3, gunshi_design_217): the mtime
+        # comparison it fed never mattered because agent_is_busy() only
+        # checked existence. Under the two-marker design idle印 is written
+        # exclusively by hooks (stop_hook_inbox.sh normal exit, watcher
+        # startup) and the 300s stale-busy net below — removing this touch
+        # is what closes off the "恒久idleを作り得るのは門付きtouchだけ"
+        # finding. Non-claude CLIs never consult this flag for busy
+        # detection, so their touch stays unconditional (existing
         # stop_hook-flag-loss recovery is unchanged for them).
         local idle_flag_cli
         idle_flag_cli=$(get_effective_cli_type)
-        if [ "$idle_flag_cli" = "claude" ]; then
-            if ! agent_is_busy_check "$PANE_TARGET" "$idle_flag_cli"; then
-                touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
-            fi
-        else
+        if [ "$idle_flag_cli" != "claude" ]; then
             touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}" 2>/dev/null || true
         fi
         # Clear stale nudge text from input field (Codex CLI prefills last input on idle).
