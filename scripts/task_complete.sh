@@ -278,6 +278,15 @@ _acquire_lock || die 2 "task YAMLのロックを取れぬ"
 # ロックを実際に取得した者だけが解放を担う（取得成功後に差し替える）
 trap '_release_lock; rm -f "$BACKUP"' EXIT
 
+# 書き換え前点検: 入力YAMLの時点で既に`status:`キーが重複していれば
+# awkは最初の一致行だけを書き換えるため、書き換え後もキー総数は
+# 変わらず重複したまま残る（後述の書き換え後検算はこのケースも
+# 正しく落とせるが、ここで先に落としておけば「どちらの時点で
+# 壊れていたか」の切り分けに役立つ）。この時点ではまだTASK_FILEへ
+# 書き込んでおらぬため巻き戻しは不要。
+[ "$(grep -cE '^  status:' "$TASK_FILE")" -eq 1 ] || \
+    die 2 "status行が重複しているか消失している（書き換え前点検・巻き戻し不要）"
+
 # 書き込み先と同じディレクトリに置く: mktempの既定(/tmp)は別デバイスの
 # ことがあり、その場合mvがrename(2)にならずcopy+unlinkとなって
 # 書き換え中にファイルが一瞬消える窓が生じる（inbox_write.shと同じ様式）
@@ -288,6 +297,14 @@ awk -v st="$STATUS" -v ts="$(date -Iseconds)" '
   { print }
 ' "$TASK_FILE" > "$tmp" && mv "$tmp" "$TASK_FILE"
 
+# 書き換え後検算: 「新しい値に一致する行が1件」だけでは、末尾等に
+# 別の値を持つ重複`status:`キーが残っていても素通りしてしまう
+# （YAMLパーサは後勝ちで古い方＝重複を採用する）。値を問わず
+# `status:`キーの出現数そのものが1件であることを先に検算する。
+[ "$(grep -cE '^  status:' "$TASK_FILE")" -eq 1 ] || {
+    cp "$BACKUP" "$TASK_FILE"
+    die 2 "status行が重複しているか消失している（巻き戻し済）"
+}
 [ "$(grep -cE "^  status: ${STATUS}$" "$TASK_FILE")" -eq 1 ] || {
     cp "$BACKUP" "$TASK_FILE"
     die 2 "status行の書き換えに失敗した（巻き戻し済）"
