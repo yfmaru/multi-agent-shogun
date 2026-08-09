@@ -46,10 +46,46 @@ mk_clean_worktree() {
     echo "$path"
 }
 
+# Installs a minimal `gh` stub at the front of PATH that answers
+# `gh pr list --state all --head <branch> --json mergedAt --jq ...` with a
+# fake merged timestamp iff <branch> is one of GH_STUB_MERGED_BRANCHES
+# (space-separated), and prints nothing otherwise (i.e. "no merged PR
+# found"). Real `gh` cannot be pointed at a fake local-path remote for
+# this — it recognizes it isn't a GitHub host and errors out.
+mk_gh_stub_path() {
+    mkdir -p "$TEST_TMPDIR/gh_stub_bin"
+    cat > "$TEST_TMPDIR/gh_stub_bin/gh" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pr" && "$2" == "list" ]]; then
+    branch="" prev=""
+    for arg in "$@"; do
+        [[ "$prev" == "--head" ]] && branch="$arg"
+        prev="$arg"
+    done
+    for b in $GH_STUB_MERGED_BRANCHES; do
+        [[ "$b" == "$branch" ]] && { echo "2026-01-01T00:00:00Z"; exit 0; }
+    done
+    exit 0
+fi
+exit 1
+STUB
+    chmod +x "$TEST_TMPDIR/gh_stub_bin/gh"
+    printf '%s:%s' "$TEST_TMPDIR/gh_stub_bin" "$PATH"
+}
+
 @test "no unsafe override flags anywhere in the script" {
     run grep -n -- '--force' "$FOLD"
     [ "$status" -ne 0 ]
     run grep -nE -- '(^|[^A-Za-z0-9_-])-D([^A-Za-z0-9_-]|$)' "$FOLD"
+    [ "$status" -ne 0 ]
+    # Scoped to the two dangerous subcommands, not the whole file — a bare
+    # script-wide "-f" ban would also flag `readlink -f` (portable
+    # absolute-path resolution, unrelated to any git override flag).
+    run grep -nE -- 'worktree remove.*(^|[^A-Za-z0-9_-])-f([^A-Za-z0-9_-]|$)' "$FOLD"
+    [ "$status" -ne 0 ]
+    run grep -nE -- 'worktree remove.*--force' "$FOLD"
+    [ "$status" -ne 0 ]
+    run grep -nE -- 'branch.*--delete[[:space:]]+--force' "$FOLD"
     [ "$status" -ne 0 ]
 }
 
@@ -77,13 +113,88 @@ assert_only_one_condition_fails() {
     [ -d "$path" ]
 }
 
-@test "C2 alone fails: no upstream tracking branch configured" {
-    path="$TEST_TMPDIR/wt_c2"
-    git -C "$TEST_MAIN" worktree add -q -b feat/c2 "$path" develop
-    run bash "$FOLD" "$path"
+@test "C2 alone fails: upstream configured, but a follow-up commit was never pushed (original path, independent of C6's landing check)" {
+    # Exercises C2's original (upstream-resolves) path in isolation. Uses a
+    # merged-PR gh stub so C6 passes via the landing fallback even though
+    # origin/develop..HEAD is non-zero here — proving C2's "ahead of
+    # upstream" failure is a distinct signal from C6's "landed" check, not
+    # just the same computation wearing two names.
+    stub_path="$(mk_gh_stub_path)"
+    path="$(mk_clean_worktree c2_unpushed)"
+    git -C "$TEST_MAIN" merge -q --ff-only "feat/c2_unpushed"
+    git -C "$TEST_MAIN" push -q origin develop
+
+    echo more > "$path/more.txt"
+    git -C "$path" add more.txt
+    git -C "$path" commit -q -m "local-only follow-up commit, never pushed"
+
+    run env PATH="$stub_path" GH_STUB_MERGED_BRANCHES="feat/c2_unpushed" bash "$FOLD" "$path"
     [ "$status" -ne 0 ]
     assert_only_one_condition_fails C2
     [ -d "$path" ]
+}
+
+@test "no-upstream + unlanded commit is refused (C2 and C6 both correctly fail — they share the landing check)" {
+    # The floor QC-1's fix must not loosen: a branch that was never pushed
+    # and carries unique content not present anywhere on base must still
+    # be refused. Here C2's fallback and C6 both fail together — that
+    # coupling is expected once @{u} is unresolvable, since they consult
+    # the exact same branch_has_landed() result (see assert_only_one_*
+    # tests above for where C2 and C6 are shown to be independently
+    # triggerable).
+    path="$TEST_TMPDIR/wt_c2_unlanded"
+    git -C "$TEST_MAIN" worktree add -q -b feat/c2_unlanded "$path" develop
+    git -C "$path" config user.email "test@example.com"
+    git -C "$path" config user.name "Test User"
+    echo unique > "$path/unique.txt"
+    git -C "$path" add unique.txt
+    git -C "$path" commit -q -m "never pushed, unique, unlanded commit"
+
+    run bash "$FOLD" "$path"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"[FAIL] C2 "* ]] || { echo "$output"; false; }
+    [[ "$output" == *"REFUSED"* ]] || { echo "$output"; false; }
+    [ -d "$path" ]
+}
+
+@test "C2 alone passes: no upstream, but branch has zero commits unique vs base" {
+    path="$TEST_TMPDIR/wt_c2_noop"
+    git -C "$TEST_MAIN" worktree add -q -b feat/c2_noop "$path" develop
+    run bash "$FOLD" "$path"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[OK]   C2"* ]] || { echo "$output"; false; }
+}
+
+@test "C2+C6 pass via merged-PR landing fallback: push, squash-merge, delete remote branch, prune (gh pr merge --squash --delete-branch equivalent, QC-1 required test)" {
+    stub_path="$(mk_gh_stub_path)"
+    path="$(mk_clean_worktree squash_landed)"
+    echo feature > "$path/feature.txt"
+    git -C "$path" add feature.txt
+    git -C "$path" commit -q -m "feature work"
+    git -C "$path" push -q origin "feat/squash_landed"
+
+    # Squash-merge into develop: content lands, but the branch's own
+    # commit never becomes an ancestor of develop.
+    git -C "$TEST_MAIN" checkout -q develop
+    git -C "$TEST_MAIN" merge -q --squash "feat/squash_landed"
+    git -C "$TEST_MAIN" commit -q -m "squash merge feat/squash_landed"
+    git -C "$TEST_MAIN" push -q origin develop
+
+    # gh pr merge --delete-branch equivalent: remote branch deleted, then
+    # pruned locally — this is what makes @{u} unresolvable (QC-1).
+    git -C "$path" push -q origin --delete "feat/squash_landed"
+    git -C "$path" fetch -q --prune
+
+    run env PATH="$stub_path" GH_STUB_MERGED_BRANCHES="feat/squash_landed" bash "$FOLD" "$path"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[OK]   C2"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"[OK]   C6"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"DRY-RUN"* ]] || { echo "$output"; false; }
+
+    run env PATH="$stub_path" GH_STUB_MERGED_BRANCHES="feat/squash_landed" bash "$FOLD" "$path" --yes
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"FOLDED"* ]] || { echo "$output"; false; }
+    [ ! -d "$path" ]
 }
 
 @test "C3 alone fails: repo-wide stash entry" {
@@ -127,6 +238,33 @@ assert_only_one_condition_fails() {
     run bash "$FOLD" "$path"
     [ "$status" -eq 0 ]
     [[ "$output" == *"DRY-RUN"* ]] || { echo "$output"; false; }
+}
+
+@test "C5 alone fails: a live process holds a subdirectory (not the root) as cwd" {
+    path="$(mk_clean_worktree c5_sub)"
+    mkdir -p "$path/sub/dir"
+    ( cd "$path/sub/dir" && exec timeout 8 sleep 20 ) &
+    sleep 1
+
+    run bash "$FOLD" "$path"
+    [ "$status" -ne 0 ]
+    assert_only_one_condition_fails C5
+
+    wait || true
+    run bash "$FOLD" "$path"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DRY-RUN"* ]] || { echo "$output"; false; }
+}
+
+@test "C5 alone fails (fails closed): neither /proc nor lsof is available" {
+    path="$(mk_clean_worktree c5_noverify)"
+    run env WORKSPACE_FOLD_PROC_DIR="$TEST_TMPDIR/no_such_proc" \
+        WORKSPACE_FOLD_LSOF_BIN="no_such_lsof_binary_xyz" \
+        bash "$FOLD" "$path"
+    [ "$status" -ne 0 ]
+    assert_only_one_condition_fails C5
+    [[ "$output" == *"cannot verify"* ]] || { echo "$output"; false; }
+    [ -d "$path" ]
 }
 
 @test "C6 alone fails: branch pushed but not landed on base, no PR" {

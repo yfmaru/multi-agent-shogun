@@ -27,8 +27,13 @@ reported but nothing is removed. Pass --yes to actually fold.
              Assumes origin/<base> is up to date locally; this script does
              not fetch on your behalf.
 
-Exit status: 0 if no removal was attempted or all attempted removals
-succeeded; 1 if any target failed a safety condition or a removal failed.
+Exit status:
+  Single target: 0 if no removal was attempted or the removal succeeded;
+                 1 if a safety condition failed or the removal failed.
+  --sweep:       always 0, regardless of how many targets were blocked —
+                 a blocked in-progress workspace is the normal steady
+                 state for a sweep. Read the SWEEP SUMMARY line for
+                 foldable/folded/blocked counts.
 EOF
 }
 
@@ -41,7 +46,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --sweep) MODE="sweep"; shift ;;
         --yes) DO_YES=1; shift ;;
-        --base) BASE_BRANCH="$2"; shift 2 ;;
+        --base)
+            if [[ $# -lt 2 ]]; then
+                echo "--base requires an argument" >&2; usage >&2; exit 2
+            fi
+            BASE_BRANCH="$2"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
         *)
@@ -120,18 +129,34 @@ c1_status_clean() {
 }
 
 # C2: no commits that exist only locally (unpushed).
+#
+# `@{u}` is unresolvable once the remote branch is deleted post-merge —
+# the normal state right after `gh pr merge --delete-branch`, which is
+# also the moment this script is most needed (design §3 C2 caveat).
+# When that happens, judge by landing instead of refusing outright:
+# see branch_has_landed().
 c2_no_unpushed_commits() {
-    local path="$1" upstream ahead
-    if ! upstream="$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>&1)"; then
-        echo "no upstream tracking branch configured; cannot verify pushed state"
+    local path="$1" base="$2" upstream ahead branch rc
+    if upstream="$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>&1)"; then
+        ahead="$(git -C "$path" log "${upstream}..HEAD" --oneline 2>&1)"
+        if [[ -n "$ahead" ]]; then
+            echo "unpushed commits ahead of $upstream: $(echo "$ahead" | wc -l) commit(s)"
+            return 1
+        fi
+        return 0
+    fi
+
+    branch="$(git -C "$path" branch --show-current)"
+    if [[ -z "$branch" ]]; then
+        echo "no upstream tracking branch configured, and detached HEAD; cannot verify pushed state"
         return 1
     fi
-    ahead="$(git -C "$path" log "${upstream}..HEAD" --oneline 2>&1)"
-    if [[ -n "$ahead" ]]; then
-        echo "unpushed commits ahead of $upstream: $(echo "$ahead" | wc -l) commit(s)"
-        return 1
+    branch_has_landed "$path" "$base" "$branch" && rc=0 || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        return 0
     fi
-    return 0
+    echo "no upstream tracking branch configured, and branch '$branch' has not landed on origin/$base"
+    return 1
 }
 
 # C3: no stash entries. Stash is shared across all worktrees of a repo
@@ -166,16 +191,20 @@ c4_no_data_files() {
 # (macOS/BSD) this falls back to lsof. If neither is available, this fails
 # closed (refuses to fold) rather than silently reporting "clear".
 c5_no_live_process() {
-    local path="$1" canon
+    local path="$1" canon proc_dir
     canon="$(resolve_path "$path")"
+    # WORKSPACE_FOLD_PROC_DIR exists solely so tests can exercise the
+    # "neither /proc nor lsof available" fail-closed branch below without
+    # actually hiding /proc on the host. Unset/default is always /proc.
+    proc_dir="${WORKSPACE_FOLD_PROC_DIR:-/proc}"
 
-    if [[ -d /proc ]]; then
+    if [[ -d "$proc_dir" ]]; then
         local p cwd pid
-        for p in /proc/[0-9]*; do
+        for p in "$proc_dir"/[0-9]*; do
             [[ -e "$p/cwd" ]] || continue
             cwd="$(readlink -f "$p/cwd" 2>/dev/null)" || continue
             if [[ "$cwd" == "$canon" || "$cwd" == "$canon"/* ]]; then
-                pid="${p#/proc/}"
+                pid="${p##*/}"
                 echo "process $pid has cwd under $canon"
                 return 1
             fi
@@ -183,7 +212,12 @@ c5_no_live_process() {
         return 0
     fi
 
-    if command -v lsof >/dev/null 2>&1; then
+    # WORKSPACE_FOLD_LSOF_BIN exists solely so tests can exercise the
+    # "neither /proc nor lsof available" fail-closed branch below without
+    # stripping lsof's real directory from PATH (which, on this platform,
+    # also holds git/bash and would break the test harness itself).
+    # Unset/default is always the real "lsof".
+    if command -v "${WORKSPACE_FOLD_LSOF_BIN:-lsof}" >/dev/null 2>&1; then
         local hit
         hit="$(lsof -a -d cwd +D "$canon" 2>/dev/null | awk 'NR>1')"
         if [[ -n "$hit" ]]; then
@@ -197,19 +231,18 @@ c5_no_live_process() {
     return 1
 }
 
-# C6: the branch has landed on the base branch (merged PR, or nothing
-# unique left ahead of base). "Clean" and "done" are different things;
-# this checks "done".
-c6_branch_landed() {
-    local path="$1" base="$2" branch ahead merged
-    branch="$(git -C "$path" branch --show-current)"
-    if [[ -z "$branch" ]]; then
-        echo "detached HEAD; cannot determine branch identity"
-        return 1
-    fi
+# Shared by C2's no-upstream fallback and C6: has $branch (checked out at
+# HEAD in $path) landed on origin/$base — either because it's an ancestor
+# (nothing unique left ahead), or because a merged PR already carried its
+# content in (squash-merge, so the commits themselves never become
+# ancestors)? "Clean" and "done" are different things; this checks "done".
+#
+# Returns: 0 landed, 1 not landed, 2 cannot determine (origin/$base does
+# not resolve locally — caller must fetch first).
+branch_has_landed() {
+    local path="$1" base="$2" branch="$3" ahead merged
     if ! ahead="$(git -C "$path" rev-list --count "origin/${base}..HEAD" 2>&1)"; then
-        echo "cannot resolve origin/$base locally to check landing status: $ahead"
-        return 1
+        return 2
     fi
     if [[ "$ahead" =~ ^[0-9]+$ ]] && [[ "$ahead" -eq 0 ]]; then
         return 0
@@ -221,8 +254,23 @@ c6_branch_landed() {
             return 0
         fi
     fi
-    echo "branch '$branch' has $ahead commit(s) ahead of origin/$base and no merged PR found"
     return 1
+}
+
+# C6: the branch has landed on the base branch. See branch_has_landed().
+c6_branch_landed() {
+    local path="$1" base="$2" branch rc
+    branch="$(git -C "$path" branch --show-current)"
+    if [[ -z "$branch" ]]; then
+        echo "detached HEAD; cannot determine branch identity"
+        return 1
+    fi
+    branch_has_landed "$path" "$base" "$branch" && rc=0 || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2) echo "cannot resolve origin/$base locally to check landing status"; return 1 ;;
+        *) echo "branch '$branch' has commit(s) ahead of origin/$base and no merged PR found"; return 1 ;;
+    esac
 }
 
 # Runs C1-C7 against one worktree path, printing one line per condition.
@@ -236,7 +284,21 @@ check_worktree() {
     fi
     echo "[OK]   C7 ($path): registered worktree"
 
-    for check in c1_status_clean:C1 c2_no_unpushed_commits:C2 c3_no_stash:C3 c4_no_data_files:C4 c5_no_live_process:C5; do
+    if msg="$(c1_status_clean "$path")"; then
+        echo "[OK]   C1 ($path)"
+    else
+        echo "[FAIL] C1 ($path): $msg"
+        fail=1
+    fi
+
+    if msg="$(c2_no_unpushed_commits "$path" "$base")"; then
+        echo "[OK]   C2 ($path)"
+    else
+        echo "[FAIL] C2 ($path): $msg"
+        fail=1
+    fi
+
+    for check in c3_no_stash:C3 c4_no_data_files:C4 c5_no_live_process:C5; do
         local fn="${check%%:*}" id="${check##*:}"
         if msg="$($fn "$path")"; then
             echo "[OK]   $id ($path)"
