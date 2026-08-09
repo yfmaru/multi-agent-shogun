@@ -1060,11 +1060,35 @@ declare -f usage_limit_state >/dev/null || usage_limit_state() { echo unknown; }
 # agent_is_busy() を claude 向けに直せば、nudge抑止・/clearガード・
 # エスカレーションという配送経路が同時に挙動を変えてしまうため、
 # stall検知の前提だけをここで差し替える。
+#
+# cmd_220 S-1 STALL_BUSY_OR_TURN_STATE: pane幅44ではagent_is_busy_check()の
+# 末尾行'esc to'規則がヒント行の切り詰めにより現れず、stall検知が誤idleへ
+# 落ちる（gunshi_design_220_pane_width_busy_scope §width_mechanism）。
+# 単純にagent_turn_stateへ差し替えるのは退行——UserPromptSubmit hookが
+# 未装填の日、agent_turn_stateは静かに「常にidle」へ縮退し（cmd_217の
+# 設計どおり）、stall検知がそれだけに依存すると緑のまま丸ごと沈黙する。
+# ゆえに二つの幅非依存な入力の論理和にする。
+#
+# 【軍師設計からの変更点】軍師の設計案は第二項に`pane_has_open_modal`
+# （選択肢一覧型モーダルの脚注アンカーのみ）を挙げていたが、実装時に
+# tests/unit/test_stall_detect.bats TC-STALL-001等（REAL_BUSY_TAIL=
+# ' Esc to cancel · Tab to amend · ctrl+e to explain'——選択肢一覧では
+# ない許可確認ダイアログの実測フィクスチャ、cmd_209 P-2 Step0で採取）
+# で実測すると、この文言は`pane_has_open_modal`のどのアンカー
+# （enter to select|to navigate|↑/↓|enter to confirm）にも一致せず、
+# 旧来`agent_is_busy_check`の末尾行'esc to'規則で拾えていたものを
+# 新たに取り逃す（AC4が禁じる誤idle面の新設）。ゆえに第二項は
+# `pane_has_open_modal`ではなく`agent_is_busy_check`（旧来のstall_busy
+# 全量、末尾行'esc to'・モーダル脚注・spinner語彙を全て含む）を採る。
+# こちらは旧stall_busy()の検知力を包含する厳密な上位集合であり、
+# agent_turn_stateを追加するだけで何も失わない。is_stalled_paneは
+# busyかつ画面hash無変化の二重ゲートゆえ、busy側を広げても誤検知には
+# 直結しない。
 stall_busy() {
     local cli
     cli=$(get_effective_cli_type)
     if [[ "$cli" == "claude" ]]; then
-        agent_is_busy_check "$PANE_TARGET" "$cli"
+        [[ "$(agent_turn_state "$AGENT_ID")" == "busy" ]] || agent_is_busy_check "$PANE_TARGET" "$cli"
     else
         agent_is_busy
     fi

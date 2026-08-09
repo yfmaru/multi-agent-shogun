@@ -123,7 +123,12 @@ if $STANDALONE; then
         agent_id=$(timeout 2 tmux display-message -t "$pane_target" -p '#{@agent_id}' 2>/dev/null || echo "---")
         [[ -z "$agent_id" ]] && agent_id="---"
 
-        agent_is_busy_check "$pane_target" && rc=0 || rc=$?
+        # cmd_220 S-2: claude型はagent_turn_state（幅非依存）優先で判定する
+        # get_pane_busy_rc()経由。agent_is_busy_check()直呼びは幅44で
+        # 繁忙中も「待機中」と誤表示する（gunshi_design_220 §scope_findings Q3(a)）。
+        pane_agent_id_arg="$agent_id"
+        [[ "$pane_agent_id_arg" == "---" ]] && pane_agent_id_arg=""
+        get_pane_busy_rc "$pane_target" "" "$pane_agent_id_arg" && rc=0 || rc=$?
         label=$(state_label "$rc")
 
         print_padded "$pane_target" 30
@@ -238,7 +243,9 @@ for i in "${!AGENTS[@]}"; do
     fi
 
     # Pane state
-    agent_is_busy_check "$pane_target" "$cli_type" && rc=0 || rc=$?
+    # cmd_220 S-2: agent/cli_typeを既に持っているのでget_pane_busy_rc()へ
+    # そのまま渡し、claude型はagent_turn_state（幅非依存）を優先させる。
+    get_pane_busy_rc "$pane_target" "$cli_type" "$agent" && rc=0 || rc=$?
     pane_state=$(state_label "$rc")
 
     # Task info
