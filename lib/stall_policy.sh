@@ -41,6 +41,9 @@ DEFAULT_STALL_POLICY = {
     "stall_retry_cooldown_sec": 600,
     "recovery_level": "escape_only",
     "unknown_policy": "escape_only",
+    # cmd_219 STALL_AWAITING_INPUT_GATE: 'none'既定は「名指しできぬ固着に
+    # 鍵を撃たぬ」安全側。'escape_only'は門を通さぬ従来挙動へ戻す弁。
+    "nonmodal_recovery_level": "none",
     "usage_limit_threshold_pct": 95,
     "usage_cache_ttl_sec": 120,
     # cmd_218 residual_hole: an Escape-proof stall (or a persistent
@@ -83,7 +86,7 @@ elif query in (
     "stall_notify_after_attempts",
 ):
     print(int(policy_get(query)))
-elif query in ("recovery_level", "unknown_policy"):
+elif query in ("recovery_level", "unknown_policy", "nonmodal_recovery_level"):
     print(str(policy_get(query)))
 elif query == "usage_limit_pane_patterns":
     patterns = policy_get("usage_limit_pane_patterns")
