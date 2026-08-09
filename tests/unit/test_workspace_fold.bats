@@ -139,7 +139,19 @@ assert_only_one_condition_fails() {
     git -C "$path" commit -q -m "unmerged commit"
     git -C "$path" push -q -u origin feat/c6
 
-    run env PATH="/usr/bin:/bin" bash "$FOLD" "$path"
+    # Simulate "gh not installed" by excluding only gh's own directory from
+    # PATH, not by blunt-stripping PATH (which would also hide lsof/coreutils
+    # needed by other checks on non-Linux platforms).
+    local gh_bin gh_dir filtered_path
+    gh_bin="$(command -v gh || true)"
+    if [[ -n "$gh_bin" ]]; then
+        gh_dir="$(dirname "$gh_bin")"
+        filtered_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vF "$gh_dir" | tr '\n' ':')"
+    else
+        filtered_path="$PATH"
+    fi
+
+    run env PATH="$filtered_path" bash "$FOLD" "$path"
     [ "$status" -ne 0 ]
     assert_only_one_condition_fails C6
     [ -d "$path" ]
