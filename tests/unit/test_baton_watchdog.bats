@@ -471,9 +471,13 @@ YAML
 @test "TC-BATON-008: missing or corrupt shogun_to_karo.yaml is treated as open_cmds=0" {
     rm -f "$FIXTURE_ROOT/queue/shogun_to_karo.yaml"
 
+    # cmd_221/W-1是正: count_open_cmdsは壊れている間、標準エラーへ診断を
+    # 1行出すようになった(TC-221-W1-001が固定)。本テストの関心は
+    # 「標準出力の契約が0のまま変わらないこと」なので、診断行を混ぜぬ
+    # よう2>/dev/nullで切り離す。
     run bash -c "
         source '$TEST_HARNESS'
-        baton_watchdog_count_open_cmds
+        baton_watchdog_count_open_cmds 2>/dev/null
     "
     [ "$status" -eq 0 ]
     [ "$output" = "0" ]
@@ -484,7 +488,7 @@ YAML
 
     run bash -c "
         source '$TEST_HARNESS'
-        baton_watchdog_count_open_cmds
+        baton_watchdog_count_open_cmds 2>/dev/null
     "
     [ "$status" -eq 0 ]
     [ "$output" = "0" ]
@@ -3820,4 +3824,397 @@ YAML
     [ "$status" -eq 0 ]
     echo "$output" | grep -q "RESULT:1" || { echo "$output"; false; }
     echo "$output" | grep -q "quiet window too wide" || { echo "$output"; false; }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_221: W-1（パース失敗を平穏と読ませぬ）＋ awaiting: shogun 語彙
+# (gunshi_design_awaiting_scheme_and_write_conflict.yaml)
+#
+# 【W-1】baton_watchdog_count_open_cmds の「壊れていても0を返し、決して
+# 非0で落ちない」性質自体は変えない。0が「0件」なのか「読めぬ」なのかを
+# 呼び手が取り違えぬための独立経路を追加する。
+#   TC-221-W1-001: パース失敗時、count_open_cmdsが標準エラーへ1行出す
+#   TC-221-W1-002: 正常なqueueではcheck_onceがqueue_parse_failed通知を出さない
+#   TC-221-W1-003: パース失敗はunread/active/経過時間に関わらず即座に
+#                  家老へ通知される（閾値なし）
+#   TC-221-W1-004: 再通知ガード——閾値未満は再通知せず、超えたら再通知する
+#   TC-221-W1-005【最重要】07:18事故と同じ型②破損（コロン+空白を含む
+#                  継続行によるScannerError）を人工的に最小再現した
+#                  合成検体（実データを含まない。cmd_221 fixture-leak是正
+#                  で実データ版から差し替え済み）を用いて、check_onceが
+#                  家老へ行番号入りで即座に警報すること
+#   TC-221-W1-006【境界の明文化・非回帰】型①（":"を含まぬ注入・値へ
+#                  静かに吸い込まれる）はYAML的に正当なため例外を投げず、
+#                  W-1の守備範囲外である。C-4（フィールド形状検査・
+#                  queue_integrity_check.py・別足軽の別PR）が担う領域で
+#                  あることを固定し、W-1がここまで捕まえるという誤った
+#                  期待が後日生じるのを防ぐ
+#
+# 【awaiting: shogun】SH-2（母数計算は変更しない・除外しない）が本設計の
+# 核心。除外すると07:18の1時間の沈黙が再演する(PA-1)。
+#   TC-221-SH-001【最重要・AC5】awaiting:shogunを持つcmdはopen_cmds_machine
+#                  (exclude_awaiting指定時)から除外されず残る
+#   TC-221-SH-002: 有効なawaiting:shogunの印があれば、将軍inbox宛の文面が
+#                  対象cmd_idと二択（裁可するか、印を外して差し戻せ）を
+#                  含む行動要求形に差し替わる。karo宛(msg_actionable)は
+#                  変わらない
+#   TC-221-SH-003: awaiting_target/awaiting_check/awaiting_sinceのいずれか
+#                  欠落は印を無効として扱う（将軍宛は従来どおりの状態
+#                  記述のまま）。open_cmds_machineからは除外されない
+#                  （そもそもshogunは除外対象でないため当然だが、退行
+#                  しないことを固定する）
+#   TC-221-SH-004: 禁止値（例: karo）は印として扱われず、除外もされない
+#                  （安全側倒し）
+#   TC-221-SH-005: 複数のawaiting:shogun cmdがあれば、将軍宛文面に
+#                  " / "区切りで両方のcmd_idが現れる
+# ═══════════════════════════════════════════════════════════════
+
+FIXTURE_CMD221_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)/fixtures"
+
+# --- TC-221-W1-001: パース失敗時、count_open_cmdsが標準エラーへ1行出す ---
+
+@test "TC-221-W1-001: baton_watchdog_count_open_cmds emits one stderr line on queue parse failure" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands: [this is: not: valid: yaml: [[[
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "queue parse failed" || { echo "$output"; false; }
+}
+
+# --- TC-221-W1-002: 正常なqueueではqueue_parse_failed通知を出さない(非回帰) ---
+
+@test "TC-221-W1-002: a healthy queue never triggers queue_parse_failed" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    ! grep -q "queue_parse_failed" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-W1-003: パース失敗は閾値なしで即座に家老へ通知される ---
+
+@test "TC-221-W1-003: a corrupt queue notifies karo immediately, with no elapsed-time threshold and regardless of unread/active" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands: [this is: not: valid: yaml: [[[
+YAML
+    # unreadを1件立てて通常のbaton_lost条件は絶対に成立させない
+    # （それでもパース失敗の警報は独立に発火するはずであることの確認）
+    cat > "$FIXTURE_ROOT/queue/inbox/ashigaru1.yaml" << 'YAML'
+messages:
+  - id: msg_unread
+    read: false
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: karo queue_parse_failed: " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "^INBOX_WRITE: shogun queue_parse_failed: " "$SHOGUN_NOTIFY_LOG" || { echo "shogun should not receive the parse-failure alert (karo only, per design)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-W1-004: 再通知ガード ---
+
+@test "TC-221-W1-004: queue_parse_failed does not repeat within the threshold, but does after it" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands: [this is: not: valid: yaml: [[[
+YAML
+
+    # (a) 直近に通知済み(100秒前 < 既定900秒) → 再通知しない
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_QUEUE_PARSE_FAIL_NOTIFIED=\$(( \$(date +%s) - 100 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    ! grep -q "queue_parse_failed" "$SHOGUN_NOTIFY_LOG" || { echo "(a) unexpected repeat within threshold"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # (b) 直近の通知が1000秒前(既定900秒超) → 再通知する
+    > "$SHOGUN_NOTIFY_LOG"
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_QUEUE_PARSE_FAIL_NOTIFIED=\$(( \$(date +%s) - 1000 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'queue_parse_failed' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { echo "(b) expected exactly one repeat notification"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # (c) 2回連続呼び出し(同一破損の継続) → 2回目は即時再通知しない
+    > "$SHOGUN_NOTIFY_LOG"
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'queue_parse_failed' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] || { echo "(c) same-continuation second call should not repeat"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-W1-005【最重要】07:18事故と同じ型②破損を合成検体で再現する ---
+
+@test "TC-221-W1-005: a synthetic type-2 ScannerError specimen (reproducing the 07:18 JST incident's error class) is detected, and karo's alert includes the pyyaml line and column numbers" {
+    [ -f "$FIXTURE_CMD221_DIR/cmd_221_real_0718_type2_scanner_error.yaml" ] || skip "specimen fixture missing"
+    cp "$FIXTURE_CMD221_DIR/cmd_221_real_0718_type2_scanner_error.yaml" "$FIXTURE_ROOT/queue/shogun_to_karo.yaml"
+
+    # まず素のパース検査そのものが合成検体に対して失敗を返すこと
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_check_queue_parseable
+        echo \"EXIT:\$?\"
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "EXIT:1" || { echo "$output"; false; }
+    echo "$output" | grep -q "line 10" || { echo "expected pyyaml line number 10 in the diagnostic"; echo "$output"; false; }
+    echo "$output" | grep -q "column 20" || { echo "expected pyyaml column number 20 in the diagnostic (合成データでも情報量を落とさぬこと)"; echo "$output"; false; }
+
+    # check_once経由でも家老へ即座に警報し、行番号・列番号を含むこと(iii要件)
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: karo queue_parse_failed: " "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "line 10" "$SHOGUN_NOTIFY_LOG" || { echo "karo's alert should carry the pyyaml line number for direct repair"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "column 20" "$SHOGUN_NOTIFY_LOG" || { echo "karo's alert should carry the pyyaml column number for direct repair"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-W1-006【境界の明文化・非回帰】型①はW-1の守備範囲外 ---
+
+@test "TC-221-W1-006: type-1 corruption (no ': ' in the continuation, silently absorbed into the prior scalar) is NOT flagged by W-1 — that is C-4's job, tracked separately" {
+    # gunshi_design_awaiting_scheme_and_write_conflict.yaml b1: 継続行に
+    # ": "が現れなければYAML的に正当な複数行スカラとして静かに吸い込まれ、
+    # pyyamlは例外を投げない。W-1はパース例外(型②)だけを検知する設計で
+    # あり、この型は原理的に捕まえられない——queue/.snapshots/には現存
+    # せず(01:xx台の雪形が残っていないため)、gunshi報告に基づき人工的に
+    # 同じ形を再現する。
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_218
+    timestamp: "2026-08-09T01:00:00+09:00"
+    status: pending
+      01:05 番犬baton_lost受信。cmd_218は主の入替待ちである
+      02:41 バトン落ちを確認した
+  - id: cmd_219
+    timestamp: "2026-08-09T01:10:00+09:00"
+    status: done
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_check_queue_parseable
+        echo \"EXIT:\$?\"
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "EXIT:0" || { echo "type-1 corruption unexpectedly raised a parse exception; re-check b1 mechanism"; echo "$output"; false; }
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    ! grep -q "queue_parse_failed" "$SHOGUN_NOTIFY_LOG" || { echo "type-1 corruption should not be flagged by W-1 (documented boundary)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-SH-001【最重要・AC5】awaiting:shogunはopen_cmds_machineから除外されない ---
+
+@test "TC-221-SH-001: a cmd marked awaiting:shogun is NOT excluded from open_cmds_machine (PA-1 regression pin)" {
+    local since
+    since="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_300
+    status: in_progress
+    awaiting: shogun
+    awaiting_since: "$since"
+    awaiting_target: "cmd_300の裁可"
+    awaiting_check: "queue/shogun_to_karo.yamlのcmd_300.statusを見よ"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds exclude_awaiting
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ] || { echo "awaiting:shogun must NOT be excluded from open_cmds_machine (SH-2/core_decision)"; echo "got: $output"; false; }
+
+    # baton_lost主経路も従来どおり発火すること(除外していれば0のまま発火しない)
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: karo " "$SHOGUN_NOTIFY_LOG" || { echo "normal baton_lost path must still fire — shogun exclusion would silently re-create the 07:18 incident"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-SH-002: 有効な印があれば将軍宛文面が行動要求形になる ---
+
+@test "TC-221-SH-002: a valid awaiting:shogun marker rewrites the shogun-bound message into an action request with cmd_id and a two-way choice, leaving karo's message untouched" {
+    local since
+    since="$(date -d @$(( $(date +%s) - 120 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_301
+    status: in_progress
+    awaiting: shogun
+    awaiting_since: "$since"
+    awaiting_target: "cmd_301の裁可"
+    awaiting_check: "dashboard.mdを見よ"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun awaiting_shogun: cmd_301が貴殿の裁可を待って" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "裁可するか、印を外して差し戻せ" "$SHOGUN_NOTIFY_LOG" || { echo "two-way choice text missing"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    # karo宛は従来の状態記述＋対象cmd列挙のまま(行動要求形に巻き込まれない)
+    grep -q "^INBOX_WRITE: karo baton_lost: unread=0 active=0 open_cmds=1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "^INBOX_WRITE: karo awaiting_shogun:" "$SHOGUN_NOTIFY_LOG" || { echo "karo's message must not be rewritten by SH-3"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-SH-003: 必須欄欠落は印を無効化する(W-4規律をshogunにも適用) ---
+
+@test "TC-221-SH-003: an awaiting:shogun marker missing awaiting_target, awaiting_check, or awaiting_since falls back to the generic message (not excluded from the machine count either)" {
+    local since
+    since="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+
+    # (a) awaiting_target 欠落
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_302
+    status: in_progress
+    awaiting: shogun
+    awaiting_since: "$since"
+    awaiting_check: "dashboard.mdを見よ"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { echo "(a) awaiting_target欠落で発火せず"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "awaiting_shogun:" "$SHOGUN_NOTIFY_LOG" || { echo "(a) 欠落した印がawaiting_shogunとして扱われた"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # (b) awaiting_check 欠落
+    > "$SHOGUN_NOTIFY_LOG"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_302
+    status: in_progress
+    awaiting: shogun
+    awaiting_since: "$since"
+    awaiting_target: "cmd_302の裁可"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { echo "(b) awaiting_check欠落で発火せず"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "awaiting_shogun:" "$SHOGUN_NOTIFY_LOG" || { echo "(b) 欠落した印がawaiting_shogunとして扱われた"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # (c) awaiting_since 欠落
+    > "$SHOGUN_NOTIFY_LOG"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_302
+    status: in_progress
+    awaiting: shogun
+    awaiting_target: "cmd_302の裁可"
+    awaiting_check: "dashboard.mdを見よ"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { echo "(c) awaiting_since欠落で発火せず"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "awaiting_shogun:" "$SHOGUN_NOTIFY_LOG" || { echo "(c) 欠落した印がawaiting_shogunとして扱われた"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # いずれの場合もopen_cmds_machineからは除外されない(そもそもshogunは除外対象でない)
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds exclude_awaiting
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ] || { echo "got: $output"; false; }
+}
+
+# --- TC-221-SH-004: 禁止値(karo等)は安全側(除外せず、印としても扱わない) ---
+
+@test "TC-221-SH-004: a forbidden awaiting value (e.g. 'karo') is neither excluded from the count nor treated as a shogun marker" {
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_303
+    status: in_progress
+    awaiting: karo
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        baton_watchdog_count_open_cmds exclude_awaiting
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ] || { echo "forbidden awaiting value must not be excluded (safe-side default)"; echo "got: $output"; false; }
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "^INBOX_WRITE: shogun baton_lost: " "$SHOGUN_NOTIFY_LOG" || { echo "forbidden value must fire the normal path like an unmarked cmd"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "awaiting_shogun:" "$SHOGUN_NOTIFY_LOG" || { echo "'karo' must never be treated as a shogun marker"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- TC-221-SH-005: 複数のawaiting:shogun cmdは" / "区切りで両方現れる ---
+
+@test "TC-221-SH-005: two awaiting:shogun cmds both appear in the shogun-bound message, joined by ' / '" {
+    local since1 since2
+    since1="$(date -d @$(( $(date +%s) - 300 )) '+%Y-%m-%dT%H:%M:%S')"
+    since2="$(date -d @$(( $(date +%s) - 60 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_304
+    status: in_progress
+    awaiting: shogun
+    awaiting_since: "$since1"
+    awaiting_target: "cmd_304の裁可"
+    awaiting_check: "dashboard.mdを見よ"
+  - id: cmd_305
+    status: in_progress
+    awaiting: shogun
+    awaiting_since: "$since2"
+    awaiting_target: "cmd_305の裁可"
+    awaiting_check: "dashboard.mdを見よ"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_LOST_SINCE=\$(( \$(date +%s) - 10 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "cmd_304が貴殿の裁可を待って" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_305が貴殿の裁可を待って" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_304が貴殿の裁可を待って.* / .*cmd_305が貴殿の裁可を待って" "$SHOGUN_NOTIFY_LOG" || { echo "expected ' / ' join between the two shogun-awaiting entries"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
