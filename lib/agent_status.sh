@@ -2,8 +2,10 @@
 # lib/agent_status.sh — エージェント稼働状態検出の共有ライブラリ
 #
 # 提供関数:
-#   agent_is_busy_check <pane_target>   → 0=busy, 1=idle, 2=pane不在
-#   get_pane_state_label <pane_target>  → "稼働中" / "待機中" / "不在"
+#   agent_is_busy_check <pane_target> [cli_type]              → 0=busy, 1=idle, 2=pane不在
+#   get_pane_busy_rc <pane_target> [cli_type] [agent_id]       → 0=busy, 1=idle, 2=pane不在
+#     (claude型はagent_turn_state優先・幅非依存。cmd_220 S-2)
+#   get_pane_state_label <pane_target>                         → "稼働中" / "待機中" / "不在"
 #
 # 使用例:
 #   source lib/agent_status.sh
@@ -152,6 +154,25 @@ agent_is_busy_check() {
     if echo "$pane_tail" | grep -qiF 'background terminal running'; then
         return 0
     fi
+
+    # cmd_220 S-3 SPINNER_VOCAB_FALLBACK_KEPT: このリポジトリの
+    # .claude/settings.json はspinnerVerbsをmode:replaceでカスタム語彙
+    # 1001件へ置き換えており、下記の英語/日本語スピナー語（Working/
+    # Thinking/思考中…）はclaude型に対して一致0件で実測済み
+    # （gunshi_design_220_pane_width_busy_scope §second_blind_spot）。
+    # 軍師の設計は「S-1/S-2でclaude経路はagent_turn_stateを優先するため
+    # 残る利用者は非claude型(本番不在)のみ」として撤去を推奨したが、
+    # 実測するとこの前提は半分しか成り立たない——本ブロックには
+    # 'Compacting conversation'等、Codex自身がハードコードで出す文言も
+    # 混在しており、これは.claude/settings.jsonのspinnerVerbsとは無関係
+    # （claudeの語彙置換の影響を受けない）。既存テスト
+    # tests/unit/test_send_wakeup.bats T-BUSY-010（CLI_TYPE=codex,
+    # 'Compacting conversation'をbusy検出）が現にこれへ依存しており、
+    # 撤去すると非claude型フォールバックへ新たな誤idle面を開いてしまう
+    # （AC4が禁じる面）。ゆえに(c)現状維持を選ぶ。claude型にとって死んで
+    # いる事実は変わらないが、それはS-1/S-2がclaude型をagent_turn_state
+    # 優先へ切り替え済みで実害が無いためであり、非claude型の実害を承知で
+    # 撤去する理由には成り得ないと判断した。
     if echo "$pane_tail" | grep -qiE '(Working|Thinking|Planning|Sending|task is in progress|Compacting conversation|thought for|思考中|考え中|計画中|送信中|処理中|実行中)'; then
         return 0
     fi
@@ -281,11 +302,53 @@ agent_turn_state() {
     fi
 }
 
+# get_pane_busy_rc <pane_target> [cli_type] [agent_id]
+# cli_type/agent_idは呼び手が既に持っていれば渡してtmux呼び出しを省ける
+# （省略時はここで解決する）。
+#
+# cmd_220 S-2 GET_PANE_BUSY_RC_TURN_STATE: 従来はagent_is_busy_check()の
+# pane解析（幅44で末尾行'esc to'規則が壊れる）だけに拠っており、幅44の
+# 6体は繁忙中でも常に「待機中」と表示されていた
+# （gunshi_design_220_pane_width_busy_scope §scope_findings Q3(a)）。
+# claude型かつagent_idが解決できた場合はagent_turn_state（幅非依存）を
+# 優先し、取れなければ従来経路（agent_is_busy_check）へ落とす。
+# 「不在」(rc=2)の判定は引き続きtmux display-messageに拠る——
+# busy印/idle印のmtimeはpaneの不在を表現できない。
+# Returns: 0=busy, 1=idle, 2=pane不在
+get_pane_busy_rc() {
+    local pane_target="$1"
+    local cli_type="${2:-}"
+    local agent_id="${3:-}"
+
+    if [[ -z "$cli_type" ]]; then
+        cli_type=$(timeout 2 tmux show-options -v -p -t "$pane_target" @agent_cli 2>/dev/null || true)
+    fi
+
+    if [[ "$cli_type" == "claude" ]]; then
+        if [[ -z "$agent_id" ]]; then
+            agent_id=$(timeout 2 tmux display-message -t "$pane_target" -p '#{@agent_id}' 2>/dev/null || true)
+        fi
+        if [[ -n "$agent_id" ]]; then
+            if ! tmux display-message -t "$pane_target" -p '#{pane_id}' &>/dev/null; then
+                return 2
+            fi
+            if [[ "$(agent_turn_state "$agent_id")" == "busy" ]]; then
+                return 0
+            fi
+            # else は置かない。hook未装填でturn_stateが常にidleへ
+            # 縮退しても表示層が沈黙せぬよう、agent_is_busy_check へ落とす
+            # （S-1と同形。gunshi_qc_220_pr103 F-1 是正）。
+        fi
+    fi
+
+    agent_is_busy_check "$pane_target" "$cli_type"
+}
+
 # get_pane_state_label <pane_target>
-# 人間が読めるラベルを返す。
+# 人間が読めるラベルを返す。get_pane_busy_rc()の薄いラッパ。
 get_pane_state_label() {
     local pane_target="$1"
-    agent_is_busy_check "$pane_target"
+    get_pane_busy_rc "$pane_target"
     local rc=$?
     case $rc in
         0) echo "稼働中" ;;
