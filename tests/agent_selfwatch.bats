@@ -111,27 +111,68 @@ YAML
     run bash -c "source '$TEST_HARNESS'; get_unread_info"
     [ "$status" -eq 0 ]
 
+    # cmd_220 F-A: get_unread_info() is a pure peek now — it routes messages
+    # into count/specials but must NOT mutate read state itself (that was
+    # the bug: a busy-deferred special was consumed on sight, before the
+    # caller decided whether to act on it). Committing read:true is
+    # mark_special_read()'s job, exercised separately below.
     "$VENV_PYTHON" - << 'PY' "$output" "$TEST_INBOX"
 import json, sys, yaml
 payload = json.loads(sys.argv[1])
 inbox_path = sys.argv[2]
 assert payload["count"] == 1, payload
 assert len(payload["specials"]) == 2, payload
+special_ids = {s["id"] for s in payload["specials"]}
+assert special_ids == {"msg_clear", "msg_model"}, payload
 
 with open(inbox_path) as f:
     data = yaml.safe_load(f)
 by_id = {m["id"]: m for m in data["messages"]}
 assert by_id["msg_task"]["read"] is False
-assert by_id["msg_clear"]["read"] is True
-assert by_id["msg_model"]["read"] is True
+assert by_id["msg_clear"]["read"] is False
+assert by_id["msg_model"]["read"] is False
 print("OK")
 PY
 }
 
 @test "TC-FR-004 [RED]: read-update path uses lock/atomic protections" {
-    body="$(awk '/get_unread_info\\(\\)/,/^}/' "$WATCHER_SCRIPT")"
+    # cmd_220 F-A: the read-update path is mark_special_read() now —
+    # get_unread_info() is a pure peek and no longer writes at all (see
+    # TC-FR-003 above and TC-FR-004c below).
+    body="$(awk '/mark_special_read\(\)/,/^}/' "$WATCHER_SCRIPT")"
     echo "$body" | grep -q "flock"
     echo "$body" | grep -q "os.replace"
+}
+
+@test "TC-FR-004c: mark_special_read commits read:true only for the given id, atomically" {
+    cat > "$TEST_INBOX" << 'YAML'
+messages:
+  - id: msg_clear
+    from: karo
+    timestamp: "2026-02-09T21:00:01"
+    type: clear_command
+    content: /clear
+    read: false
+  - id: msg_model
+    from: karo
+    timestamp: "2026-02-09T21:00:02"
+    type: model_switch
+    content: /model opus
+    read: false
+YAML
+
+    run bash -c "source '$TEST_HARNESS'; mark_special_read msg_clear"
+    [ "$status" -eq 0 ]
+
+    "$VENV_PYTHON" - << 'PY' "$TEST_INBOX"
+import sys, yaml
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f)
+by_id = {m["id"]: m for m in data["messages"]}
+assert by_id["msg_clear"]["read"] is True
+assert by_id["msg_model"]["read"] is False
+print("OK")
+PY
 }
 
 @test "TC-FR-004b: get_unread_info does not update when lock is unavailable" {
