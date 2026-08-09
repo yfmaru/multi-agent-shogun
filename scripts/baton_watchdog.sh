@@ -68,6 +68,14 @@ BATON_LOST_SINCE=0     # 3条件が揃い始めた epoch（揃っていなけれ
 BATON_NOTIFIED=0       # 将軍inbox通知を同一継続停止で二重送信しないためのガード
 BATON_NTFY_NOTIFIED=0  # ntfy通知（cmd_172/急報）を同一継続停止で二重送信しないためのガード
 
+# cmd_221/W-1: queue/shogun_to_karo.yamlがパース不能な間、家老inboxへの
+# 警報を同一の破損につき連呼しないためのガード。BATON_NOTIFIEDと同型
+# （epoch比較）だが変数は分ける——パース失敗中はopen_cmds_machineが0に
+# 丸められ通常判定(condition)は偽になり続けるため、BATON_NOTIFIEDを
+# 共用すると通常判定のelseブランチ(L1145相当)が毎tick 0へ戻してしまい、
+# 再通知ガードとして機能しない。
+BATON_QUEUE_PARSE_FAIL_NOTIFIED=0
+
 # cmd_197: 長い安全網（人待ちの印が付いたまま24h+滞留）専用の独立トラッカー。
 # BATON_LOST_SINCEとは絶対に混ぜない（混ぜると通常判定が偽になるたび
 # 安全網のタイマーまで巻き戻る）。印は「発報を止める」のではなく
@@ -197,7 +205,8 @@ import sys
 
 try:
     import yaml
-except Exception:
+except Exception as exc:
+    print(f"[baton_watchdog] pyyaml unavailable: {exc}".replace("\n", " | "), file=sys.stderr)
     print(0)
     raise SystemExit(0)
 
@@ -207,7 +216,12 @@ exclude_awaiting = sys.argv[2] if len(sys.argv) > 2 else ""
 try:
     with open(path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
-except Exception:
+except Exception as exc:
+    # cmd_221/W-1: 「壊れていても0を返し、決して非0で落ちない」性質
+    # そのものは変えない(番犬が非0終了で死ねば全軍の見張りが消える)。
+    # ただし0の意味(「0件」か「読めぬ」か)を呼び手が取り違えぬよう、
+    # 標準エラーへ必ず1行出す(従来は無言だった。軍師実測で確認済み)。
+    print(f"[baton_watchdog] queue parse failed: {path}: {exc}".replace("\n", " | "), file=sys.stderr)
     data = {}
 
 if not isinstance(data, dict):
@@ -231,6 +245,54 @@ def _is_open(c):
     return True
 
 print(sum(1 for c in cmds if _is_open(c)))
+PY
+}
+
+# cmd_221/W-1: queue/shogun_to_karo.yaml がパース可能かどうかだけを検査する。
+# baton_watchdog_count_open_cmds の「壊れていても0を返し、決して非0で
+# 落ちない」性質は変えない。本関数はその0が「開いたcmdが0件」なのか
+# 「読めぬ」なのかを呼び手（check_once）が取り違えぬための、独立した
+# 判定手段である。
+#
+# 成功時: 標準出力・標準エラーとも無出力で return 0。
+# 失敗時: 標準エラーへ理由（pyyamlの例外を1行に畳んだもの。行番号・
+#         列番号を含む）を必ず1行出し、同じ理由を標準出力へも出して
+#         return 1（呼び出し側が発報文へそのまま使えるようにするため）。
+# ファイル欠損もここでは「パース失敗」として報せる（count_open_cmdsが
+# ファイル欠損を「0件」に丸めるのは母数計算としては正しいが、本関数の
+# 目的は「読めているか」の一次情報であり、欠損もまた読めていない事象の
+# 一種であるため区別しない）。
+baton_watchdog_check_queue_parseable() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" <<'PY'
+import sys
+
+path = sys.argv[1]
+
+try:
+    import yaml
+except Exception as exc:
+    msg = f"pyyaml unavailable: {exc}".replace("\n", " | ")
+    print(msg, file=sys.stderr)
+    print(msg)
+    raise SystemExit(1)
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        yaml.safe_load(fh)
+except FileNotFoundError:
+    msg = f"queue file not found: {path}"
+    print(msg, file=sys.stderr)
+    print(msg)
+    raise SystemExit(1)
+except Exception as exc:
+    msg = f"queue parse failed: {path}: {exc}".replace("\n", " | ")
+    print(msg, file=sys.stderr)
+    print(msg)
+    raise SystemExit(1)
+
+raise SystemExit(0)
 PY
 }
 
@@ -396,6 +458,98 @@ for c in cmds:
         continue
     dt = parse_ts(c.get("awaiting_since"))
     epoch = str(int(dt.timestamp())) if dt is not None else ""
+    print(f"{cid}\t{epoch}")
+PY
+}
+
+# awaiting: shogun を持つ開いた(status != done) cmdについて、
+# "cmd_id<TAB>awaiting_sinceのepoch秒" を1行1件で返す（cmd_221/SH-1）。
+#
+# 【必須欄・W-4の規律をshogunにも同じく課す(gunshi_design_awaiting_scheme_
+# and_write_conflict.yaml a5・what_must_not_change)】awaiting_target・
+# awaiting_check・awaiting_sinceのいずれかが欠落/解釈不能なcmdは、この
+# 関数の出力から一切除外する（＝呼び出し側からは「印なし」と見分けが
+# 付かない）。返り値の形はbaton_watchdog_list_awaiting_lord_with_since
+# （cmd_id<TAB>since）と同型だが、必須欄の検査はbaton_watchdog_list_
+# external_wait_cmds（3欄必須）を踏襲する——shogunは「起こせるが検算
+# できぬ」という lord/external どちらとも異なる象限であり(design
+# key_insight)、lord用の「since無しはフォールバック計時」という緩さは
+# 適用しない。
+#
+# 【安全側】count_open_cmds の母数計算はここには一切関わらない
+# （SH-2・shogunを除外しない設計はcount_open_cmds側に閉じている）。
+# 本関数は「発報すると決めた後」の文面用データを提供するのみである。
+# ファイル欠損・壊れた YAML でも空を返すのみで決して非0で落ちない。
+baton_watchdog_list_awaiting_shogun_with_since() {
+    local python_bin
+    python_bin="$(stall_policy_python)"
+    "$python_bin" - "$ROOT/queue/shogun_to_karo.yaml" <<'PY'
+import sys
+from datetime import datetime, timezone
+
+try:
+    import yaml
+except Exception:
+    raise SystemExit(0)
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+cmds = data.get("commands")
+if cmds is None:
+    cmds = data.get("cmds")
+if isinstance(cmds, dict):
+    cmds = list(cmds.values())
+if not isinstance(cmds, list):
+    cmds = []
+
+
+def parse_ts(value):
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc)
+
+
+def clean(v):
+    if not isinstance(v, str):
+        return ""
+    return v.replace("\t", " ").replace("\n", " ").strip()
+
+
+for c in cmds:
+    if not isinstance(c, dict):
+        continue
+    if c.get("status") == "done":
+        continue
+    if c.get("awaiting") != "shogun":
+        continue
+    cid = c.get("id")
+    if not cid:
+        continue
+    target = clean(c.get("awaiting_target"))
+    check = clean(c.get("awaiting_check"))
+    dt = parse_ts(c.get("awaiting_since"))
+    if not target or not check or dt is None:
+        continue
+    epoch = str(int(dt.timestamp()))
     print(f"{cid}\t{epoch}")
 PY
 }
@@ -968,11 +1122,47 @@ check_once() {
     local -A ext_by_id=()
     local -a external_budget_exceeded=()  # "cmd_id<TAB>target<TAB>check<TAB>elapsed<TAB>budget" 1行1件
 
+    # cmd_221/SH-1〜SH-3専用のローカル変数。awaiting:shogunの開いたcmdが
+    # あれば、将軍inbox宛の文面のみを行動要求形へ差し替える。
+    # open_cmds_machineの条件判定・母数計算(SH-2)には一切触れない。
+    local msg_for_shogun shogun_wait_cmd shogun_wait_epoch shogun_wait_min shogun_wait_lines
+
+    # cmd_221/W-1専用のローカル変数。
+    local queue_parse_error repeat_threshold_parse_fail
+
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
     fi
 
     now=$(date +%s)
+
+    # ── W-1(cmd_221): queueファイルがパース不能なら、unread/activeの
+    # 状態に関わらず即座に家老へ吠える。閾値は課さない——これは停滞では
+    # なく破損であり、待って直る性質のものではない(gunshi_design_
+    # awaiting_scheme_and_write_conflict.yaml b5/W-1)。
+    #
+    # baton_watchdog_count_open_cmdsが「壊れていても0を返す」性質
+    # (L184-186相当)自体は変えない。下記のunread/active/open_cmds計算
+    # には一切影響させず、それらは従来どおり0として計算される
+    # （＝通常のcondition判定は変わらず偽のままとなり、else側の
+    # リセット処理も従来どおり走る）。本ブロックは「別経路で即座に
+    # 家老へ知らせる」ことだけを追加する。
+    #
+    # 再通知ガードはBATON_NOTIFIEDと同型(epoch比較)だが、専用の新変数
+    # BATON_QUEUE_PARSE_FAIL_NOTIFIEDを使う(理由は変数宣言側のコメント
+    # 参照)。再通知間隔は既存のbaton_lost_repeat_after_secをそのまま
+    # 流用し、新しい設定キーは増やさない(PB-2)。
+    if queue_parse_error=$(baton_watchdog_check_queue_parseable); then
+        BATON_QUEUE_PARSE_FAIL_NOTIFIED=0
+    else
+        repeat_threshold_parse_fail=$(baton_watchdog_query baton_lost_repeat_after_sec)
+        if [ "$BATON_QUEUE_PARSE_FAIL_NOTIFIED" -eq 0 ] \
+            || [ $((now - BATON_QUEUE_PARSE_FAIL_NOTIFIED)) -ge "$repeat_threshold_parse_fail" ]; then
+            baton_watchdog_notify_inbox karo "queue_parse_failed: queue/shogun_to_karo.yaml が読めぬ。${queue_parse_error} 即時修復せよ——この間、open_cmds等の判定はすべて0扱いで沈黙している。"
+            BATON_QUEUE_PARSE_FAIL_NOTIFIED=$now
+        fi
+    fi
+
     unread=$(baton_watchdog_count_unread)
     active=$(baton_watchdog_count_active_tasks)
     open_cmds=$(baton_watchdog_count_open_cmds)                          # 全件(安全網用)
@@ -1077,6 +1267,43 @@ check_once() {
             repeat_threshold=$(baton_watchdog_query baton_lost_repeat_after_sec)
         fi
 
+        # ── cmd_221/SH-3: awaiting:shogunの開いたcmdがあれば、将軍宛の
+        # 文面のみを状態記述から行動要求へ差し替える ──
+        # karo宛(msg_actionable)・発火閾値(shogun_threshold)・再通知間隔
+        # (repeat_threshold)・BATON_NOTIFIEDゲートは一切変更しない。変える
+        # のは「将軍inboxへ渡す文字列」だけである。
+        #
+        # 【SH-4の意図についての設計判断】外部待ちモード(external_mode)は
+        # 「開いているmachine cmd全件が有効な外部印を持つ」場合のみ選ばれる
+        # (直前のwhileループ)。awaiting:shogunのcmdは外部印を持たぬため、
+        # 1件でも混在すればexternal_modeは必ずfalseへ落ち、上のif/elseは
+        # 常にelse(通常モード)を通る。通常モードのrepeat_thresholdは既定
+        # baton_lost_repeat_after_sec=900秒であり、これはSH-4が求める
+        # 「lordの24h・externalの3600sとは別の、短い将軍専用間隔(既定900秒)」
+        # と既定値で一致する。ゆえに新たな設定キー
+        # (baton_shogun_repeat_after_sec)や新たなゲート変数は追加しない
+        # ——「時計が複数あることの弊害」（前回D-2の教訓、PB-2で再引用）を
+        # 増やさぬための選択であり、karo/shogunを同一ゲートで足並み揃えて
+        # 再武装させたほうが安全である。
+        msg_for_shogun="$msg"
+        shogun_wait_lines=""
+        while IFS=$'\t' read -r shogun_wait_cmd shogun_wait_epoch; do
+            [ -n "$shogun_wait_cmd" ] || continue
+            if [ -n "$shogun_wait_epoch" ]; then
+                shogun_wait_min=$(( (now - shogun_wait_epoch) / 60 ))
+                [ "$shogun_wait_min" -ge 0 ] || shogun_wait_min=0
+            else
+                shogun_wait_min=0
+            fi
+            if [ -n "$shogun_wait_lines" ]; then
+                shogun_wait_lines="${shogun_wait_lines} / "
+            fi
+            shogun_wait_lines="${shogun_wait_lines}${shogun_wait_cmd}が貴殿の裁可を待って${shogun_wait_min}分。裁可するか、印を外して差し戻せ"
+        done < <(baton_watchdog_list_awaiting_shogun_with_since)
+        if [ -n "$shogun_wait_lines" ]; then
+            msg_for_shogun="awaiting_shogun: ${shogun_wait_lines}"
+        fi
+
         # 主経路（cmd_208/措置A・宛先の二重化）: karo（手を打てる者）と
         # shogun（見通し）の両方へ通知する。将軍への通知は既存のまま
         # 減らさず、karo宛を追加するのみ。900秒(既定)継続で無条件に発火する。
@@ -1095,7 +1322,7 @@ check_once() {
         if [ "$elapsed" -ge "$shogun_threshold" ] \
             && { [ "$BATON_NOTIFIED" -eq 0 ] || [ $((now - BATON_NOTIFIED)) -ge "$repeat_threshold" ]; }; then
             baton_watchdog_notify_inbox karo   "$msg_actionable"
-            baton_watchdog_notify_inbox shogun "$msg"
+            baton_watchdog_notify_inbox shogun "$msg_for_shogun"
             BATON_NOTIFIED=$now
         fi
 

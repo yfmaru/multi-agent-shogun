@@ -1,0 +1,17 @@
+# TC-221-W1-005用の合成検体。実データ（実cmd文言・ntfyトピック名・
+# ローカル絶対パス・OSアカウント名・非公開リポジトリ名）は一切含まない。
+# gunshi_design報告のb1節（コロン+空白を含む継続行がpyyamlのScanner
+# Errorを誘発する形）を、人工的なcmd_id・ダミーの値のみで最小再現した
+# ものである。
+commands:
+  - id: cmd_9001
+    timestamp: "2026-01-01T00:00:00+09:00"
+    status: pending
+      09:00 ダミーnote: これはコロンと空白を含む継続行のテストである
+      09:05 別のダミー行である
+  - id: cmd_9002
+    timestamp: "2026-01-01T00:10:00+09:00"
+    status: done
+  - id: cmd_9003
+    timestamp: "2026-01-01T00:20:00+09:00"
+    status: pending
