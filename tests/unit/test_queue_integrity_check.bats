@@ -239,6 +239,209 @@ EOF
     [[ "$output" == *"shogun_to_karo.yaml"* ]] || { echo "$output"; false; }
 }
 
+@test "C-4 flags type-1 corruption (silent absorption, no colon-space) as a warning, exit stays 0" {
+    # Exact shape from queue/reports/gunshi_design_awaiting_scheme_and_write_
+    # conflict.yaml b1_why_one_passed_and_one_failed reproduction (the real
+    # 01:12 incident): an Edit anchor lands inside cmd_218's `status` plain
+    # scalar. The injected text contains no ": " (colon+space), so it never
+    # trips the YAML scanner -- the whole blob is silently absorbed as a
+    # continuation of `status`. C-1/C-2/C-3 all pass cleanly on this (no key
+    # duplicated, no heading lost, no id missing); only C-4 can see it.
+    cat > "$TEST_TMPDIR/type1.yaml" <<'EOF'
+commands:
+  - id: cmd_218
+    timestamp: "2026-08-09T01:00:00+09:00"
+    status: pending
+      01:05 番犬baton_lost受信。cmd_218は主の入替待ちである
+      02:41 バトン落ちを確認した
+  - id: cmd_219
+    timestamp: "2026-08-09T01:00:00+09:00"
+    status: pending
+EOF
+
+    run run_check "$TEST_TMPDIR/type1.yaml"
+    [ "$status" -eq 0 ] || { echo "C-4 must warn, not fail, during initial rollout: $output"; false; }
+    [[ "$output" == *"C-4 field shape"* ]] || { echo "type-1 corruption not detected: $output"; false; }
+    [[ "$output" == *"cmd_218"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"status"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"OK:"* ]] || { echo "warning must not suppress the OK line: $output"; false; }
+}
+
+@test "C-4 mutation check: disabling field-shape check loses type-1 detection entirely" {
+    # Proves C-4 is the thing catching type-1, not some other check --
+    # feeding the identical fixture through a stub that reports zero C-4
+    # warnings (equivalent to pre-C-4 behavior) must produce a silent OK,
+    # with no field-shape mention anywhere in the output.
+    cat > "$TEST_TMPDIR/type1.yaml" <<'EOF'
+commands:
+  - id: cmd_218
+    timestamp: "2026-08-09T01:00:00+09:00"
+    status: pending
+      01:05 番犬baton_lost受信。cmd_218は主の入替待ちである
+      02:41 バトン落ちを確認した
+  - id: cmd_219
+    timestamp: "2026-08-09T01:00:00+09:00"
+    status: pending
+EOF
+
+    PYTHON_BIN="${SHOGUN_PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python3}"
+    [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
+
+    run "$PYTHON_BIN" -c "
+import sys
+sys.path.insert(0, '$PROJECT_ROOT/scripts')
+import queue_integrity_check as qic
+qic.check_field_shapes = lambda parsed: []
+sys.exit(qic.main())
+" "$TEST_TMPDIR/type1.yaml"
+
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [[ "$output" != *"C-4"* ]] || { echo "mutation should silence C-4 entirely: $output"; false; }
+    [[ "$output" == *"OK:"* ]] || { echo "$output"; false; }
+}
+
+@test "C-4 flags an unrecognized status/awaiting value outside the measured vocabulary" {
+    cat > "$TEST_TMPDIR/bad_vocab.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    timestamp: "2026-08-01T00:00:00+09:00"
+    status: blocked
+    awaiting: karo
+EOF
+
+    run run_check "$TEST_TMPDIR/bad_vocab.yaml"
+    [ "$status" -eq 0 ] || { echo "C-4 is a warning, must not fail the check: $output"; false; }
+    [[ "$output" == *"cmd_A"* && "$output" == *"status"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"cmd_A"* && "$output" == *"awaiting"* ]] || { echo "$output"; false; }
+}
+
+@test "C-4 raises no warnings for well-formed entries across the known vocabulary and all field shapes" {
+    cat > "$TEST_TMPDIR/clean.yaml" <<'EOF'
+commands:
+  - id: cmd_1
+    timestamp: "2026-08-01T00:00:00+09:00"
+    status: done
+    awaiting: lord
+    awaiting_since: "2026-08-01T00:00:00+09:00"
+    awaiting_budget_sec: 86400
+  - id: cmd_2
+    timestamp: "2026-08-02T00:00:00"
+    status: in_progress
+    awaiting: external
+  - id: cmd_3
+    timestamp: "2026-08-03T00:00:00+09:00"
+    status: pending
+    awaiting: shogun
+EOF
+
+    run run_check "$TEST_TMPDIR/clean.yaml"
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [[ "$output" != *"C-4"* ]] || { echo "unexpected false-positive C-4 warning: $output"; false; }
+}
+
+@test "S-3: newest snapshot is unparseable, C-3 falls back to the next-newest parseable snapshot" {
+    # Reproduces the 07:18 secondary finding (design doc b2
+    # secondary_finding_snapshot_poisoning): the PreToolUse hook snapshots
+    # unconditionally, so the newest snapshot can itself be the corrupted
+    # copy. Falling back to the first parseable snapshot (newest-to-oldest)
+    # must still catch a real monotonicity violation against that baseline.
+    mkdir -p "$TEST_TMPDIR/.snapshots"
+    cat > "$TEST_TMPDIR/.snapshots/target.20260809T071800Z.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: done
+  - id: cmd_B
+    status: pending
+EOF
+    cat > "$TEST_TMPDIR/.snapshots/target.20260809T072021Z.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: pending
+      07:18 家老note: cmd_217は将軍の裁可待ちと判断した
+EOF
+
+    cat > "$TEST_TMPDIR/target.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: done
+EOF
+
+    run run_check "$TEST_TMPDIR/target.yaml"
+    [ "$status" -ne 0 ] || { echo "expected the missing cmd_B to be caught via the older fallback baseline: $output"; false; }
+    [[ "$output" == *"C-3 monotonicity violation"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"cmd_B"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"071800Z"* ]] || { echo "expected the older snapshot's name as the baseline used: $output"; false; }
+}
+
+@test "S-3: newest snapshot has a genuine ScannerError (07:18 corruption shape), C-3 still falls back" {
+    # Same fallback path, but the newest snapshot fails via a real YAML
+    # ScannerError (colon+space in a continuation line) rather than merely
+    # being semantically odd -- the exact shape gunshi's b1 reproduction
+    # confirmed for the 07:18 incident.
+    mkdir -p "$TEST_TMPDIR/.snapshots"
+    cat > "$TEST_TMPDIR/.snapshots/target.20260809T071800Z.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: done
+  - id: cmd_B
+    status: pending
+EOF
+    python3 - "$TEST_TMPDIR/.snapshots/target.20260809T072021Z.yaml" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, "w", encoding="utf-8") as f:
+    f.write("commands:\n")
+    f.write("  - id: cmd_A\n")
+    f.write("    status: pending\n")
+    f.write("      07:18 家老note: cmd_217は将軍の裁可待ちと判断した\n")
+PYEOF
+
+    # Confirm the fixture is genuinely unparseable before relying on it.
+    run python3 -c "
+import yaml
+yaml.safe_load(open('$TEST_TMPDIR/.snapshots/target.20260809T072021Z.yaml', encoding='utf-8').read())
+"
+    [ "$status" -ne 0 ] || { echo "fixture setup bug: newest snapshot must be genuinely unparseable"; false; }
+
+    cat > "$TEST_TMPDIR/target.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: done
+EOF
+
+    run run_check "$TEST_TMPDIR/target.yaml"
+    [ "$status" -ne 0 ] || { echo "expected the missing cmd_B to be caught via the older fallback baseline: $output"; false; }
+    [[ "$output" == *"C-3 monotonicity violation"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"cmd_B"* ]] || { echo "$output"; false; }
+}
+
+@test "S-3: every snapshot generation is unparseable, C-3 reports inability rather than silently passing" {
+    mkdir -p "$TEST_TMPDIR/.snapshots"
+    cat > "$TEST_TMPDIR/.snapshots/target.20260809T071800Z.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: pending
+      also broken: this one too
+EOF
+    cat > "$TEST_TMPDIR/.snapshots/target.20260809T072021Z.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: pending
+      07:18 家老note: cmd_217は将軍の裁可待ちと判断した
+EOF
+
+    cat > "$TEST_TMPDIR/target.yaml" <<'EOF'
+commands:
+  - id: cmd_A
+    status: done
+EOF
+
+    run run_check "$TEST_TMPDIR/target.yaml"
+    [ "$status" -ne 0 ] || { echo "must not silently pass when every snapshot generation is corrupted: $output"; false; }
+    [[ "$output" == *"C-3"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"failed to parse"* || "$output" == *"failed"* ]] || { echo "$output"; false; }
+}
+
 @test "runs within a reasonable time budget on a file sized like the real queue/shogun_to_karo.yaml" {
     # queue/shogun_to_karo.yaml is gitignored (queue/ is per-instance runtime
     # state, not tracked), so it never exists in a clean checkout -- CI
