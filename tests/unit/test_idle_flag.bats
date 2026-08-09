@@ -158,11 +158,16 @@ YAML
     [ -f "$IDLE_FLAG_DIR/shogun_idle_test_idle_agent" ]
 }
 
-# ─── T-003: agent_is_busy() フラグなし時にtrue (busy) ───
+# ─── T-003: agent_is_busy() フラグなし時にidle (cmd_217二枚の印方式) ───
+# 旧仕様（フラグなし=busy）はcmd_217で置き換えられた。二枚の印方式では
+# busy印が一度も存在せぬ場合（=UserPromptSubmit hook未装填）はidleへ
+# 静かに縮退する（T-217-06と同一の主張。今日の実質挙動——フラグは一度
+# 作られると消えず、agent_is_busy()は実質常にidleを返す——と同一であり
+# 退行しない）。
 
-@test "T-003: agent_is_busy returns 0 (busy) when no flag file — claude CLI" {
-    # Ensure no flag file
-    rm -f "$IDLE_FLAG_DIR/shogun_idle_test_idle_agent"
+@test "T-003: agent_is_busy returns 1 (idle) when no busy flag file — claude CLI (cmd_217)" {
+    # Ensure no flag file at all (idle印もbusy印も無い)
+    rm -f "$IDLE_FLAG_DIR/shogun_idle_test_idle_agent" "$IDLE_FLAG_DIR/shogun_busy_test_idle_agent"
 
     run bash -c "
         source '$WATCHER_HARNESS'
@@ -170,7 +175,7 @@ YAML
         CLI_TYPE='claude'
         agent_is_busy
     "
-    [ "$status" -eq 0 ]  # 0 = busy
+    [ "$status" -eq 1 ]  # 1 = idle (busy印不在はhook未装填への縮退)
 }
 
 # ─── T-004: agent_is_busy() フラグあり時にfalse (idle) ───
@@ -279,4 +284,33 @@ YAML
     [ ! -f "$IDLE_FLAG_DIR/shogun_idle_ashigaru1" ]
     [ ! -f "$IDLE_FLAG_DIR/shogun_idle_ashigaru2" ]
     [ ! -f "$IDLE_FLAG_DIR/shogun_idle_gunshi" ]
+}
+
+# ─── T-217-10: shutsujin時に busy印も一緒にクリア (T-009拡張) ───
+# §7-4 pre_mortem: idle印しか消さぬままbusy印を導入すると、次の出陣で
+# 全エージェントが恒久busyで始まる（出陣し直しても直らない、最も静かに
+# 効く罠）。shutsujin_departure.sh:697 の実コマンドと同一パターンで検査。
+
+@test "T-217-10: rm -f flag_dir/{shogun_idle_*,shogun_busy_*} clears both marker kinds" {
+    touch "$IDLE_FLAG_DIR/shogun_idle_karo"
+    touch "$IDLE_FLAG_DIR/shogun_busy_karo"
+    touch "$IDLE_FLAG_DIR/shogun_idle_ashigaru3"
+    touch "$IDLE_FLAG_DIR/shogun_busy_ashigaru3"
+
+    [ -f "$IDLE_FLAG_DIR/shogun_idle_karo" ]
+    [ -f "$IDLE_FLAG_DIR/shogun_busy_karo" ]
+
+    # shutsujin_departure.sh:697と同一パターン
+    rm -f "$IDLE_FLAG_DIR"/shogun_idle_* "$IDLE_FLAG_DIR"/shogun_busy_*
+
+    [ ! -f "$IDLE_FLAG_DIR/shogun_idle_karo" ]
+    [ ! -f "$IDLE_FLAG_DIR/shogun_busy_karo" ]
+    [ ! -f "$IDLE_FLAG_DIR/shogun_idle_ashigaru3" ]
+    [ ! -f "$IDLE_FLAG_DIR/shogun_busy_ashigaru3" ]
+}
+
+@test "T-217-10b: shutsujin_departure.sh clears both shogun_idle_* and shogun_busy_*" {
+    local departure_script="$SCRIPT_DIR/shutsujin_departure.sh"
+    [ -f "$departure_script" ]
+    grep -q 'rm -f /tmp/shogun_idle_\* /tmp/shogun_busy_\*' "$departure_script"
 }

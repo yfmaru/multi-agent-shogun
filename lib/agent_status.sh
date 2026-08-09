@@ -233,6 +233,54 @@ PY
     return 1
 }
 
+# agent_turn_state <agent_id>
+# cmd_217: busy/idle を画面から推し量るのをやめ、CLI自身が知っている
+# 出来事（ターンの開始・終了）を2つのタイムスタンプファイル（busy印・
+# idle印）の新旧mtime比較で読む。
+#   busy := mtime(busy印) >= mtime(idle印)      （busy印が在る時）
+#   idle := busy印が存在せぬ、または mtime(idle印) > mtime(busy印)
+# 同秒同着は busy 側に倒す（安全側 — 送出を控える方が安全）。
+# busy印が一度も生まれておらぬ（＝ UserPromptSubmit hook 未装填）場合は
+# idle へ静かに縮退する（フラグ方式で「flagが常在＝実質常にidle」だった
+# 現状と同一の姿であり、退行しない。装填検査は呼び手 (inbox_watcher.sh)
+# の責務）。
+#
+# 標準出力に "busy" または "idle" を書く（返り値ではない）。既存の
+# agent_is_busy_check の 0/1/2 三値と紛らわしくならぬよう、意図的に
+# 別名・別インターフェースとする。
+#
+# 幅依存の実測（§1-3, gunshi_design_217_idle_flag_liveness.yaml）:
+# pane解析による busy 判定（agent_is_busy_check 上記）は pane 幅44
+# （本リポでは軍師・足軽3〜7号）で繁忙時にも idle と誤判定する
+# （末尾行の 'esc to' 判定の土台となるヒント行がアプリ側の切り詰めで
+# 現れない）。本関数は pane テキストを一切参照しないため、この幅依存
+# 欠陥の影響を受けない。
+agent_turn_state() {
+    local agent_id="$1"
+    local flag_dir="${IDLE_FLAG_DIR:-/tmp}"
+    local busy_flag="${flag_dir}/shogun_busy_${agent_id}"
+    local idle_flag="${flag_dir}/shogun_idle_${agent_id}"
+
+    if [ ! -f "$busy_flag" ]; then
+        echo "idle"
+        return
+    fi
+
+    local mtime_busy mtime_idle
+    mtime_busy=$(stat -c %Y "$busy_flag" 2>/dev/null || echo 0)
+    if [ -f "$idle_flag" ]; then
+        mtime_idle=$(stat -c %Y "$idle_flag" 2>/dev/null || echo 0)
+    else
+        mtime_idle=-1
+    fi
+
+    if [ "$mtime_busy" -ge "$mtime_idle" ]; then
+        echo "busy"
+    else
+        echo "idle"
+    fi
+}
+
 # get_pane_state_label <pane_target>
 # 人間が読めるラベルを返す。
 get_pane_state_label() {

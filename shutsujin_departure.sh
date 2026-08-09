@@ -694,8 +694,11 @@ if [ "$SETUP_ONLY" = false ]; then
     fi
 
     # 前セッションのstaleフラグをクリア
-    rm -f /tmp/shogun_idle_*
-    echo "idle flags cleared"
+    # cmd_217: busy印/idle印の二枚とも消す。片方だけ消すと次回出陣時に
+    # 全エージェントが恒久busy（またはその逆）で始まる — §7-4で最も
+    # 静かに効く罠として名指しされた失敗筋。出陣し直しても直らない。
+    rm -f /tmp/shogun_idle_* /tmp/shogun_busy_*
+    echo "idle/busy flags cleared"
 
     log_war "👑 全軍にエージェントCLIを召喚中..."
 
