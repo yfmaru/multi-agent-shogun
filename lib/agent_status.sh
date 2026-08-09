@@ -222,6 +222,57 @@ pane_has_open_modal() {
     return 1
 }
 
+# pane_awaiting_input <pane_target>
+# cmd_219 STALL_AWAITING_INPUT_GATE: 「この画面はキー入力を待っている」と
+# 積極的に名指しできるかを判定する。attempt_stall_recovery() の鍵注入
+# 直前ゲートとして使うことを目的とする
+# （queue/reports/gunshi_design_219_stall_wait_budget_conflict.yaml §2(b)）。
+# Returns: 0=入力待ちと名指しできる, 1=それ以外（pane不在を含む）
+#
+# pane_has_open_modal の流用では足りぬ——許可確認ダイアログの実採取フッタ
+# ' Esc to cancel · Tab to amend · ctrl+e to explain'
+# （tests/unit/test_liveness_tick.bats:171 REAL_BUSY_TAIL）を
+# pane_has_open_modal のどのアンカーも拾えない。stall検知は「待って良い
+# 時間」を一切見ず「その画面が何であるか」だけを見るため、この述語は
+# pane_has_open_modal より広い（許可ダイアログ含む）が、繁忙中の画面
+# （'esc to interrupt' が末尾にある）は明示的に除外する。
+#
+# 判定順（設計§2(b)を厳守。除外規則が最優先）:
+#   1. 末尾ブロックに 'esc to interrupt' が在れば無条件 false
+#      （「働いている」印。他のアンカーと同時に現れても false を優先する）
+#   2. 次に以下いずれかが在れば true:
+#      enter to select | to navigate | ↑/↓ | enter to confirm
+#      | esc to cancel | tab to amend
+#   3. どちらも無ければ false
+pane_awaiting_input() {
+    local pane_target="$1"
+
+    if ! tmux display-message -t "$pane_target" -p '#{pane_id}' &>/dev/null; then
+        return 1  # pane不在は入力待ちではない
+    fi
+
+    local full_capture pane_tail
+    full_capture=$(timeout 2 tmux capture-pane -t "$pane_target" -p -J 2>/dev/null)
+    pane_tail=$(echo "$full_capture" | tail -5)
+
+    if [[ -z "$pane_tail" ]]; then
+        return 1
+    fi
+
+    local bottom_block
+    bottom_block=$(echo "$pane_tail" | awk 'NF{b=b $0} !NF{b=""} END{print b}')
+
+    if echo "$bottom_block" | grep -qiE 'esc to interrupt'; then
+        return 1  # 働いている印。入力待ちではない（除外規則、最優先）
+    fi
+
+    if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓|enter to confirm|esc to cancel|tab to amend'; then
+        return 0  # 入力待ちと名指しできる
+    fi
+
+    return 1
+}
+
 # opencode_has_busy_animation <capture_text>
 # OpenCode paneの busy animation (`[■⬝]{8}`) を検出する。
 opencode_has_busy_animation() {

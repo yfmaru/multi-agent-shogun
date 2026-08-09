@@ -1586,10 +1586,39 @@ attempt_stall_recovery() {
     fi
 
     STALL_ACTED_AT=$now
-    STALL_ACTION_TAKEN=1
     STALL_UNRESPONSIVE_ATTEMPTS=$((${STALL_UNRESPONSIVE_ATTEMPTS:-0} + 1))
-    stall_maybe_notify "$AGENT_ID" "unresponsive" "$STALL_UNRESPONSIVE_ATTEMPTS"
-    echo "[$(date)] [STALL] $AGENT_ID: type-A stall detected (usage=$usage_state, policy=$policy) — Escape x2" >&2
+
+    # STALL_AWAITING_INPUT_GATE (cmd_219): 「入力待ちと名指しできる時だけ
+    # 撃つ」。CLAUDE.md「待機の上限」（正当な待機は1800秒まで可）と
+    # stall_after_sec（900秒動かねば固着）は同じ「時間」の軸に乗って
+    # おり数字をどう動かしても衝突が残る——ここで軸を分ける。検知
+    # （is_stalled_pane、上の呼び出し）は一切変えぬ。鍵を撃つか否かだけを
+    # 「その画面が何であるか」で決める（待機時間は一切見ない）。
+    # queue/reports/gunshi_design_219_stall_wait_budget_conflict.yaml §2 参照。
+    local awaiting_input=false kind="unresponsive"
+    if pane_awaiting_input "$PANE_TARGET"; then
+        awaiting_input=true
+    else
+        kind="unresponsive_nonmodal"
+    fi
+
+    # 通知は名指しできる/できぬに関わらず必ず届ける（cmd_218が塞いだ
+    # 「鳴らぬ番犬」の穴を、門の設置で再び開けぬため——通知は門の手前で
+    # 呼ぶ）。
+    stall_maybe_notify "$AGENT_ID" "$kind" "$STALL_UNRESPONSIVE_ATTEMPTS"
+
+    local hash_frozen_sec=$((now - STALL_HASH_SINCE))
+    if [ "$awaiting_input" != "true" ]; then
+        local nonmodal_level
+        nonmodal_level=$(stall_policy_query nonmodal_recovery_level 2>/dev/null) || nonmodal_level="none"
+        if [ "$nonmodal_level" = "none" ]; then
+            echo "[$(date)] [STALL] $AGENT_ID: awaiting_input=false hash_frozen_sec=$hash_frozen_sec — 鍵は撃たぬ (usage=$usage_state, policy=$policy)" >&2
+            return 0        # STALL_ACTION_TAKEN は立てぬ — inbox_watcher.sh 配送1tick契約を壊すため
+        fi
+    fi
+
+    STALL_ACTION_TAKEN=1
+    echo "[$(date)] [STALL] $AGENT_ID: type-A stall detected (usage=$usage_state, policy=$policy, awaiting_input=$awaiting_input, hash_frozen_sec=$hash_frozen_sec) — Escape x2" >&2
     timeout 5 tmux send-keys -t "$PANE_TARGET" Escape Escape 2>/dev/null || true
 
     if [ "$policy" = "escape_only" ]; then
@@ -1601,16 +1630,26 @@ attempt_stall_recovery() {
         echo "[$(date)] [STALL] $AGENT_ID: pane moved after Escape — aborting ladder" >&2
         return 0
     fi
+    # STALL_AWAITING_INPUT_GATE 再検査（設計§2(c)後段）: モーダルが剥がれた
+    # 後に非モーダルで固まった画面へ、後段（nudge）が鍵を撃つのを防ぐ。
+    if ! pane_awaiting_input "$PANE_TARGET" && [ "$(stall_policy_query nonmodal_recovery_level 2>/dev/null || echo none)" = "none" ]; then
+        echo "[$(date)] [STALL] $AGENT_ID: awaiting_input=false after Escape — aborting ladder (non-modal freeze)" >&2
+        return 0
+    fi
 
     echo "[$(date)] [STALL] $AGENT_ID: still stalled after Escape — nudge" >&2
 
-    # Modal gate (cmd_216 F-3 ii): this route sends "inbox?" + Enter directly
-    # via tmux send-keys, bypassing send_wakeup entirely — so PR#97's 5-route
-    # gate table never covered it (gunshi QC finding, the 6th route). Enter
-    # into an open modal confirms/selects an option exactly as it would via
-    # send_wakeup (see T-MODAL-GATE-01) — gate it the same way, before
-    # sending anything.
-    if pane_has_open_modal "$PANE_TARGET"; then
+    # Modal gate (cmd_216 F-3 ii → cmd_219 STALL_AWAITING_INPUT_GATE): this
+    # route sends "inbox?" + Enter directly via tmux send-keys, bypassing
+    # send_wakeup entirely — so PR#97's 5-route gate table never covered it
+    # (gunshi QC finding, the 6th route). Enter into an open modal
+    # confirms/selects an option exactly as it would via send_wakeup (see
+    # T-MODAL-GATE-01) — gate it the same way, before sending anything.
+    # cmd_219: pane_has_open_modal() misses the permission-confirm dialog
+    # footer (' Esc to cancel · Tab to amend'); pane_awaiting_input() covers
+    # it. pane_has_open_modal() itself stays untouched (used elsewhere by
+    # PR#97's Enter gate).
+    if pane_awaiting_input "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing stall-ladder nudge" >&2
         return 0
     fi
@@ -1622,6 +1661,10 @@ attempt_stall_recovery() {
     sleep 30
     if ! is_stalled_pane; then
         echo "[$(date)] [STALL] $AGENT_ID: pane moved after nudge — aborting ladder" >&2
+        return 0
+    fi
+    if ! pane_awaiting_input "$PANE_TARGET" && [ "$(stall_policy_query nonmodal_recovery_level 2>/dev/null || echo none)" = "none" ]; then
+        echo "[$(date)] [STALL] $AGENT_ID: awaiting_input=false after nudge — aborting ladder (non-modal freeze)" >&2
         return 0
     fi
 

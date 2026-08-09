@@ -55,6 +55,25 @@
 #                 pane text alone would read idle. Display-layer twin of
 #                 TC-STALL-013; the only guard on what cmd_220 S-2 actually
 #                 gained (gunshi_qc_220_pr103 N-1)
+#
+# cmd_219 STALL_AWAITING_INPUT_GATE (queue/reports/
+# gunshi_design_219_stall_wait_budget_conflict.yaml §9):
+#   TC-WAIT-001: awaiting_input=false + nonmodal_recovery_level=none →
+#                (a) no send-keys (b) STALL_UNRESPONSIVE_ATTEMPTS still
+#                increments (c) stall_maybe_notify still fires
+#                (d) STALL_ACTION_TAKEN stays 0
+#   TC-WAIT-002: choice-style modal footer → Escape sent (cmd_218 regression
+#                guard)
+#   TC-WAIT-003: permission-confirm dialog (REAL_BUSY_TAIL) → Escape sent —
+#                new acquisition proof (pane_has_open_modal() alone misses
+#                this footer; pane_awaiting_input() catches it)
+#   TC-WAIT-004: 'esc to interrupt' and 'esc to cancel' both present in the
+#                bottom block → awaiting_input=false (exclusion rule wins)
+#   TC-WAIT-005: nonmodal_recovery_level=escape_only reverts to the
+#                pre-cmd_219 behavior (fires regardless of awaiting_input)
+#   TC-WAIT-006: nonmodal_recovery_level defaults to "none" when
+#                config/settings.yaml is absent (cmd_163 BL-3 safe-default
+#                lesson)
 
 SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHER_SCRIPT="$SCRIPT_DIR/scripts/inbox_watcher.sh"
@@ -96,6 +115,10 @@ MOCK
     export MOCK_RECOVERY_LEVEL="full"
     export MOCK_UNKNOWN_POLICY="escape_only"
     export MOCK_USAGE_STATE="ok"
+    # cmd_219 STALL_AWAITING_INPUT_GATE: mirrors config/settings.yaml's
+    # production default (none) so tests exercise the same gate behavior
+    # as production unless a test explicitly overrides it.
+    export MOCK_NONMODAL_RECOVERY_LEVEL="none"
 
     export TEST_HARNESS="$TEST_TMPDIR/test_harness.sh"
     cat > "$TEST_HARNESS" << HARNESS
@@ -182,6 +205,8 @@ stall_policy_query() {
         stall_retry_cooldown_sec) echo "\${MOCK_STALL_COOLDOWN:-600}" ;;
         recovery_level) echo "\${MOCK_RECOVERY_LEVEL:-full}" ;;
         unknown_policy) echo "\${MOCK_UNKNOWN_POLICY:-escape_only}" ;;
+        nonmodal_recovery_level) echo "\${MOCK_NONMODAL_RECOVERY_LEVEL:-none}" ;;
+        stall_notify_after_attempts) echo "\${MOCK_STALL_NOTIFY_AFTER_ATTEMPTS:-3}" ;;
         *) echo "" ;;
     esac
 }
@@ -338,20 +363,24 @@ seed_stalled_hash() {
 # ─── TC-STALL-007: pane moves mid-ladder → later steps not sent ───
 
 @test "TC-STALL-007: attempt_stall_recovery aborts the ladder once the pane starts moving again" {
-    # Sequence has 3 slots because is_stalled_pane() now does TWO
-    # capture-pane calls per invocation (stall_busy()'s own, then its own
-    # hash capture): [0]=busy marker for call#1's stall_busy(),
+    # Sequence has 4 slots: is_stalled_pane() does TWO capture-pane calls
+    # per invocation (stall_busy()'s own, then its own hash capture), and
+    # cmd_219's STALL_AWAITING_INPUT_GATE adds a THIRD capture-pane call
+    # (pane_awaiting_input()) right before the Escape send.
+    # [0]=busy marker for call#1's stall_busy(),
     # [1]="frozen screen content" for call#1's hash check (matches the
-    # pre-seeded hash below), [2]="screen moved now" for call#2's
-    # stall_busy() — a plain line with no busy marker, so stall_busy()
-    # itself reports idle and the ladder aborts (still verifies the
-    # "pane moved -> ladder aborts" externally-observable contract).
+    # pre-seeded hash below), [2]=REAL_BUSY_TAIL again for the awaiting-input
+    # gate (dialog-shaped so the gate lets Escape through under the
+    # production-default nonmodal_recovery_level=none), [3]="screen moved
+    # now" for call#2's stall_busy() — a plain line with no busy marker, so
+    # stall_busy() itself reports idle and the ladder aborts (still verifies
+    # the "pane moved -> ladder aborts" externally-observable contract).
     run bash -c '
         MOCK_RECOVERY_LEVEL=full
         MOCK_USAGE_STATE=ok
         source "'"$TEST_HARNESS"'"
         '"$(seed_stalled_hash 'frozen screen content' 500)"'
-        MOCK_CAPTURE_SEQUENCE=("'"$REAL_BUSY_TAIL"'" "frozen screen content" "screen moved now")
+        MOCK_CAPTURE_SEQUENCE=("'"$REAL_BUSY_TAIL"'" "frozen screen content" "'"$REAL_BUSY_TAIL"'" "screen moved now")
         attempt_stall_recovery
     '
     [ "$status" -eq 0 ]
@@ -485,12 +514,25 @@ seed_stalled_hash() {
 # ─── TC-USAGE-004: ok → full ladder (Escape -> nudge -> /clear) ───
 
 @test "TC-USAGE-004: attempt_stall_recovery runs the full ladder when usage state is ok" {
+    # cmd_219: REAL_BUSY_TAIL (a permission-confirm dialog footer) is now
+    # correctly identified as awaiting_input=true by pane_awaiting_input(),
+    # so the nudge-stage modal gate (STALL_AWAITING_INPUT_GATE) suppresses
+    # the raw "inbox?"+Enter nudge into it (see TC-STALL-012) — nudging a
+    # real dialog would risk confirming its default option. To exercise the
+    # full ladder this test needs a busy-but-NOT-dialog-shaped fixture
+    # ('esc to interrupt' — busy per the generic 'esc to' marker, but
+    # explicitly excluded from awaiting_input by the exclusion rule) plus an
+    # explicit opt-in (nonmodal_recovery_level=escape_only) since the
+    # production default (none) would otherwise block even the initial
+    # Escape send for a non-dialog-identified freeze.
+    local busy_not_dialog='frozen busy screen esc to interrupt'
     run bash -c "
-        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
+        MOCK_CAPTURE_PANE='$busy_not_dialog'
         MOCK_USAGE_STATE=ok
         MOCK_RECOVERY_LEVEL=full
+        MOCK_NONMODAL_RECOVERY_LEVEL=escape_only
         source '$TEST_HARNESS'
-        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
+        $(seed_stalled_hash "$busy_not_dialog" 500)
         attempt_stall_recovery
     "
     [ "$status" -eq 0 ]
@@ -621,4 +663,123 @@ seed_stalled_hash() {
         get_pane_busy_rc \"\$PANE_TARGET\" claude \"\$AGENT_ID\"
     "
     [ "$status" -eq 0 ] || { echo "expected busy(0), got $status; output=$output"; false; }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_219 STALL_AWAITING_INPUT_GATE (TC-WAIT-001〜006)
+# queue/reports/gunshi_design_219_stall_wait_budget_conflict.yaml §9
+# ═══════════════════════════════════════════════════════════════════════
+
+# ─── TC-WAIT-001: awaiting_input=false → no keys, but count/notify/kind
+#     still happen in order (M2 mutation target: gate must sit AFTER the
+#     count+notify, not before) ───
+
+@test "TC-WAIT-001: gate blocks send-keys but still counts, notifies (kind=unresponsive_nonmodal), and leaves STALL_ACTION_TAKEN unset" {
+    # 'esc to interrupt' is busy per the generic 'esc to' marker (so
+    # is_stalled_pane() reaches the gate) but is explicitly excluded from
+    # awaiting_input by the exclusion rule — a non-modal frozen screen.
+    fixture='frozen busy screen esc to interrupt'
+    run bash -c "
+        MOCK_CAPTURE_PANE='$fixture'
+        MOCK_USAGE_STATE=ok
+        MOCK_RECOVERY_LEVEL=full
+        MOCK_NONMODAL_RECOVERY_LEVEL=none
+        branch_policy_notify() { echo \"NOTIFY:\$*\" >> '$MOCK_LOG'; return 0; }
+        export -f branch_policy_notify
+        source '$TEST_HARNESS'
+        $(seed_stalled_hash "$fixture" 500)
+        STALL_UNRESPONSIVE_ATTEMPTS=2
+        attempt_stall_recovery
+        echo \"ATTEMPTS=\$STALL_UNRESPONSIVE_ATTEMPTS\"
+        echo \"ACTION_TAKEN=\$STALL_ACTION_TAKEN\"
+    "
+    [ "$status" -eq 0 ]
+    ! grep -q "send-keys" "$MOCK_LOG" \
+        || { echo "expected no send-keys when awaiting_input=false"; cat "$MOCK_LOG"; false; }
+    grep -q "NOTIFY:.*unresponsive_nonmodal" "$MOCK_LOG" \
+        || { echo "expected stall_maybe_notify to still fire with kind=unresponsive_nonmodal"; cat "$MOCK_LOG"; false; }
+    echo "$output" | grep -q "ATTEMPTS=3" \
+        || { echo "expected STALL_UNRESPONSIVE_ATTEMPTS to reach 3 (2+1)"; echo "$output"; false; }
+    echo "$output" | grep -q "ACTION_TAKEN=0" \
+        || { echo "expected STALL_ACTION_TAKEN to stay 0 (delivery 1-tick-defer contract)"; echo "$output"; false; }
+}
+
+# ─── TC-WAIT-002: choice-style modal footer → Escape sent (cmd_218 regression) ───
+
+@test "TC-WAIT-002: awaiting_input=true (choice modal) still gets Escape x2" {
+    run bash -c "
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL_WRAPPED_JOINED'
+        MOCK_USAGE_STATE=ok
+        MOCK_RECOVERY_LEVEL=escape_only
+        MOCK_NONMODAL_RECOVERY_LEVEL=none
+        source '$TEST_HARNESS'
+        $(seed_stalled_hash "$REAL_BUSY_TAIL_WRAPPED_JOINED" 500)
+        attempt_stall_recovery
+    "
+    [ "$status" -eq 0 ]
+    grep -q "send-keys.*Escape.*Escape" "$MOCK_LOG" \
+        || { echo "expected Escape x2 for a choice-style modal"; cat "$MOCK_LOG"; false; }
+}
+
+# ─── TC-WAIT-003: permission-confirm dialog → Escape sent (new acquisition:
+#     pane_has_open_modal() alone cannot see this footer) ───
+
+@test "TC-WAIT-003: awaiting_input=true (permission-confirm dialog, REAL_BUSY_TAIL) still gets Escape x2" {
+    run bash -c "
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
+        MOCK_USAGE_STATE=ok
+        MOCK_RECOVERY_LEVEL=escape_only
+        MOCK_NONMODAL_RECOVERY_LEVEL=none
+        source '$TEST_HARNESS'
+        $(seed_stalled_hash "$REAL_BUSY_TAIL" 500)
+        attempt_stall_recovery
+    "
+    [ "$status" -eq 0 ]
+    grep -q "send-keys.*Escape.*Escape" "$MOCK_LOG" \
+        || { echo "expected Escape x2 for the permission-confirm dialog footer"; cat "$MOCK_LOG"; false; }
+}
+
+# ─── TC-WAIT-004: exclusion rule wins when both markers are present (M4
+#     mutation target) ───
+
+@test "TC-WAIT-004: pane_awaiting_input returns false when 'esc to interrupt' and 'esc to cancel' both appear" {
+    run bash -c "
+        MOCK_CAPTURE_PANE='Working (12s) esc to interrupt
+ esc to cancel'
+        source '$TEST_HARNESS'
+        pane_awaiting_input \"\$PANE_TARGET\"
+    "
+    [ "$status" -eq 1 ] \
+        || { echo "expected exclusion rule (esc to interrupt) to win over esc to cancel"; false; }
+}
+
+# ─── TC-WAIT-005: nonmodal_recovery_level=escape_only reverts to
+#     pre-cmd_219 behavior (fires regardless of awaiting_input) (M5
+#     mutation target pairs with TC-WAIT-006, not this one — this one
+#     exercises the escape_only override directly) ───
+
+@test "TC-WAIT-005: nonmodal_recovery_level=escape_only fires Escape even when awaiting_input=false" {
+    fixture='frozen busy screen esc to interrupt'
+    run bash -c "
+        MOCK_CAPTURE_PANE='$fixture'
+        MOCK_USAGE_STATE=ok
+        MOCK_RECOVERY_LEVEL=escape_only
+        MOCK_NONMODAL_RECOVERY_LEVEL=escape_only
+        source '$TEST_HARNESS'
+        $(seed_stalled_hash "$fixture" 500)
+        attempt_stall_recovery
+    "
+    [ "$status" -eq 0 ]
+    grep -q "send-keys.*Escape.*Escape" "$MOCK_LOG" \
+        || { echo "expected nonmodal_recovery_level=escape_only to revert to firing unconditionally"; cat "$MOCK_LOG"; false; }
+}
+
+# ─── TC-WAIT-006: nonmodal_recovery_level defaults to 'none' when
+#     config/settings.yaml is absent (cmd_163 BL-3 safe-default lesson) ───
+
+@test "TC-WAIT-006: stall_policy_query nonmodal_recovery_level defaults to none when settings.yaml is absent" {
+    run env STALL_POLICY_SETTINGS="$TEST_TMPDIR/does_not_exist.yaml" \
+        bash -c 'source "'"$PROJECT_ROOT"'/lib/stall_policy.sh"; stall_policy_query nonmodal_recovery_level'
+    [ "$status" -eq 0 ]
+    [ "$output" = "none" ] || { echo "expected default 'none', got '$output'"; false; }
 }

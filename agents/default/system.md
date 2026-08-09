@@ -275,6 +275,15 @@ fi
 
 ACが原理的に充足不能と判明した場合の完了判定は `instructions/karo.md` / `instructions/gunshi.md` の同名節を見よ（上記「打ち切りの作法」(a)(b) と対をなす規律である）。
 
+**stall検知との関係**（cmd_219 STALL_AWAITING_INPUT_GATE）: stall検知
+（`stall_policy`）は待機時間を根拠に鍵を撃たぬ。撃つのは、画面が
+「入力待ち」と名指しできる時（モーダル・許可確認ダイアログ）に限る。
+ゆえに本節の30分は`stall_policy.stall_after_sec`（既定900秒）と
+**別軸の規範**であり、両者は競合しない。wait_budgetで30分を超えて
+授権された待機も、検知器へ申告する必要は無い——検知器は待っている
+時間を見ていない。名指しできぬ画面が固着した場合、検知器は鍵を撃たずに
+人へ報せる（`config/settings.yaml`の`stall_policy.nonmodal_recovery_level`）。
+
 ## 常駐デーモンの再起動 (all agents)
 
 **常駐デーモン・持続プロセスを変更する改修は、マージだけでは完了としない。
