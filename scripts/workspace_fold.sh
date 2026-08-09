@@ -320,10 +320,18 @@ check_worktree() {
 
 # Folds one worktree: assumes check_worktree already passed.
 fold_worktree() {
-    local path="$1" canon branch main_repo
+    local path="$1" canon branch main_repo wt_list
     canon="$(resolve_path "$path")"
     branch="$(git -C "$canon" branch --show-current)"
-    main_repo="$(git -C "$canon" worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}')"
+    # SIGPIPE-safe main_repo lookup (see run_sweep() for rationale):
+    # capture the full `git worktree list --porcelain` output via command
+    # substitution first (which waits for git to finish), THEN feed the
+    # already-complete string to awk's early-exit. Piping git directly into
+    # an early-exiting awk risks SIGPIPE if git is still writing when awk
+    # closes the pipe — this becomes a near-certain crash once the repo has
+    # dozens of worktrees (cmd_222 follow-up, discovered post-merge of PR#107).
+    wt_list="$(git -C "$canon" worktree list --porcelain)"
+    main_repo="$(printf '%s\n' "$wt_list" | awk '/^worktree /{print substr($0,10); exit}')"
 
     if ! git -C "$main_repo" worktree remove "$canon"; then
         echo "ABORT: git worktree remove refused for $canon (git's own safety check declined; not overridden)"
@@ -358,8 +366,17 @@ run_single() {
 }
 
 run_sweep() {
-    local main_repo
-    main_repo="$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}')"
+    local main_repo wt_list
+    # SIGPIPE-safe main_repo lookup: capture the full porcelain output via
+    # command substitution first (command substitution waits for the
+    # producer to finish, so this cannot race), THEN let awk early-exit on
+    # the already-complete string. Piping `git worktree list --porcelain`
+    # directly into an early-exiting `awk '...; exit}'` risks SIGPIPE when
+    # git is still writing remaining worktrees at the moment awk closes the
+    # pipe — under `set -euo pipefail` this kills the whole script (exit
+    # 141), reproducibly once the repo has dozens of worktrees.
+    wt_list="$(git worktree list --porcelain)"
+    main_repo="$(printf '%s\n' "$wt_list" | awk '/^worktree /{print substr($0,10); exit}')"
     if [[ -z "$main_repo" ]]; then
         echo "not inside a git repository; --sweep requires running from within one" >&2
         return 1

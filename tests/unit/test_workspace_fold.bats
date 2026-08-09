@@ -323,6 +323,54 @@ assert_only_one_condition_fails() {
     [ -z "$output" ]
 }
 
+# Installs a `git` stub at the front of PATH that behaves exactly like real
+# git EXCEPT for `worktree list --porcelain` (with or without a leading
+# `-C <path>`), where it re-emits the real output one line at a time with a
+# small sleep between lines instead of writing it all at once. This forces
+# the SIGPIPE race deterministically: if a caller pipes this output directly
+# into an early-exiting `awk '...; exit}'`, awk closes its read end after
+# the very first "worktree " line, and the stub's next write attempt (after
+# its sleep) hits a broken pipe and dies with SIGPIPE (exit 141) — exactly
+# what real git does on a busy host with dozens of worktrees, just made
+# reproducible on demand instead of depending on OS scheduling luck.
+mk_slow_worktree_list_git_stub_path() {
+    local real_git
+    real_git="$(command -v git)"
+    mkdir -p "$TEST_TMPDIR/slow_git_bin"
+    cat > "$TEST_TMPDIR/slow_git_bin/git" <<STUB
+#!/usr/bin/env bash
+REAL_GIT="$real_git"
+is_wt_list=0
+args=("\$@")
+for ((i=0; i<\${#args[@]}; i++)); do
+    if [[ "\${args[\$i]}" == "worktree" && "\${args[\$((i+1))]}" == "list" && "\${args[\$((i+2))]}" == "--porcelain" ]]; then
+        is_wt_list=1
+        break
+    fi
+done
+if [[ "\$is_wt_list" -eq 1 ]]; then
+    while IFS= read -r line; do
+        printf '%s\n' "\$line"
+        sleep 0.05
+    done < <("\$REAL_GIT" "\$@")
+    exit 0
+fi
+exec "\$REAL_GIT" "\$@"
+STUB
+    chmod +x "$TEST_TMPDIR/slow_git_bin/git"
+    printf '%s:%s' "$TEST_TMPDIR/slow_git_bin" "$PATH"
+}
+
+@test "--sweep dry-run survives a slow-writing 'git worktree list --porcelain' without SIGPIPE-aborting (cmd_222 follow-up regression: main_repo lookup must not pipe a live writer into an early-exiting awk)" {
+    mk_clean_worktree sigpipe_a >/dev/null
+    mk_clean_worktree sigpipe_b >/dev/null
+
+    cd "$TEST_MAIN"
+    PATH="$(mk_slow_worktree_list_git_stub_path)" run bash "$FOLD" --sweep
+    [ "$status" -eq 0 ] || { echo "status=$status (141 == SIGPIPE-killed); output:"; echo "$output"; false; }
+    [[ "$output" == *"SWEEP SUMMARY"* ]] || { echo "$output"; false; }
+}
+
 @test "--sweep folds every eligible worktree and blocks the rest, main worktree untouched" {
     ok_path="$(mk_clean_worktree sweep_ok)"
     git -C "$TEST_MAIN" merge -q --ff-only "feat/sweep_ok"
