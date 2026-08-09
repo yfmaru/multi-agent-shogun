@@ -57,13 +57,35 @@ if [[ -z "$MODE" ]]; then
     exit 2
 fi
 
+# Portable absolute-path resolution. Deliberately avoids GNU-only
+# `realpath -m` (BSD/macOS realpath lacks -m and requires the path to
+# exist) — uses only cd+pwd -P, which both platforms' shells provide.
+resolve_path() {
+    local target="$1" dir base
+    if [[ -d "$target" ]]; then
+        (cd "$target" 2>/dev/null && pwd -P)
+        return
+    fi
+    dir="$(dirname "$target")"
+    base="$(basename "$target")"
+    if [[ -d "$dir" ]]; then
+        printf '%s/%s\n' "$(cd "$dir" 2>/dev/null && pwd -P)" "$base"
+    else
+        printf '%s\n' "$target"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # C7: is this a directory git itself tracks as a worktree of some repo?
 # Anything else (a raw directory) is out of an agent's reach per D002.
 # ---------------------------------------------------------------------------
 c7_is_registered_worktree() {
     local path="$1" canon
-    canon="$(realpath -m "$path" 2>/dev/null)" || { echo "cannot resolve path: $path"; return 1; }
+    canon="$(resolve_path "$path")"
+    if [[ -z "$canon" ]]; then
+        echo "cannot resolve path: $path"
+        return 1
+    fi
     if [[ ! -d "$canon" ]]; then
         echo "path does not exist: $canon"
         return 1
@@ -74,7 +96,7 @@ c7_is_registered_worktree() {
     fi
     local wt found=0
     while IFS= read -r wt; do
-        if [[ "$(realpath -m "$wt")" == "$canon" ]]; then
+        if [[ "$(resolve_path "$wt")" == "$canon" ]]; then
             found=1
             break
         fi
@@ -140,20 +162,39 @@ c4_no_data_files() {
 
 # C5: no live process holds this directory (or a subdirectory) as its cwd.
 # Deleting a process's cwd out from under it succeeds silently on Linux;
-# git does not detect this.
+# git does not detect this. /proc is Linux-only; on platforms without it
+# (macOS/BSD) this falls back to lsof. If neither is available, this fails
+# closed (refuses to fold) rather than silently reporting "clear".
 c5_no_live_process() {
-    local path="$1" canon p cwd pid
-    canon="$(realpath -m "$path")"
-    for p in /proc/[0-9]*; do
-        [[ -e "$p/cwd" ]] || continue
-        cwd="$(readlink -f "$p/cwd" 2>/dev/null)" || continue
-        if [[ "$cwd" == "$canon" || "$cwd" == "$canon"/* ]]; then
-            pid="${p#/proc/}"
-            echo "process $pid has cwd under $canon"
+    local path="$1" canon
+    canon="$(resolve_path "$path")"
+
+    if [[ -d /proc ]]; then
+        local p cwd pid
+        for p in /proc/[0-9]*; do
+            [[ -e "$p/cwd" ]] || continue
+            cwd="$(readlink -f "$p/cwd" 2>/dev/null)" || continue
+            if [[ "$cwd" == "$canon" || "$cwd" == "$canon"/* ]]; then
+                pid="${p#/proc/}"
+                echo "process $pid has cwd under $canon"
+                return 1
+            fi
+        done
+        return 0
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        local hit
+        hit="$(lsof -a -d cwd +D "$canon" 2>/dev/null | awk 'NR>1')"
+        if [[ -n "$hit" ]]; then
+            echo "a process holds $canon as cwd (lsof): $(echo "$hit" | head -1)"
             return 1
         fi
-    done
-    return 0
+        return 0
+    fi
+
+    echo "cannot verify: neither /proc nor lsof is available on this platform"
+    return 1
 }
 
 # C6: the branch has landed on the base branch (merged PR, or nothing
@@ -218,7 +259,7 @@ check_worktree() {
 # Folds one worktree: assumes check_worktree already passed.
 fold_worktree() {
     local path="$1" canon branch main_repo
-    canon="$(realpath -m "$path")"
+    canon="$(resolve_path "$path")"
     branch="$(git -C "$canon" branch --show-current)"
     main_repo="$(git -C "$canon" worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}')"
 
@@ -264,7 +305,7 @@ run_sweep() {
 
     local wt folded=0 blocked=0
     while IFS= read -r wt; do
-        [[ "$(realpath -m "$wt")" == "$(realpath -m "$main_repo")" ]] && continue
+        [[ "$(resolve_path "$wt")" == "$(resolve_path "$main_repo")" ]] && continue
         if check_worktree "$wt" "$BASE_BRANCH"; then
             if [[ "$DO_YES" -eq 1 ]]; then
                 fold_worktree "$wt" && folded=$((folded + 1)) || blocked=$((blocked + 1))
