@@ -50,6 +50,22 @@
 #   TC-TCOMP-EXP-004 /procが読めぬ環境を模す → 黙って飛ばしexit 0
 #   TC-TCOMP-REG-001 既存の--message呼び出し形は非破壊
 #
+# TC-TCOMP-DUP-* は cmd_220 subtask（cmd_221 F-5是正、軍師QC
+# gunshi_qc_220_pr103.yamlのF-5）に基づく。従来の書き換え後検算
+# `grep -cE "^  status: ${STATUS}$"`は「新しい値に一致する行が1件か」
+# しか見ておらず、末尾等に別の値を持つ重複`status:`キーが残っていても
+# 素通りする（YAMLパーサは後勝ちで古い方＝重複を採用する）。値を問わず
+# `status:`キーの出現数そのものが1件であることを検算するよう是正した。
+#
+#   TC-TCOMP-DUP-001 変異試験: 是正前の検算（新値一致件数のみ）は
+#                     重複statusキーを検知できず「成功」と誤報告する
+#                     ことを、是正前コードの再現で確認する
+#   TC-TCOMP-DUP-002 回帰試験: 是正後の本スクリプトは重複statusキーを
+#                     検知しexit 2で落ちる。原ファイルは巻き戻され
+#                     重複がそのまま残る（＝真の巻き戻し）
+#   TC-TCOMP-DUP-003 正常系の回帰無し: 重複の無い通常のtask YAMLは
+#                     従来どおりexit 0でstatusが書き換わる
+
 # TC-TCOMP-PF-* は cmd_203 案C（軍師設計 gunshi_self_return_dependency_design.yaml
 # 案C）に基づく。queue/shogun_to_karo.yamlのpending_followups（status: pending分
 # のみ）を、完了出力へ強制的に割り込ませて表示する。
@@ -132,6 +148,38 @@ write_report() {
 task_id: $task_id
 status: $status
 YAML
+}
+
+# TC-TCOMP-DUP-* 用: task:マッピング直下（2スペース字下げ）の`status:`
+# キーを先頭付近と末尾付近の2箇所に持つ検体（cmd_220 F-5の実例と同型）。
+# 両方とも初期値はassignedとする（貴殿自身が踏んだ実例と同じ形）。
+write_task_dup_status() {
+    cat > "$TASK_FILE" << 'YAML'
+task:
+  task_id: subtask_test
+  status: assigned
+  description: |
+    紛らわしい字下げの決り文句:
+    status: assigned
+  status: assigned
+YAML
+}
+
+# TC-TCOMP-DUP-001用: 是正前（F-5是正前）のtask_complete.shを、
+# フィクスチャの現物コードから機械的に再構成する。「新しい値に一致する
+# 行が1件か」しか見ない旧検算のみが残る形。行番号ではなく本文中の
+# 是正コミットで追加した目印コメント・die文言で範囲指定するため、
+# 本体側の周辺コードが動いても対象を見失わない。
+build_pre_fix_script() {
+    local dst="$1"
+    awk '
+      /^# 書き換え前点検:/ { skipA=1 }
+      skipA { if ($0 ~ /（書き換え前点検・巻き戻し不要）/) skipA=0; next }
+      /^# 書き換え後検算:/ { skipB=1 }
+      skipB { if ($0 == "}") skipB=0; next }
+      { print }
+    ' "$FIXTURE_ROOT/scripts/task_complete.sh" > "$dst"
+    chmod +x "$dst"
 }
 
 # TC-TCOMP-PF-* 用: parent_cmdフィールドを持つtask YAML。
@@ -355,6 +403,40 @@ run_tc() {
     local leftovers=("$FIXTURE_ROOT"/queue/tasks/*.bak.*)
     shopt -u nullglob
     [ "${#leftovers[@]}" -eq 0 ] || { echo "REGRESSION: BACKUPが残存: ${leftovers[*]}"; false; }
+}
+
+@test "TC-TCOMP-DUP-001: mutation check - the pre-fix status verification wrongly reports success on a duplicate status key" {
+    write_task_dup_status
+    write_report done
+    local pre_fix_script="$FIXTURE_ROOT/scripts/task_complete_pre_fix.sh"
+    build_pre_fix_script "$pre_fix_script"
+    run bash "$pre_fix_script" --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "REGRESSION: 変異試験の前提が崩れている（是正前コードなのにexit 0でない）: output=$output"; false; }
+    [ "$(grep -cE '^  status:' "$TASK_FILE")" -eq 2 ] || { echo "変異試験の前提が崩れている: 重複が再現できていない"; cat "$TASK_FILE"; false; }
+    grep -qE '^  status: done$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+    grep -qE '^  status: assigned$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+}
+
+@test "TC-TCOMP-DUP-002: regression - a duplicate status key is detected and exits 2, original file rolled back" {
+    write_task_dup_status
+    write_report done
+    local before_content
+    before_content="$(cat "$TASK_FILE")"
+    run_tc --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
+    [ "$status" -eq 2 ] || { echo "output: $output"; false; }
+    [ "$(cat "$TASK_FILE")" = "$before_content" ] || { echo "REGRESSION: 巻き戻しが不完全"; cat "$TASK_FILE"; false; }
+    [ "$(grep -cE '^  status: assigned$' "$TASK_FILE")" -eq 2 ] || { cat "$TASK_FILE"; false; }
+    [ ! -s "$INBOX_LOG" ] || { cat "$INBOX_LOG"; false; }
+}
+
+@test "TC-TCOMP-DUP-003: no regression on a normal (non-duplicate) task YAML" {
+    write_task assigned
+    write_report done
+    run_tc --task-id subtask_test --to gunshi --message "hello" --agent ashigaru1
+    [ "$status" -eq 0 ] || { echo "output: $output"; false; }
+    [ "$(grep -cE '^  status:' "$TASK_FILE")" -eq 1 ] || { cat "$TASK_FILE"; false; }
+    grep -qE '^  status: done$' "$TASK_FILE" || { cat "$TASK_FILE"; false; }
+    [ "$(wc -l < "$INBOX_LOG")" -eq 1 ] || { cat "$INBOX_LOG"; false; }
 }
 
 @test "TC-TCOMP-MF-001: --message-file passes the file's raw content through unchanged (backticks, \$(), \$VAR survive verbatim)" {
