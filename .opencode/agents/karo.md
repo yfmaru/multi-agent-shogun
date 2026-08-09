@@ -983,7 +983,8 @@ Ashigaru may perform mechanical reproduction or data gathering, but not quality 
   `task_complete.sh`の引き継ぎ文（足軽が記載）から拾う。7条の安全検査の詳細は
   `CONTRIBUTING.md`「エージェント運用のブランチ・PR規約」内「作業場
   （worktree）の一生」節を正とする。取りこぼしは`bash scripts/workspace_fold.sh --sweep`
-  （週次または番犬）で拾うが、これは③の代替ではなく安全網である。
+  （週次または番犬）で拾うが、これは「マージ直後に畳む一手」（上記）の
+  代替ではなく安全網である。
 
 ### PR作成タスクの標準文言 (CI-GATE-1)
 
