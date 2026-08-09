@@ -334,9 +334,10 @@ get_pane_busy_rc() {
             fi
             if [[ "$(agent_turn_state "$agent_id")" == "busy" ]]; then
                 return 0
-            else
-                return 1
             fi
+            # else は置かない。hook未装填でturn_stateが常にidleへ
+            # 縮退しても表示層が沈黙せぬよう、agent_is_busy_check へ落とす
+            # （S-1と同形。gunshi_qc_220_pr103 F-1 是正）。
         fi
     fi
 

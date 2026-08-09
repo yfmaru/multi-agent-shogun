@@ -45,6 +45,12 @@
 #   TC-CL-001: AGENT_ID=shogun/karo/gunshi → no keys sent at all (cmd_209
 #              P-2 role guard, mitigation 3 — stricter than the old
 #              "Escape ok, /clear forbidden" behavior)
+#   TC-STALL-013: stall_busy() reports busy via agent_turn_state even when
+#                 the pane text looks idle (cmd_220 S-1 coverage, gunshi
+#                 QC F-2/T-1)
+#   TC-STALL-014: get_pane_busy_rc() falls back to pane-text analysis and
+#                 reports busy when busy印 is absent — hook未装填 regression
+#                 guard for cmd_220 S-2 (gunshi_qc_220_pr103 F-1/F-2/T-2)
 
 SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHER_SCRIPT="$SCRIPT_DIR/scripts/inbox_watcher.sh"
@@ -564,4 +570,37 @@ seed_stalled_hash() {
         [ "$status" -eq 0 ]
         ! grep -q "send-keys" "$MOCK_LOG"
     done
+}
+
+# ─── TC-STALL-013: stall_busy() honors agent_turn_state even when the pane
+#     text alone would read idle (cmd_220 S-1, recommended by gunshi F-2/T-1)
+
+@test "TC-STALL-013: stall_busy reports busy via agent_turn_state even when pane looks idle" {
+    # No 'esc to' marker anywhere in the capture — agent_is_busy_check alone
+    # would say idle. A busy印 on disk (IDLE_FLAG_DIR/shogun_busy_$AGENT_ID)
+    # must still make stall_busy() report busy (the OR added in cmd_220 S-1).
+    run bash -c "
+        MOCK_CAPTURE_PANE='frozen screen content'
+        source '$TEST_HARNESS'
+        touch \"\$IDLE_FLAG_DIR/shogun_busy_\$AGENT_ID\"
+        stall_busy
+    "
+    [ "$status" -eq 0 ]
+}
+
+# ─── TC-STALL-014: get_pane_busy_rc() falls back to pane-text analysis when
+#     busy印 is absent (cmd_220 S-2 regression guard, gunshi F-1/F-2/T-2)
+
+@test "TC-STALL-014: get_pane_busy_rc falls back to agent_is_busy_check and reports busy when busy印 is absent" {
+    # No busy_flag file exists in this fresh IDLE_FLAG_DIR (hook未装填を
+    # 模す), so agent_turn_state() degrades to idle. Before the F-1 fix,
+    # get_pane_busy_rc() returned 1 (idle) right there without ever
+    # consulting the pane text — this is the exact regression gunshi's QC
+    # caught (a genuinely busy pane reported as 待機中).
+    run bash -c "
+        MOCK_CAPTURE_PANE='$REAL_BUSY_TAIL'
+        source '$TEST_HARNESS'
+        get_pane_busy_rc \"\$PANE_TARGET\" claude \"\$AGENT_ID\"
+    "
+    [ "$status" -eq 0 ]
 }
