@@ -201,21 +201,31 @@ YAML
 
 # ─── T-217-08: nudge3回でbusy印が一度も出ない → [HOOK-UNARMED]が一度だけ ───
 
-@test "T-217-08: three nudges with busy印 never appearing logs HOOK-UNARMED exactly once" {
+@test "T-217-08: four nudges with busy印 never appearing logs HOOK-UNARMED exactly once" {
     _build_watcher_harness
     rm -f "$IDLE_FLAG_DIR/shogun_busy_t217agent"
 
     # should_throttle_nudge suppresses repeat sends of the same unread count
-    # within its cooldown window — vary the count (1,2,3) so all three
+    # within its cooldown window — vary the count (1,2,3,4) so all four
     # send_wakeup calls actually reach the send-keys success path and
     # check_hook_armed, matching how count changes bypass throttling in
     # production (see T-SHOOK-002 in test_send_wakeup.bats).
+    #
+    # cmd_217 QC (gunshi_qc_217_pr100.yaml F-2): the threshold N=3 means
+    # only the 3rd nudge ever reaches NUDGE_SEND_COUNT>=N, so a 3-nudge
+    # test can't distinguish "logged once" from "one-shot flag removed" —
+    # both look identical at exactly 1 line. A 4th nudge (N+1) is required
+    # to prove the one-shot flag (HOOK_UNARMED_LOGGED) actually suppresses
+    # the 2nd would-be log line, since production nudges indefinitely and a
+    # broken one-shot flag means [HOOK-UNARMED] (and the ntfy it triggers)
+    # fires on every nudge from the 3rd onward.
     run bash -c "
         source '$WATCHER_HARNESS'
         HOOK_ARMED_CHECK_N=3
         send_wakeup 1
         send_wakeup 2
         send_wakeup 3
+        send_wakeup 4
     "
     [ "$status" -eq 0 ]
 
@@ -397,4 +407,49 @@ YAML
         IDLE_FLAG_DIR='/nonexistent/no/such/dir' bash '$UPS_HOOK'
     "
     [ "$status" -eq 0 ]
+}
+
+# ─── F-1 (subtask_217_qc_fixes, gunshi_qc_217_pr100.yaml): M3/M4を捕まえる ───
+# 軍師の変異試験で M3（session_start_hook.sh の busy印touch削除）と
+# M4（stop_hook_inbox.sh block経路の busy印touch削除）が生存した
+# （どちらも捕まえるテストが無かった）。T-217-10b と同じ流儀
+# （対象スクリプトの現物をgrepして busy印touch 行の存在を検査する）で塞ぐ。
+#
+# NOTE: パターンに $AGENT_ID のような "$" を含む文字列を渡す際は必ず
+# grep -F（固定文字列）を用いること。素の -n/-q だと、この実行環境の
+# grep 実体（ugrep）が BRE 途中の "$" を行末アンカーとして誤解釈し、
+# 実在する行にも決してヒットしなくなる
+# （gunshi_qc_217_pr100.yaml F-3で実証済みの罠。printf 'a$b\n' | grep -c
+# 'a$b' が GNU grep=1 / ugrep=0 で再現する）。
+
+@test "T-217-12 (F-1/M3): session_start_hook.sh touches shogun_busy_<agent> on Session Start" {
+    local hook_script="$SCRIPT_DIR/scripts/session_start_hook.sh"
+    [ -f "$hook_script" ]
+    grep -qF 'touch "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}"' "$hook_script"
+}
+
+@test "T-217-13 (F-1/M4): stop_hook_inbox.sh block path touches shogun_busy_<agent> after any idle印touch and before the block decision" {
+    local hook_script="$SCRIPT_DIR/scripts/stop_hook_inbox.sh"
+    [ -f "$hook_script" ]
+
+    local busy_line
+    busy_line=$(grep -nF 'touch "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}"' "$hook_script" | head -1 | cut -d: -f1)
+    [ -n "$busy_line" ] || { echo "shogun_busy_ touch line not found in $hook_script"; false; }
+
+    local last_idle_line
+    last_idle_line=$(grep -nF 'touch "$FLAG"' "$hook_script" | tail -1 | cut -d: -f1)
+    [ -n "$last_idle_line" ] || { echo "idle印 touch line not found in $hook_script"; false; }
+
+    local block_line
+    block_line=$(grep -nF "'decision': 'block'" "$hook_script" | head -1 | cut -d: -f1)
+    [ -n "$block_line" ] || { echo "block decision line not found in $hook_script"; false; }
+
+    # busy印touch must be positioned AFTER every idle印touch on this
+    # invocation (newer mtime wins under §2 design) and BEFORE the block
+    # decision is emitted — matching the ordering comment at the touch
+    # site (stop_hook_inbox.sh: "immediately before the block decision").
+    [ "$busy_line" -gt "$last_idle_line" ] \
+        || { echo "busy印touch(L$busy_line) must come AFTER last idle印touch(L$last_idle_line)"; false; }
+    [ "$busy_line" -lt "$block_line" ] \
+        || { echo "busy印touch(L$busy_line) must come BEFORE block decision(L$block_line)"; false; }
 }
