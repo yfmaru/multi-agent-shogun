@@ -685,6 +685,13 @@ PY
 # 実行時にtmux paneの @agent_cli を再確認し、ドリフト時はpane値を優先する。
 send_cli_command() {
     local cmd="$1"
+    # cmd_220 subtask2 (QC-1/QC-2): global flag, not the return value, tells
+    # the caller "this was deferred, not a final disposition". Two callers
+    # (line ~1599 stall recovery, ~1925 context reset) invoke this function
+    # bare, outside any `if`; a non-zero return there would be killed by
+    # set -euo pipefail (see the "Never return 1" comment below). So every
+    # transient-suppress path below sets SEND_DEFERRED=1 and still returns 0.
+    SEND_DEFERRED=0
     # cmd_171/C1-3: attempt_stall_recovery() passes force_busy=1. A stall is
     # BY DEFINITION busy (is_stalled_pane requires agent_is_busy() true), so
     # the ordinary busy-guard below would silently swallow /clear every time
@@ -702,6 +709,10 @@ send_cli_command() {
     # idle-flag design already fears (spinner flicker → permanent stall).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing CLI command ($cmd)" >&2
+        # cmd_220 subtask2 QC-1: this is a transient state, not a final
+        # disposition — the modal will eventually close on its own. Tell the
+        # caller via SEND_DEFERRED so it does NOT mark the message read.
+        SEND_DEFERRED=1
         return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
@@ -741,6 +752,11 @@ send_cli_command() {
     fi
     if [[ "$cmd" == "/clear" ]] && [ "$force_busy" -ne 1 ] && ! [[ "$effective_cli" == "opencode" && -z "${pane_snapshot//[[:space:]]/}" ]] && agent_is_busy; then
         echo "[$(date)] [SKIP] Agent is busy — /clear deferred to next cycle (agent=$AGENT_ID)" >&2
+        # cmd_220 subtask2 QC-2: same as the modal gate above — transient,
+        # not final. Normally the outer busy guard (~line 1738) catches this
+        # first, but a race window (agent_is_busy flips between the two
+        # checks) can reach here directly.
+        SEND_DEFERRED=1
         return 0
     fi
 
@@ -1753,16 +1769,28 @@ for s in data.get('specials', []):
                     # clear_command that was actually suppressed would still
                     # set clear_sent=1 and wrongly trigger the auto-recovery
                     # task_assigned injection below (T-SHOGUN-005).
-                    if [ "$msg_type" = "clear_command" ] && [ "$AGENT_ID" != "shogun" ]; then
+                    # cmd_220 subtask2 QC-1: also guard on SEND_DEFERRED — a
+                    # modal/busy-suppressed send must not be counted as sent.
+                    if [ "$msg_type" = "clear_command" ] && [ "$AGENT_ID" != "shogun" ] && [ "${SEND_DEFERRED:-0}" -eq 0 ]; then
                         clear_sent=1
                     fi
                 fi
-                # cmd_220 F-A: mark read once handed to send_cli_command —
-                # every one of its return paths is a final disposition for
-                # this cycle (send / intentional suppress / CLI-unsupported
-                # skip), never "try again later". Only the busy-guard
-                # `continue` above (genuinely deferred) must skip this.
-                mark_special_read "$msg_id"
+                # cmd_220 F-A / subtask2 QC-1/QC-3: mark read once handed to
+                # send_cli_command UNLESS it reports a transient suppression
+                # (SEND_DEFERRED=1 — modal open, or the inner busy-guard race
+                # window). NOT every return path here is a final disposition:
+                # the modal gate (:703) and inner busy guard (:742) are both
+                # "try again later", same as the busy-guard `continue` above.
+                # Treat a deferred special exactly like that continue path —
+                # leave it unread and arm the F-D stale-busy safety net.
+                if [ "${SEND_DEFERRED:-0}" -eq 0 ]; then
+                    mark_special_read "$msg_id"
+                else
+                    special_deferred=1
+                    if [ "${FIRST_UNREAD_SEEN:-0}" -eq 0 ]; then
+                        FIRST_UNREAD_SEEN=$(date +%s)
+                    fi
+                fi
             else
                 # normalize_special_command rejected the payload (e.g.
                 # malformed model_switch) — it can't become valid by
