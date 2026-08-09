@@ -51,6 +51,10 @@
 #   TC-STALL-014: get_pane_busy_rc() falls back to pane-text analysis and
 #                 reports busy when busy印 is absent — hook未装填 regression
 #                 guard for cmd_220 S-2 (gunshi_qc_220_pr103 F-1/F-2/T-2)
+#   TC-STALL-015: get_pane_busy_rc() honors agent_turn_state even when the
+#                 pane text alone would read idle. Display-layer twin of
+#                 TC-STALL-013; the only guard on what cmd_220 S-2 actually
+#                 gained (gunshi_qc_220_pr103 N-1)
 
 SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHER_SCRIPT="$SCRIPT_DIR/scripts/inbox_watcher.sh"
@@ -603,4 +607,18 @@ seed_stalled_hash() {
         get_pane_busy_rc \"\$PANE_TARGET\" claude \"\$AGENT_ID\"
     "
     [ "$status" -eq 0 ]
+}
+
+# ─── TC-STALL-015: get_pane_busy_rc() honors agent_turn_state even
+#     when the pane text alone would read idle. Display-layer twin of
+#     TC-STALL-013; the only guard on what cmd_220 S-2 actually gained.
+
+@test "TC-STALL-015: get_pane_busy_rc reports busy via agent_turn_state even when pane looks idle" {
+    run bash -c "
+        MOCK_CAPTURE_PANE='frozen screen content'
+        source '$TEST_HARNESS'
+        touch \"\$IDLE_FLAG_DIR/shogun_busy_\$AGENT_ID\"
+        get_pane_busy_rc \"\$PANE_TARGET\" claude \"\$AGENT_ID\"
+    "
+    [ "$status" -eq 0 ] || { echo "expected busy(0), got $status; output=$output"; false; }
 }
