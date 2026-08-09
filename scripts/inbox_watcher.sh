@@ -578,6 +578,17 @@ PY
 # ─── Extract unread message info ───
 # Returns JSON lines: {"count": N, "has_special": true/false, "specials": [...]}
 # Test anchor for bats awk pattern: get_unread_info\\(\\)
+#
+# cmd_220 F-A: this is a pure PEEK — it no longer marks specials as read.
+# Peek and commit used to be fused here (read the message → immediately
+# write read:true), which meant a clear_command/model_switch/cli_restart
+# was consumed the instant it was *seen*, regardless of whether the busy
+# guard downstream actually acted on it. When the busy guard deferred
+# (agent busy → `continue`), the message was already gone: "deferred to
+# next cycle" was a lie, there was no next cycle (gunshi RCA
+# gunshi_rca_ashigaru1_baton_drop_fix2, L2). Committing read:true is now
+# the caller's job via mark_special_read(), called only after the special
+# is actually handed to send_cli_command and it reports success.
 get_unread_info() {
     (
         # acquire_inbox_lock also takes flock when available.
@@ -601,11 +612,55 @@ try:
     special_types = ("clear_command", "model_switch", "cli_restart")
     specials = [m for m in unread if m.get("type") in special_types]
 
-    if specials:
-        for m in messages:
-            if not m.get("read", False) and m.get("type") in special_types:
-                m["read"] = True
+    normal_count = len(unread) - len(specials)
+    normal_msgs = [m for m in unread if m.get("type") not in special_types]
+    has_task_assigned = any(m.get("type") == "task_assigned" for m in normal_msgs)
+    payload = {
+        "count": normal_count,
+        "has_task_assigned": has_task_assigned,
+        "specials": [
+            {"type": m.get("type", ""), "content": m.get("content", ""), "id": m.get("id", "")}
+            for m in specials
+        ],
+    }
+    print(json.dumps(payload))
+except Exception:
+    print(json.dumps({"count": 0, "specials": []}))
+PY
+    ) 200>"$LOCKFILE" 2>/dev/null
+}
 
+# ─── Commit a special message as read (cmd_220 F-A) ───
+# Call ONLY after the special identified by msg_id was actually handed to
+# send_cli_command and it reported success. Never call this from the busy
+# guard's defer/continue path — that is precisely the case that must leave
+# the message unread so the next cycle sees it again.
+mark_special_read() {
+    local msg_id="$1"
+    [ -n "$msg_id" ] || return 0
+    (
+        if ! acquire_inbox_lock; then
+            exit 0
+        fi
+        trap release_inbox_lock EXIT
+        INBOX_PATH="$INBOX" MSG_ID="$msg_id" "$SCRIPT_DIR/.venv/bin/python3" - << 'PY'
+import os
+import yaml
+
+inbox = os.environ.get("INBOX_PATH", "")
+target_id = os.environ.get("MSG_ID", "")
+try:
+    with open(inbox, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    messages = data.get("messages", []) or []
+    changed = False
+    for m in messages:
+        if m.get("id") == target_id and not m.get("read", False):
+            m["read"] = True
+            changed = True
+
+    if changed:
         tmp_path = f"{inbox}.tmp.{os.getpid()}"
         with open(tmp_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(
@@ -616,18 +671,8 @@ try:
                 sort_keys=False,
             )
         os.replace(tmp_path, inbox)
-
-    normal_count = len(unread) - len(specials)
-    normal_msgs = [m for m in unread if m.get("type") not in special_types]
-    has_task_assigned = any(m.get("type") == "task_assigned" for m in normal_msgs)
-    payload = {
-        "count": normal_count,
-        "has_task_assigned": has_task_assigned,
-        "specials": [{"type": m.get("type", ""), "content": m.get("content", "")} for m in specials],
-    }
-    print(json.dumps(payload))
 except Exception:
-    print(json.dumps({"count": 0, "specials": []}))
+    pass
 PY
     ) 200>"$LOCKFILE" 2>/dev/null
 }
@@ -640,6 +685,13 @@ PY
 # 実行時にtmux paneの @agent_cli を再確認し、ドリフト時はpane値を優先する。
 send_cli_command() {
     local cmd="$1"
+    # cmd_220 subtask2 (QC-1/QC-2): global flag, not the return value, tells
+    # the caller "this was deferred, not a final disposition". Two callers
+    # (line ~1599 stall recovery, ~1925 context reset) invoke this function
+    # bare, outside any `if`; a non-zero return there would be killed by
+    # set -euo pipefail (see the "Never return 1" comment below). So every
+    # transient-suppress path below sets SEND_DEFERRED=1 and still returns 0.
+    SEND_DEFERRED=0
     # cmd_171/C1-3: attempt_stall_recovery() passes force_busy=1. A stall is
     # BY DEFINITION busy (is_stalled_pane requires agent_is_busy() true), so
     # the ordinary busy-guard below would silently swallow /clear every time
@@ -657,6 +709,10 @@ send_cli_command() {
     # idle-flag design already fears (spinner flicker → permanent stall).
     if pane_has_open_modal "$PANE_TARGET"; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing CLI command ($cmd)" >&2
+        # cmd_220 subtask2 QC-1: this is a transient state, not a final
+        # disposition — the modal will eventually close on its own. Tell the
+        # caller via SEND_DEFERRED so it does NOT mark the message read.
+        SEND_DEFERRED=1
         return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
 
@@ -674,9 +730,15 @@ send_cli_command() {
 
     # Safety: never inject CLI commands into the shogun pane.
     # Shogun is controlled by the Lord; keystroke injection can clobber human input.
+    # cmd_220 F-A: returns 0 (not 1) — this is a final, intentional decision to
+    # never send, same status as an actual send from the caller's point of
+    # view. The busy-guard loop calls mark_special_read() only when this
+    # function returns truthy; returning 1 here would leave a shogun-directed
+    # special permanently unread (retried and re-suppressed every cycle
+    # forever) instead of the pre-cmd_220 behavior of being handled once.
     if [ "$AGENT_ID" = "shogun" ]; then
         echo "[$(date)] [SKIP] shogun: suppressing CLI command injection ($cmd)" >&2
-        return 1
+        return 0
     fi
 
     # Busy guard: never send /clear when agent is actively processing.
@@ -690,6 +752,11 @@ send_cli_command() {
     fi
     if [[ "$cmd" == "/clear" ]] && [ "$force_busy" -ne 1 ] && ! [[ "$effective_cli" == "opencode" && -z "${pane_snapshot//[[:space:]]/}" ]] && agent_is_busy; then
         echo "[$(date)] [SKIP] Agent is busy — /clear deferred to next cycle (agent=$AGENT_ID)" >&2
+        # cmd_220 subtask2 QC-2: same as the modal gate above — transient,
+        # not final. Normally the outer busy guard (~line 1738) catches this
+        # first, but a race window (agent_is_busy flips between the two
+        # checks) can reach here directly.
+        SEND_DEFERRED=1
         return 0
     fi
 
@@ -1661,29 +1728,75 @@ data = json.load(sys.stdin)
 for s in data.get('specials', []):
     t = s.get('type', '')
     c = (s.get('content', '') or '').replace('\t', ' ').replace('\n', ' ').strip()
-    print(f'{t}\t{c}')
+    i = s.get('id', '') or ''
+    print(f'{t}\t{i}\t{c}')
 " 2>/dev/null)
 
     local clear_seen=0
     local clear_sent=0  # tracks if /clear was actually sent (not just seen)
+    local special_deferred=0  # cmd_220 F-D: a clear_command was seen but busy-deferred
     if [ -n "$specials" ]; then
-        local msg_type msg_content cmd
-        while IFS=$'\t' read -r msg_type msg_content; do
+        local msg_type msg_id msg_content cmd
+        while IFS=$'\t' read -r msg_type msg_id msg_content; do
             [ -n "$msg_type" ] || continue
             if [ "$msg_type" = "clear_command" ]; then
                 clear_seen=1
                 # Busy guard: skip /clear if agent is currently processing.
                 # Sending /clear during active work destroys in-progress context.
+                # cmd_220 F-A/F-D: do NOT mark this message read on this path —
+                # it must still be unread on the next cycle, or "deferred to
+                # next cycle" is a lie (gunshi RCA L2). F-D: arm
+                # FIRST_UNREAD_SEEN here too, so a busy episode made of pure
+                # specials (normal_count stays 0) can still reach the 300s
+                # stale-busy safety net below instead of being invisible to it
+                # (RCA L4 — the net used to live entirely inside the
+                # normal_count>0 branch).
                 if agent_is_busy && [[ "$AGENT_ID" != "shogun" ]]; then
                     echo "[$(date)] [SKIP] Agent $AGENT_ID is busy — /clear (clear_command) deferred to next cycle" >&2
+                    if [ "${FIRST_UNREAD_SEEN:-0}" -eq 0 ]; then
+                        FIRST_UNREAD_SEEN=$(date +%s)
+                    fi
+                    special_deferred=1
                     continue
                 fi
             fi
             cmd=$(normalize_special_command "$msg_type" "$msg_content")
             if [ -n "$cmd" ]; then
                 if send_cli_command "$cmd"; then
-                    [ "$msg_type" = "clear_command" ] && clear_sent=1
+                    # cmd_220: send_cli_command now returns 0 (not 1) for the
+                    # shogun-suppression case too (see its comment), so guard
+                    # AGENT_ID here explicitly — otherwise a shogun-directed
+                    # clear_command that was actually suppressed would still
+                    # set clear_sent=1 and wrongly trigger the auto-recovery
+                    # task_assigned injection below (T-SHOGUN-005).
+                    # cmd_220 subtask2 QC-1: also guard on SEND_DEFERRED — a
+                    # modal/busy-suppressed send must not be counted as sent.
+                    if [ "$msg_type" = "clear_command" ] && [ "$AGENT_ID" != "shogun" ] && [ "${SEND_DEFERRED:-0}" -eq 0 ]; then
+                        clear_sent=1
+                    fi
                 fi
+                # cmd_220 F-A / subtask2 QC-1/QC-3: mark read once handed to
+                # send_cli_command UNLESS it reports a transient suppression
+                # (SEND_DEFERRED=1 — modal open, or the inner busy-guard race
+                # window). NOT every return path here is a final disposition:
+                # the modal gate (:703) and inner busy guard (:742) are both
+                # "try again later", same as the busy-guard `continue` above.
+                # Treat a deferred special exactly like that continue path —
+                # leave it unread and arm the F-D stale-busy safety net.
+                if [ "${SEND_DEFERRED:-0}" -eq 0 ]; then
+                    mark_special_read "$msg_id"
+                else
+                    special_deferred=1
+                    if [ "${FIRST_UNREAD_SEEN:-0}" -eq 0 ]; then
+                        FIRST_UNREAD_SEEN=$(date +%s)
+                    fi
+                fi
+            else
+                # normalize_special_command rejected the payload (e.g.
+                # malformed model_switch) — it can't become valid by
+                # retrying, so mark it read instead of re-logging the same
+                # [SKIP] every cycle forever.
+                mark_special_read "$msg_id"
             fi
         done <<< "$specials"
     fi
@@ -1848,6 +1961,38 @@ for s in data.get('specials', []):
                 send_wakeup_with_escape "$normal_count"
             fi
         fi
+    elif [ "${special_deferred:-0}" -eq 1 ]; then
+        # cmd_220 F-D: normal_count is 0 (a deferred clear_command doesn't
+        # count as a normal message), so the branch above — and the 300s
+        # stale-busy safety net inside it — is unreachable for pure-special
+        # traffic (gunshi RCA gunshi_rca_ashigaru1_baton_drop_fix2, L4: the
+        # net and its ntfy lived entirely inside normal_count>0). Mirror just
+        # the net here, gated on FIRST_UNREAD_SEEN (armed above at the defer
+        # point) instead of normal_count, so a deferred special is not
+        # stranded behind a permanently-busy agent forever. Deliberately do
+        # NOT fall into the normal-message nudge/escalation ladder below —
+        # there is no normal message to nudge about, and do NOT reset
+        # FIRST_UNREAD_SEEN here — the message is still genuinely unread.
+        if agent_is_busy && [[ "$AGENT_ID" != "shogun" ]]; then
+            local special_now
+            special_now=$(date +%s)
+            local stale_busy_limit=300  # 5 minutes — same bound as the normal-message net above
+            if [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ] && [ "$((special_now - FIRST_UNREAD_SEEN))" -ge "$stale_busy_limit" ]; then
+                local special_busy_cli
+                special_busy_cli=$(get_effective_cli_type)
+                if [[ "$special_busy_cli" == "claude" ]]; then
+                    echo "[$(date)] WARNING: $AGENT_ID busy for $((special_now - FIRST_UNREAD_SEEN))s with a deferred special pending — forcing idle flag (stale busy recovery; hook不発の疑い)" >&2
+                    if [ "${STALE_BUSY_NTFY_SENT:-0}" -eq 0 ]; then
+                        type branch_policy_notify &>/dev/null && branch_policy_notify "${AGENT_ID}: ${stale_busy_limit}秒busy継続のため強制idle化(hook不発の疑い、延期中特殊型あり)" 2>/dev/null || true
+                        STALE_BUSY_NTFY_SENT=1
+                    fi
+                else
+                    echo "[$(date)] WARNING: $AGENT_ID busy for $((special_now - FIRST_UNREAD_SEEN))s with a deferred special pending — forcing idle flag (stale busy recovery)" >&2
+                fi
+                touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}"
+            fi
+        fi
+        return 0
     else
         # No unread messages — reset escalation tracker
         if [ "$FIRST_UNREAD_SEEN" -ne 0 ]; then

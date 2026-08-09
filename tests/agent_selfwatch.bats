@@ -111,27 +111,68 @@ YAML
     run bash -c "source '$TEST_HARNESS'; get_unread_info"
     [ "$status" -eq 0 ]
 
+    # cmd_220 F-A: get_unread_info() is a pure peek now — it routes messages
+    # into count/specials but must NOT mutate read state itself (that was
+    # the bug: a busy-deferred special was consumed on sight, before the
+    # caller decided whether to act on it). Committing read:true is
+    # mark_special_read()'s job, exercised separately below.
     "$VENV_PYTHON" - << 'PY' "$output" "$TEST_INBOX"
 import json, sys, yaml
 payload = json.loads(sys.argv[1])
 inbox_path = sys.argv[2]
 assert payload["count"] == 1, payload
 assert len(payload["specials"]) == 2, payload
+special_ids = {s["id"] for s in payload["specials"]}
+assert special_ids == {"msg_clear", "msg_model"}, payload
 
 with open(inbox_path) as f:
     data = yaml.safe_load(f)
 by_id = {m["id"]: m for m in data["messages"]}
 assert by_id["msg_task"]["read"] is False
-assert by_id["msg_clear"]["read"] is True
-assert by_id["msg_model"]["read"] is True
+assert by_id["msg_clear"]["read"] is False
+assert by_id["msg_model"]["read"] is False
 print("OK")
 PY
 }
 
 @test "TC-FR-004 [RED]: read-update path uses lock/atomic protections" {
-    body="$(awk '/get_unread_info\\(\\)/,/^}/' "$WATCHER_SCRIPT")"
+    # cmd_220 F-A: the read-update path is mark_special_read() now —
+    # get_unread_info() is a pure peek and no longer writes at all (see
+    # TC-FR-003 above and TC-FR-004c below).
+    body="$(awk '/mark_special_read\(\)/,/^}/' "$WATCHER_SCRIPT")"
     echo "$body" | grep -q "flock"
     echo "$body" | grep -q "os.replace"
+}
+
+@test "TC-FR-004c: mark_special_read commits read:true only for the given id, atomically" {
+    cat > "$TEST_INBOX" << 'YAML'
+messages:
+  - id: msg_clear
+    from: karo
+    timestamp: "2026-02-09T21:00:01"
+    type: clear_command
+    content: /clear
+    read: false
+  - id: msg_model
+    from: karo
+    timestamp: "2026-02-09T21:00:02"
+    type: model_switch
+    content: /model opus
+    read: false
+YAML
+
+    run bash -c "source '$TEST_HARNESS'; mark_special_read msg_clear"
+    [ "$status" -eq 0 ]
+
+    "$VENV_PYTHON" - << 'PY' "$TEST_INBOX"
+import sys, yaml
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f)
+by_id = {m["id"]: m for m in data["messages"]}
+assert by_id["msg_clear"]["read"] is True
+assert by_id["msg_model"]["read"] is False
+print("OK")
+PY
 }
 
 @test "TC-FR-004b: get_unread_info does not update when lock is unavailable" {
@@ -232,6 +273,46 @@ PY
     # 確かめたいのは「実体(lib/usage_limit.sh)から解決されたか」そのもの
     # であり、実装の字面（行数・echo文言）ではない。
     [[ "$output" == *"lib/usage_limit.sh"* ]] || { echo "$output"; false; }
+}
+
+@test "TC-FR-015 (QC-1 regression guard): a special message seen while the pane has an open modal is NOT marked read, and no send-keys fires" {
+    # cmd_220 subtask2: before the SEND_DEFERRED fix, send_cli_command's
+    # modal gate (:pane_has_open_modal) returned 0 (success) even though it
+    # sent nothing, so the caller unconditionally called mark_special_read()
+    # and the clear_command vanished — exactly the bug this whole cmd exists
+    # to close, just via a different gate than the busy-guard one (QC-1).
+    cat > "$TEST_INBOX" << 'YAML'
+messages:
+  - id: msg_modal_clear
+    from: karo
+    timestamp: "2026-02-09T21:00:00"
+    type: clear_command
+    content: /clear
+    read: false
+YAML
+
+    # Modal footer anchor (see lib/agent_status.sh pane_has_open_modal):
+    # capture-pane's mocked output ends with a recognized modal footer line.
+    export MOCK_CAPTURE_PANE=$'Do you want to proceed?\nEnter to select · Esc to cancel'
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        agent_turn_state() { echo idle; }  # pane is idle — only the modal gate should suppress
+        process_unread manual
+    "
+    [ "$status" -eq 0 ]
+
+    # No CLI command was ever sent to the pane.
+    ! grep -q "send-keys.*Enter" "$MOCK_LOG" || { cat "$MOCK_LOG"; false; }
+
+    "$VENV_PYTHON" - << 'PY' "$TEST_INBOX"
+import sys, yaml
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f)
+by_id = {m["id"]: m for m in data["messages"]}
+assert by_id["msg_modal_clear"]["read"] is False, by_id
+print("OK")
+PY
 }
 
 @test "TC-NFR-008: test file itself has no skip directives (SKIP=0 guard)" {
