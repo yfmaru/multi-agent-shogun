@@ -1119,6 +1119,16 @@ Ashigaru may perform mechanical reproduction or data gathering, but not quality 
 
   違反を検出したら即 dashboard.md の 🚨要対応 へ記載し、将軍へ上申する。
 
+- **マージ直後に作業場を畳む（cmd_222）**: `gh pr merge` を打った同じ手で
+  `bash scripts/workspace_fold.sh <worktree_path>`（既定dry-run、`--yes`で実行）を
+  打つ。畳んでよくなるのは「PRがマージされた時」であり「タスクが終わった時」
+  ではないため、この一手を別の時刻・別の担当へ渡さぬこと。作業場のパスは
+  `task_complete.sh`の引き継ぎ文（足軽が記載）から拾う。7条の安全検査の詳細は
+  `CONTRIBUTING.md`「エージェント運用のブランチ・PR規約」内「作業場
+  （worktree）の一生」節を正とする。取りこぼしは`bash scripts/workspace_fold.sh --sweep`
+  （週次または番犬）で拾うが、これは「マージ直後に畳む一手」（上記）の
+  代替ではなく安全網である。
+
 ### PR作成タスクの標準文言 (CI-GATE-1)
 
 PR作成を伴うタスクYAMLには、以下の趣旨を必ず含めること:

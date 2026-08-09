@@ -121,6 +121,7 @@ scripts/seo_qc.sh
 !scripts/queue_integrity_snapshot.sh
 !scripts/queue_integrity_post_check.sh
 !scripts/prune_snapshots.sh
+!scripts/workspace_fold.sh
 
 # SayTask (sample template only, not actual data)
 !saytask/
