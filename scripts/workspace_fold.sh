@@ -489,8 +489,15 @@ list_stray_panes() {
 # Uses the same capture-then-awk pattern as fold_worktree()/run_sweep()
 # to avoid the SIGPIPE race documented there.
 stray_blocks_worktree() {
-    local cwd="$1" wt_list first=1 wt
+    local cwd="$1" wt_list first=1 wt canon_cwd
     command -v git >/dev/null 2>&1 || return 1
+    # Canonicalize both sides before comparing. A real tmux pane_current_path
+    # is already symlink-resolved, so this is normally a no-op — but on
+    # hosts where the tmp/worktree root itself is a symlink (e.g. macOS's
+    # /tmp -> /private/tmp), comparing a raw path against `resolve_path`'s
+    # canonical worktree form would false-negative.
+    canon_cwd="$(resolve_path "$cwd")"
+    [[ -z "$canon_cwd" ]] && canon_cwd="$cwd"
     wt_list="$(git worktree list --porcelain 2>/dev/null)" || return 1
     [[ -z "$wt_list" ]] && return 1
     while IFS= read -r wt; do
@@ -500,7 +507,7 @@ stray_blocks_worktree() {
             continue
         fi
         wt="$(resolve_path "$wt")"
-        if [[ "$cwd" == "$wt" || "$cwd" == "$wt"/* ]]; then
+        if [[ "$canon_cwd" == "$wt" || "$canon_cwd" == "$wt"/* ]]; then
             printf '%s\n' "$wt"
             return 0
         fi

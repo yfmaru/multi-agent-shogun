@@ -422,7 +422,12 @@ STUB
         TMUX_STUB_PANES="scratch_a3_225_x $path"$'\n'"scratch_a3_225_y $TEST_MAIN" \
         bash "$FOLD" --strays
     [ "$status" -eq 0 ]
-    [[ "$output" == *"PANE_CWD: $path [BLOCKS C5 of workspace: $path]"* ]] || { echo "$output"; false; }
+    # Match loosely on the workspace path inside [BLOCKS ...], not exactly
+    # $path: the script canonicalizes it (resolve_path), and on hosts where
+    # the tmp root itself is a symlink (macOS /tmp -> /private/tmp) the
+    # canonical form legitimately differs from bats' raw $TEST_TMPDIR-based
+    # $path even though both name the same directory.
+    [[ "$output" == *"PANE_CWD: $path"*"[BLOCKS C5 of workspace:"* ]] || { echo "$output"; false; }
     [[ "$output" == *"PANE_CWD: $TEST_MAIN"* ]] || { echo "$output"; false; }
     [[ "$output" != *"PANE_CWD: $TEST_MAIN [BLOCKS"* ]] || { echo "$output"; false; }
 }
