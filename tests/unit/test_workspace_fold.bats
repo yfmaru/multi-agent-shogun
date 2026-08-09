@@ -371,6 +371,127 @@ STUB
     [[ "$output" == *"SWEEP SUMMARY"* ]] || { echo "$output"; false; }
 }
 
+# Installs a minimal `tmux` stub at the front of PATH for the --strays
+# tests. Real tmux sessions are never created for these tests (Test Rules
+# 5 forbids creating anything that can't self-terminate, and a real tmux
+# session inside a bats run would itself be exactly the kind of stray this
+# feature exists to catch) — the stub answers `list-sessions`/`list-panes`
+# from TMUX_STUB_SESSIONS/TMUX_STUB_PANES env vars instead of a live server.
+mk_tmux_stub_path() {
+    mkdir -p "$TEST_TMPDIR/tmux_stub_bin"
+    cat > "$TEST_TMPDIR/tmux_stub_bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+    list-sessions) printf '%s\n' "$TMUX_STUB_SESSIONS" ;;
+    list-panes)    printf '%s\n' "$TMUX_STUB_PANES" ;;
+    *) exit 1 ;;
+esac
+STUB
+    chmod +x "$TEST_TMPDIR/tmux_stub_bin/tmux"
+    printf '%s:%s' "$TEST_TMPDIR/tmux_stub_bin" "$PATH"
+}
+
+@test "--strays never lists multiagent/shogun even when tmux reports them (exclusion, not inclusion)" {
+    stub_path="$(mk_tmux_stub_path)"
+    run env PATH="$stub_path" \
+        TMUX_STUB_SESSIONS=$'multiagent 1700000000\nshogun 1700000000\nscratch_g_225_a 1700000000' \
+        TMUX_STUB_PANES=$'multiagent /some/prod/path\nshogun /some/prod/path\nscratch_g_225_a /some/scratch/path' \
+        bash "$FOLD" --strays
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"STRAY_SESSION: multiagent"* ]] || { echo "$output"; false; }
+    [[ "$output" != *"STRAY_SESSION: shogun"* ]] || { echo "$output"; false; }
+    [[ "$output" != *"kill-session -t multiagent"* ]] || { echo "$output"; false; }
+    [[ "$output" != *"kill-session -t shogun"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"STRAY_SESSION: scratch_g_225_a"* ]] || { echo "$output"; false; }
+}
+
+@test "--strays refuses --yes outright (D006 guard: folding a tmux session is never an agent's to do)" {
+    run bash "$FOLD" --strays --yes
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"REFUSED"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"--strays"* ]] || { echo "$output"; false; }
+}
+
+@test "--strays flags a pane cwd inside a registered workspace as blocking its C5, and excludes a pane cwd in the main worktree" {
+    path="$(mk_clean_worktree strays_c5)"
+    stub_path="$(mk_tmux_stub_path)"
+
+    cd "$TEST_MAIN"
+    run env PATH="$stub_path" \
+        TMUX_STUB_SESSIONS=$'scratch_a3_225_x 1700000000\nscratch_a3_225_y 1700000000' \
+        TMUX_STUB_PANES="scratch_a3_225_x $path"$'\n'"scratch_a3_225_y $TEST_MAIN" \
+        bash "$FOLD" --strays
+    [ "$status" -eq 0 ]
+    # Match loosely on the workspace path inside [BLOCKS ...], not exactly
+    # $path: the script canonicalizes it (resolve_path), and on hosts where
+    # the tmp root itself is a symlink (macOS /tmp -> /private/tmp) the
+    # canonical form legitimately differs from bats' raw $TEST_TMPDIR-based
+    # $path even though both name the same directory.
+    [[ "$output" == *"PANE_CWD: $path"*"[BLOCKS C5 of workspace:"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"PANE_CWD: $TEST_MAIN"* ]] || { echo "$output"; false; }
+    [[ "$output" != *"PANE_CWD: $TEST_MAIN [BLOCKS"* ]] || { echo "$output"; false; }
+}
+
+@test "--strays flags a non-scratch_* session name as a naming violation" {
+    stub_path="$(mk_tmux_stub_path)"
+    run env PATH="$stub_path" \
+        TMUX_STUB_SESSIONS='diag_e2e2 1700000000' \
+        TMUX_STUB_PANES='diag_e2e2 /tmp/somewhere' \
+        bash "$FOLD" --strays
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"STRAY_SESSION: diag_e2e2"*"NAMING-VIOLATION"* ]] || { echo "$output"; false; }
+}
+
+@test "--strays returns quietly (no error) when tmux is not installed" {
+    # Shadows tmux's directory with a copy that symlinks everything EXCEPT
+    # tmux, rather than dropping the directory from PATH outright: on this
+    # host /bin is a symlink to /usr/bin (merged-usr) and also holds bash,
+    # git, awk, date, etc., so a blunt removal of that PATH entry breaks
+    # the very tools the script (and `env`'s own re-exec of `bash`) needs,
+    # and a plain string exclusion of "/usr/bin" would leave tmux reachable
+    # via the "/bin" entry regardless. Replacing both entries with the same
+    # tmux-free shadow directory removes only tmux, everywhere it would
+    # otherwise be found.
+    local tmux_bin real_dir shadow_dir f dir filtered_path
+    tmux_bin="$(command -v tmux || true)"
+    if [[ -n "$tmux_bin" ]]; then
+        real_dir="$(cd "$(dirname "$tmux_bin")" && pwd -P)"
+        shadow_dir="$TEST_TMPDIR/no_tmux_bin"
+        mkdir -p "$shadow_dir"
+        for f in "$real_dir"/*; do
+            [[ "$(basename "$f")" == "tmux" ]] && continue
+            ln -sf "$f" "$shadow_dir/$(basename "$f")"
+        done
+        filtered_path=""
+        while IFS= read -r dir; do
+            [[ -z "$dir" ]] && continue
+            if [[ -d "$dir" ]] && [[ "$(cd "$dir" 2>/dev/null && pwd -P)" == "$real_dir" ]]; then
+                filtered_path="$filtered_path:$shadow_dir"
+            else
+                filtered_path="$filtered_path:$dir"
+            fi
+        done < <(printf '%s' "$PATH" | tr ':' '\n')
+        filtered_path="${filtered_path#:}"
+    else
+        filtered_path="$PATH"
+    fi
+    run env PATH="$filtered_path" bash "$FOLD" --strays
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"STRAY_SESSION"* ]] || { echo "$output"; false; }
+}
+
+@test "--sweep prints the strays section at the end even with nothing to fold" {
+    stub_path="$(mk_tmux_stub_path)"
+    cd "$TEST_MAIN"
+    run env PATH="$stub_path" \
+        TMUX_STUB_SESSIONS='scratch_a3_225_z 1700000000' \
+        TMUX_STUB_PANES="scratch_a3_225_z $TEST_MAIN" \
+        bash "$FOLD" --sweep
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SWEEP SUMMARY"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"STRAY_SESSION: scratch_a3_225_z"* ]] || { echo "$output"; false; }
+}
+
 @test "--sweep folds every eligible worktree and blocks the rest, main worktree untouched" {
     ok_path="$(mk_clean_worktree sweep_ok)"
     git -C "$TEST_MAIN" merge -q --ff-only "feat/sweep_ok"
