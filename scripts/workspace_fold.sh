@@ -16,6 +16,7 @@ usage() {
 Usage:
   workspace_fold.sh <worktree_path> [--yes] [--base BRANCH]
   workspace_fold.sh --sweep [--yes] [--base BRANCH]
+  workspace_fold.sh --strays
 
 Checks a git worktree against 7 safety conditions (C1-C7) before folding
 it with `git worktree remove`. Default is dry-run: conditions are
@@ -23,6 +24,12 @@ reported but nothing is removed. Pass --yes to actually fold.
 
 --sweep      Check every worktree registered under this repo (except the
              main worktree) instead of a single path.
+--strays     Read-only inventory of non-production tmux sessions (per
+             CLAUDE.md Test Rules 5). Never removes anything and refuses
+             --yes outright — folding a tmux session is not something an
+             agent can do (D006 forbids `tmux kill-session`); this only
+             reports what exists, so the lord can decide. Also printed
+             automatically at the end of --sweep.
 --base       Base branch to check "landed" status against (default: develop).
              Assumes origin/<base> is up to date locally; this script does
              not fetch on your behalf.
@@ -34,6 +41,8 @@ Exit status:
                  a blocked in-progress workspace is the normal steady
                  state for a sweep. Read the SWEEP SUMMARY line for
                  foldable/folded/blocked counts.
+  --strays:      0 on a normal report (including "nothing found" and "no
+                 tmux on this host"); 2 if --yes was also passed.
 EOF
 }
 
@@ -45,6 +54,7 @@ BASE_BRANCH="$DEFAULT_BASE_BRANCH"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sweep) MODE="sweep"; shift ;;
+        --strays) MODE="strays"; shift ;;
         --yes) DO_YES=1; shift ;;
         --base)
             if [[ $# -lt 2 ]]; then
@@ -63,6 +73,15 @@ done
 
 if [[ -z "$MODE" ]]; then
     usage >&2
+    exit 2
+fi
+
+# --strays is read-only by design (CLAUDE.md Test Rules 5): folding a tmux
+# session means `tmux kill-session`, which D006 forbids an agent from ever
+# running. Accepting --yes here would be an open door to that violation,
+# so it is refused outright rather than silently ignored.
+if [[ "$MODE" == "strays" && "$DO_YES" -eq 1 ]]; then
+    echo "REFUSED: --strays is read-only and does not accept --yes (D006: an agent may never run tmux kill-session)." >&2
     exit 2
 fi
 
@@ -400,10 +419,147 @@ run_sweep() {
 
     git -C "$main_repo" worktree prune
     echo "SWEEP SUMMARY: foldable/folded=$folded blocked=$blocked"
+    print_strays_report
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# --strays (cmd_225): read-only tmux-session inventory. Never folds anything.
+#
+# The naming convention `scratch_<agent>_<cmd>_<label>` (CLAUDE.md Test
+# Rules 5) exists so this can tell production sessions apart from ones an
+# agent spun up for verification. But per the design's pre_mortem, listing
+# is done by EXCLUSION (everything except the two production names), never
+# by INCLUSION (only names matching scratch_*) — an inclusion list would
+# let a misnamed stray slip through the exact same way the underlying bug
+# class does: something not on the list goes unnoticed. Misnamed sessions
+# are instead surfaced as their own [NAMING-VIOLATION] category below.
+# ---------------------------------------------------------------------------
+STRAY_SESSION_PREFIX="scratch_"
+STRAY_PRODUCTION_SESSIONS=(multiagent shogun)
+STRAY_STALE_AGE_SECONDS=1800
+
+is_production_session() {
+    local name="$1" prod
+    for prod in "${STRAY_PRODUCTION_SESSIONS[@]}"; do
+        [[ "$name" == "$prod" ]] && return 0
+    done
+    return 1
+}
+
+# Lists "<name> <created_epoch>", one per line, for every tmux session
+# except the production ones. A host with no tmux (or no server running)
+# is a normal environment for this repo (CI, a fresh checkout) — never an
+# error, so this returns an empty list rather than failing.
+list_stray_sessions() {
+    command -v tmux >/dev/null 2>&1 || return 0
+    local line name created
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name="${line%% *}"
+        created="${line#* }"
+        is_production_session "$name" && continue
+        printf '%s %s\n' "$name" "$created"
+    done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null)
+    return 0
+}
+
+# Lists "<session_name> <pane_current_path>" for every pane of every
+# non-production session (a session can have several windows/panes, each
+# with its own cwd — this is why cmd220_probe's 4 windows all had to be
+# checked individually, not just the session's first pane).
+list_stray_panes() {
+    command -v tmux >/dev/null 2>&1 || return 0
+    local line name path
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name="${line%% *}"
+        path="${line#* }"
+        is_production_session "$name" && continue
+        printf '%s %s\n' "$name" "$path"
+    done < <(tmux list-panes -a -F '#{session_name} #{pane_current_path}' 2>/dev/null)
+    return 0
+}
+
+# Is $1 inside a registered *feature* worktree (i.e. would this pane's cwd
+# make C5 refuse that workspace's fold)? The main working tree is
+# deliberately excluded — it is never folded by this script, so a pane
+# sitting there (as the 2026-08-09 `livefire999` specimen did) blocks
+# nothing (design_6: "作業場を掴んではおらぬゆえ今は誰も阻んでいない").
+# Uses the same capture-then-awk pattern as fold_worktree()/run_sweep()
+# to avoid the SIGPIPE race documented there.
+stray_blocks_worktree() {
+    local cwd="$1" wt_list first=1 wt
+    command -v git >/dev/null 2>&1 || return 1
+    wt_list="$(git worktree list --porcelain 2>/dev/null)" || return 1
+    [[ -z "$wt_list" ]] && return 1
+    while IFS= read -r wt; do
+        [[ -z "$wt" ]] && continue
+        if [[ "$first" -eq 1 ]]; then
+            first=0
+            continue
+        fi
+        wt="$(resolve_path "$wt")"
+        if [[ "$cwd" == "$wt" || "$cwd" == "$wt"/* ]]; then
+            printf '%s\n' "$wt"
+            return 0
+        fi
+    done < <(printf '%s\n' "$wt_list" | awk '/^worktree /{print substr($0,10)}')
+    return 1
+}
+
+print_strays_report() {
+    command -v tmux >/dev/null 2>&1 || return 0
+
+    local sessions
+    sessions="$(list_stray_sessions)"
+    if [[ -z "$sessions" ]]; then
+        echo "STRAYS: no non-production tmux sessions found."
+        return 0
+    fi
+
+    echo "STRAYS: non-production tmux sessions (multiagent/shogun always excluded):"
+    local now line name created age note wt
+    now="$(date +%s)"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name="${line%% *}"
+        created="${line#* }"
+        age=$(( now - created ))
+        note=""
+        if [[ "$name" != ${STRAY_SESSION_PREFIX}* ]]; then
+            note=" [NAMING-VIOLATION: does not follow scratch_<agent>_<cmd>_<label>]"
+        elif [[ "$age" -gt "$STRAY_STALE_AGE_SECONDS" ]]; then
+            note=" [STALE: age ${age}s exceeds the ${STRAY_STALE_AGE_SECONDS}s Test Rules 5 default despite scratch_* naming]"
+        fi
+        echo "STRAY_SESSION: $name age=${age}s${note}"
+
+        while IFS= read -r pane_line; do
+            [[ -z "$pane_line" ]] && continue
+            [[ "${pane_line%% *}" == "$name" ]] || continue
+            local pane_cwd="${pane_line#* }" blocked=""
+            if wt="$(stray_blocks_worktree "$pane_cwd")"; then
+                blocked=" [BLOCKS C5 of workspace: $wt]"
+            fi
+            echo "  PANE_CWD: $pane_cwd$blocked"
+        done < <(list_stray_panes)
+    done <<< "$sessions"
+
+    echo "STRAYS: to remove, the lord's own hand only — D006 forbids an agent from running these:"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        echo "  tmux kill-session -t ${line%% *}"
+    done <<< "$sessions"
+    return 0
+}
+
+run_strays() {
+    print_strays_report
     return 0
 }
 
 case "$MODE" in
     single) run_single "$TARGET_PATH" ;;
     sweep) run_sweep ;;
+    strays) run_strays ;;
 esac
