@@ -131,6 +131,42 @@ assert_file_contains() {
     return 0
 }
 
+# ─── inbox_message_is_read / wait_for_inbox_read (cmd_220 F-A/F-D/F-E) ───
+# Is the inbox message with the given id marked read? Prints "true"/"false",
+# or "missing" if no message with that id exists. Used to confirm a special
+# (clear_command/model_switch/cli_restart) message's read state was actually
+# committed by mark_special_read(), not merely peeked by get_unread_info().
+inbox_message_is_read() {
+    local inbox_file="$1" msg_id="$2"
+    python3 -c "
+import yaml
+try:
+    with open('$inbox_file') as f:
+        data = yaml.safe_load(f) or {}
+    for m in data.get('messages', []) or []:
+        if m.get('id') == '$msg_id':
+            print('true' if m.get('read', False) else 'false')
+            raise SystemExit
+    print('missing')
+except SystemExit:
+    pass
+except Exception:
+    print('missing')
+" 2>/dev/null
+}
+
+wait_for_inbox_read() {
+    local inbox_file="$1" msg_id="$2" timeout="${3:-40}"
+    local elapsed=0
+    while [ "$elapsed" -lt "$timeout" ]; do
+        [ "$(inbox_message_is_read "$inbox_file" "$msg_id")" = "true" ] && return 0
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    echo "TIMEOUT: message $msg_id not marked read in $inbox_file after ${timeout}s" >&2
+    return 1
+}
+
 # ─── assert_inbox_message_exists ───
 # Check that an inbox has a message with the given type from the given sender.
 # Usage: assert_inbox_message_exists <inbox_file> <from> <type>

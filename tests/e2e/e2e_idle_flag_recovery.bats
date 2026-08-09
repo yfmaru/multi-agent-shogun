@@ -5,6 +5,8 @@
 # Validates:
 #   A) /clear processing restores idle flag (IDLE_FLAG_DIR)
 #   B) stale busy recovery can force idle flag creation
+#   C) stale busy recovery also fires for pure-special (clear_command-only)
+#      traffic, where normal_count never goes above 0 (cmd_220 F-D)
 # ═══════════════════════════════════════════════════════════════
 
 # bats file_tags=e2e
@@ -143,6 +145,79 @@ wait_for_log() {
     assert_success
 
     run wait_for_yaml_value "$E2E_QUEUE/queue/tasks/ashigaru1.yaml" "task.status" "done" 45
+    assert_success
+
+    stop_inbox_watcher "$watcher_pid"
+    rm -rf "$flag_dir"
+}
+
+# ═══ E2E-010-C: stale busy recovery for pure-special traffic (cmd_220 F-D) ═══
+# E2E-010-B seeds a stale FIRST_UNREAD_SEEN together with a task_assigned
+# message, so normal_count > 0 the whole time and the pre-existing safety net
+# (nested inside the normal_count>0 branch) was already reachable before
+# cmd_220. This test sends ONLY a clear_command — normal_count stays 0 for
+# the entire episode — which is exactly the gap the gunshi RCA
+# (gunshi_rca_ashigaru1_baton_drop_fix2, L4) found: the safety net and its
+# ntfy lived entirely inside normal_count>0, so a permanently-busy agent with
+# nothing but a deferred special pending could never reach it. Without F-D
+# (arming FIRST_UNREAD_SEEN at the defer point and mirroring the stale-busy
+# check for the specials-only path), this test's "forcing idle flag" log
+# never appears and the clear_command is stranded forever.
+
+@test "E2E-010-C: stale busy recovery forces idle flag for pure-special traffic" {
+    local ashigaru1_pane
+    ashigaru1_pane=$(pane_target 1)
+    local flag_dir log_file watcher_pid first_unread_seen
+
+    flag_dir="$(mktemp -d "/tmp/e2e_idle_flags_stale_special_XXXXXX")"
+    local ashigaru_idle_flag="$flag_dir/shogun_idle_ashigaru1"
+    first_unread_seen=$(( $(date +%s) - 420 ))
+
+    # Same busy印 seeding as E2E-010-B — see its comment for why this is
+    # required regardless of the "copilot" argument below (effective_cli
+    # follows the pane's live @agent_cli option, which setup_e2e_session
+    # defaults to "claude" for every pane).
+    touch "$flag_dir/shogun_busy_ashigaru1"
+
+    send_to_pane "$ashigaru1_pane" "busy_hold 12"
+    sleep 1
+
+    cp "$PROJECT_ROOT/tests/e2e/fixtures/task_ashigaru1_basic.yaml" \
+        "$E2E_QUEUE/queue/tasks/ashigaru1.yaml"
+
+    bash "$E2E_QUEUE/scripts/inbox_write.sh" "ashigaru1" \
+        "/clear" "clear_command" "karo"
+
+    local clear_msg_id
+    clear_msg_id=$(python3 -c "
+import yaml
+with open('$E2E_QUEUE/queue/inbox/ashigaru1.yaml') as f:
+    data = yaml.safe_load(f) or {}
+for m in data.get('messages', []) or []:
+    if m.get('type') == 'clear_command':
+        print(m.get('id', ''))
+" 2>/dev/null)
+    [ -n "$clear_msg_id" ]
+
+    log_file="/tmp/e2e_inbox_watcher_ashigaru1_stale_special_${BASHPID}.log"
+    watcher_pid=$(
+        IDLE_FLAG_DIR="$flag_dir" \
+        FIRST_UNREAD_SEEN="$first_unread_seen" \
+        bash "$E2E_QUEUE/scripts/inbox_watcher.sh" "ashigaru1" "$ashigaru1_pane" "copilot" \
+            > "$log_file" 2>&1 &
+        echo $!
+    )
+
+    run wait_for_log "$log_file" "forcing idle flag"
+    assert_success
+
+    run wait_for_file_within "$ashigaru_idle_flag" 10
+    assert_success
+
+    run wait_for_log "$log_file" "[SEND-KEYS] Sending CLI command to ashigaru1 (claude): /clear" 40
+    assert_success
+
+    run wait_for_inbox_read "$E2E_QUEUE/queue/inbox/ashigaru1.yaml" "$clear_msg_id" 30
     assert_success
 
     stop_inbox_watcher "$watcher_pid"
