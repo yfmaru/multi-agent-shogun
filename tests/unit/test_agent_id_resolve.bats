@@ -15,6 +15,11 @@
 #   T-A4: 系譜に pane_pid が一つも現れない場合、L2 が黙って失敗し
 #         L3（session_id対応表）へ落ち、最終的に解決できなければ失敗を返す
 #   T-A5: 系譜遡上に上限段数とループ検出があること（構造検査）
+#   T-A1-dynamic (cmd_217 QC是正 F-E): T-A1は $$ （呼び出し元シェル自身）
+#          がpane_pidに一致し1段目で当たって終わるため、/proc/<pid>/status
+#          を読んで親を辿る部分が一度も走らぬ。子シェルを2重に起こし
+#          （3つのpid: 孫→子→本体）、本体だけをpane_pidに置くことで
+#          実際の多段/proc遡上を走らせる
 #   T-SS-L3-1: session_start_hook.sh が stdin の session_id から対応表を書く
 #   T-SS-L3-2: session_start_hook.sh は stdin が空/不正JSONでも exit 0
 
@@ -154,6 +159,48 @@ teardown() {
         || { echo "expected a hop-count cap (10 rungs) in resolve_agent_id_l2"; false; }
     grep -qF 'seen[$pid]:-' "$LADDER_LIB" \
         || { echo "expected a seen[pid] loop guard in resolve_agent_id_l2"; false; }
+}
+
+# ─── T-A1-dynamic (cmd_217 QC是正 F-E): real multi-hop /proc ancestry
+#     walk, not the degenerate 1-hop case T-A1 exercises (mock list-panes
+#     returns $$ itself as pane_pid, so the /proc/<pid>/status read never
+#     runs). AGENT_ID_RESOLVE_L2_START_PID lets the start pid be a real
+#     grandchild — the walk must climb two real PPid hops to reach the
+#     pane_pid, exercising the /proc read gunshi flagged as untested. ───
+
+@test "T-A1-dynamic: resolve_agent_id_l2 climbs real multi-hop /proc ancestry (grandchild start_pid → parent → grandparent pane_pid)" {
+    local script="$IDLE_FLAG_DIR/l2_dynamic.sh"
+    cat > "$script" << SCRIPT
+unset TMUX_PANE
+outer_pid=\$\$
+tmux() {
+    if echo "\$*" | grep -q 'list-panes'; then
+        echo "\$outer_pid multihopagent"
+        return 0
+    fi
+    return 1
+}
+timeout() { shift; "\$@"; }
+export -f tmux timeout
+source '$LADDER_LIB'
+(
+    (
+        export AGENT_ID_RESOLVE_L2_START_PID=\$BASHPID
+        if [ "\$AGENT_ID_RESOLVE_L2_START_PID" = "\$outer_pid" ]; then
+            echo "SETUP_FAILED_SAME_PID"
+            exit 1
+        fi
+        resolve_agent_id_ladder ''
+        echo "AGENT=\$RESOLVED_AGENT_ID VIA=\$RESOLVED_VIA START=\$AGENT_ID_RESOLVE_L2_START_PID TARGET=\$outer_pid"
+    )
+)
+SCRIPT
+    run bash "$script"
+    [ "$status" -eq 0 ]
+    ! echo "$output" | grep -q "SETUP_FAILED_SAME_PID" \
+        || { echo "test setup bug: nested subshell BASHPID equals the top-level pid, no real hop exercised"; false; }
+    echo "$output" | grep -q "AGENT=multihopagent VIA=l2" \
+        || { echo "expected L2 to resolve via a real 2-hop /proc ancestry walk (start_pid != pane_pid); output: $output"; false; }
 }
 
 # ─── AC-I1/T-217-11-style: the hook script itself still honors exit 0

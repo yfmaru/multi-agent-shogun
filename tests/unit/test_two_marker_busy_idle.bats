@@ -13,7 +13,10 @@
 #   T-217-07: 未読ありで300秒busy継続「かつ」画面停止 → idle印がtouchされ配送再開＋警告1回（D-1）
 #   T-217-D1: 300秒busy継続だが画面が動き続けている → force-idleを撃たない（D-1の核心、N-3の再現防止）
 #   T-217-08: nudge3回でups印が一度も出ない → [HOOK-UNARMED]が一度だけ
-#   T-217-08b: ups印のmtimeがnudge間で前進すれば [HOOK-ARMED] が一度だけ（HOOK_ARMED_DEFERRED_EVAL）
+#   T-217-08b: ups印のmtimeがnudge間で前進すれば [HOOK-ARMED] が一度だけ（HOOK_ARMED_DEFERRED_EVAL）。
+#              cmd_217 QC是正F-B: 3回目のnudge（ups印を再度前進）は一度きり旗
+#              (HOOK_ARMED_LOGGED)そのものの検査である（2回目までではARMEDが
+#              出る唯一の機会にしかならず、旗が壊れていても区別できない）
 #   T-217-09: send_context_reset がbusy中に呼ばれる → 送出しない（かつ非0 return で defer とわかる）
 #   T-217-11: UserPromptSubmit hookがtmux不在で走る → exit 0（プロンプトを壊さない）
 #
@@ -281,7 +284,7 @@ YAML
     teardown_watcher_harness
 }
 
-@test "T-217-08b: ups印 mtime advancing between nudges logs HOOK-ARMED exactly once, no HOOK-UNARMED" {
+@test "T-217-08b: ups印 mtime advancing between nudges logs HOOK-ARMED exactly once, no HOOK-UNARMED (3rd nudge tests the one-shot flag itself)" {
     _build_watcher_harness
     # cmd_217 design_2 UPS_MARK_PROVENANCE: check_hook_armed() now looks at
     # ups印 (not busy印) and evaluates it one nudge late (HOOK_ARMED_
@@ -294,6 +297,17 @@ YAML
     # Keep the agent's CURRENT state idle (idle印 newer) so send_wakeup's
     # own busy gate doesn't itself suppress the nudge before
     # check_hook_armed runs.
+    #
+    # cmd_217 QC是正 F-B (gunshi_report.yaml required_fixes): a 2-nudge
+    # test can't distinguish "logged once" from "one-shot flag removed" —
+    # nudge #2 is the FIRST occasion ARMED can log at all, so there is no
+    # 3rd occasion for a broken HOOK_ARMED_LOGGED flag to double-fire.
+    # A 3rd nudge, with ups印 advanced again in between, is required to
+    # prove the one-shot flag itself suppresses a second [HOOK-ARMED]
+    # line — mirroring how T-217-08 (17 lines above) needed a 4th nudge
+    # for the same reason on the UNARMED side. Plain back-to-back `touch`
+    # calls would not do: within the same second mtime does not move, so
+    # `touch -d` is used to advance it explicitly (confirmed by gunshi).
     touch -d "@$(( $(date +%s) - 100 ))" "$IDLE_FLAG_DIR/shogun_ups_t217agent"
     touch "$IDLE_FLAG_DIR/shogun_idle_t217agent"
 
@@ -301,13 +315,15 @@ YAML
         source '$WATCHER_HARNESS'
         HOOK_ARMED_CHECK_N=3
         send_wakeup 1
-        touch '$IDLE_FLAG_DIR/shogun_ups_t217agent'
+        touch -d \"@\$(( \$(date +%s) + 5 ))\" '$IDLE_FLAG_DIR/shogun_ups_t217agent'
         send_wakeup 2
+        touch -d \"@\$(( \$(date +%s) + 10 ))\" '$IDLE_FLAG_DIR/shogun_ups_t217agent'
+        send_wakeup 3
     "
     [ "$status" -eq 0 ]
 
     [ "$(echo "$output" | grep -c 'HOOK-ARMED')" -eq 1 ] \
-        || { echo "expected exactly 1 [HOOK-ARMED] log line; output: $output"; false; }
+        || { echo "expected exactly 1 [HOOK-ARMED] log line across 3 nudges (one-shot flag); output: $output"; false; }
     ! echo "$output" | grep -q "HOOK-UNARMED"
 
     teardown_watcher_harness

@@ -11,8 +11,13 @@
 #
 #   AC-I4: /tmp/shogun_ups_<agent> を touch する者が
 #          user_prompt_submit_hook.sh ただ一つであることのリポジトリ全体grep
+#   T-B2/AC-I7 (cmd_217 QC是正 F-A): /clear由来のsession_start_hook busy印
+#          touchを何度繰り返してもups印が動かぬ限りHOOK-ARMEDを出さぬこと
+#          （将軍が名指しで「これを外すな」と仰せの検査）
 #   T-B5:  user_prompt_submit_hook.sh が busy印 と ups印 の両方を touch する
 #   T-B6:  hook 成功時にログ行が1行増える
+#   T-C1/T-C2 (cmd_217 QC是正 F-C): post_tool_use_hook.sh (D-2) が busy印を
+#          touchすること・TMUX_PANE不在でもexit 0すること
 #   T-D3:  force-idle の ntfy が複数サイクルにわたっても一度きりであること
 #   T-D4:  pane capture が空を返す場合、force-idle を撃たない側へ倒れる
 #   D-1(special_deferred枝): 延期中special型でも同じpane-hash-frozen AND
@@ -181,6 +186,87 @@ HARNESS
 
 teardown_watcher_harness() {
     rm -rf "$TEST_HOOK_TMP"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# T-B2/AC-I7 (cmd_217 QC是正 F-A, gunshi_report.yaml required_fixes):
+# session_start_hook busy印 touchが何度繰り返されようと、ups印が動かぬ
+# 限りHOOK-ARMEDを出してはならぬ。将軍が名指しで「これを外すな」と
+# 仰せの検査。M4（check_hook_armedがups印でなくbusy印を見る変異）を
+# 将軍のご懸念そのものの形で赤にする。
+# ═══════════════════════════════════════════════════════════════
+
+@test "T-B2/AC-I7: repeated session_start_hook busy印 touches never yield HOOK-ARMED while ups印 stays put" {
+    _build_watcher_harness
+    rm -f "$IDLE_FLAG_DIR/shogun_ups_t217agent"
+
+    # session_start_hook.sh を実際に走らせて busy印 を進める。
+    # 走らせるたび idle印 を後追いで touch し、send_wakeup 自身の
+    # busy ゲートで nudge が抑止されるのを防ぐ（抑止されると
+    # check_hook_armed が一度も走らず、変異を入れても ARMED が
+    # 出ないため、テストが無意味に緑になる）。
+    _fire_session_start() {
+        TMUX_PANE='test:0.0' IDLE_FLAG_DIR="$IDLE_FLAG_DIR" \
+            bash -c "
+                tmux() { echo 't217agent'; return 0; }
+                export -f tmux
+                bash '$PROJECT_ROOT/scripts/session_start_hook.sh' < /dev/null
+            " >/dev/null 2>&1 || true
+        sleep 1
+        touch "$IDLE_FLAG_DIR/shogun_idle_t217agent"
+    }
+
+    _fire_session_start
+    run bash -c "
+        source '$WATCHER_HARNESS'
+        HOOK_ARMED_CHECK_N=99
+        send_wakeup 1
+    "
+    [ "$status" -eq 0 ]
+
+    _fire_session_start
+    run bash -c "
+        source '$WATCHER_HARNESS'
+        HOOK_ARMED_CHECK_N=99
+        UPS_MTIME_PRE=0
+        HOOK_CHECK_PENDING=1
+        send_wakeup 2
+    "
+    [ "$status" -eq 0 ]
+    ! echo "$output" | grep -q 'HOOK-ARMED' \
+        || { echo "AC-I7 violation: busy印 movement alone produced [HOOK-ARMED]; output: $output"; false; }
+
+    [ ! -f "$IDLE_FLAG_DIR/shogun_ups_t217agent" ] \
+        || { echo "ups印 must not exist — session_start_hook must never touch it"; false; }
+
+    teardown_watcher_harness
+}
+
+# ═══════════════════════════════════════════════════════════════
+# T-C1/T-C2 (cmd_217 QC是正 F-C, gunshi_report.yaml recommended_fixes):
+# post_tool_use_hook.sh (D-2) はmatcher無しで全ツール呼び出しごとに
+# 走るゆえ、契約(busy印touch/exit 0)の検査が要る。ups印を触らぬことは
+# AC-I4が既に担保している。
+# ═══════════════════════════════════════════════════════════════
+
+@test "T-C1: post_tool_use_hook.sh touches busy印 when TMUX_PANE resolves an agent" {
+    run bash -c "
+        tmux() { echo 't217c1agent'; return 0; }
+        export -f tmux
+        export TMUX_PANE='test:0.0'
+        IDLE_FLAG_DIR='$IDLE_FLAG_DIR' bash '$POSTTOOL_HOOK' < /dev/null
+    "
+    [ "$status" -eq 0 ]
+    [ -f "$IDLE_FLAG_DIR/shogun_busy_t217c1agent" ] \
+        || { echo "expected busy印 to be touched"; false; }
+}
+
+@test "T-C2: post_tool_use_hook.sh exits 0 with no TMUX_PANE (does not break tool execution)" {
+    run bash -c "
+        unset TMUX_PANE
+        IDLE_FLAG_DIR='$IDLE_FLAG_DIR' bash '$POSTTOOL_HOOK' < /dev/null
+    "
+    [ "$status" -eq 0 ]
 }
 
 # ═══════════════════════════════════════════════════════════════

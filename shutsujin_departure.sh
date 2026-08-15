@@ -697,8 +697,11 @@ if [ "$SETUP_ONLY" = false ]; then
     # cmd_217: busy印/idle印の二枚とも消す。片方だけ消すと次回出陣時に
     # 全エージェントが恒久busy（またはその逆）で始まる — §7-4で最も
     # 静かに効く罠として名指しされた失敗筋。出陣し直しても直らない。
-    rm -f /tmp/shogun_idle_* /tmp/shogun_busy_*
-    echo "idle/busy flags cleared"
+    # cmd_217 QC是正F-D: ups印/session印も同様に消す。実害は
+    # /tmp/shogun_session_<uuid>が際限なく増える一点のみ（session_id は
+    # セッションごとに新しく、消す者が他にどこにも居らぬため）。
+    rm -f /tmp/shogun_idle_* /tmp/shogun_busy_* /tmp/shogun_ups_* /tmp/shogun_session_*
+    echo "idle/busy/ups/session flags cleared"
 
     log_war "👑 全軍にエージェントCLIを召喚中..."
 
