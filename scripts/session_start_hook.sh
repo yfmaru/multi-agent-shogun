@@ -29,6 +29,31 @@ if [ -z "$AGENT_ID" ]; then
     exit 0
 fi
 
+# ─── AGENT_ID_RESOLVE_LADDER L3 対応表 (cmd_217 design_1) ───
+# stdin JSON の session_id を読み、agent_id への対応表を書く。
+# user_prompt_submit_hook.sh の L3 がこの対応表を引く（08-10実測: L1が
+# SessionStartでは解決できたがUserPromptSubmitではできなかった回が
+# あった——「解決できた者が、できぬ者のために書き置く」構図）。
+# stdin は DATA として扱うのみで、中身を実行することは絶対にしない。
+# stdin が空・不正JSONでも必ず exit 0 契約を守る（timeoutで包む）。
+HOOK_SESSION_ID=""
+if [ ! -t 0 ]; then
+    _stdin_json=$(timeout 1 cat 2>/dev/null || true)
+    if [ -n "$_stdin_json" ] && command -v python3 &>/dev/null; then
+        HOOK_SESSION_ID=$(printf '%s' "$_stdin_json" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get("session_id", ""))
+except Exception:
+    print("")
+' 2>/dev/null || true)
+    fi
+fi
+if [ -n "$HOOK_SESSION_ID" ]; then
+    echo "$AGENT_ID" > "${IDLE_FLAG_DIR:-/tmp}/shogun_session_${HOOK_SESSION_ID}" 2>/dev/null || true
+fi
+
 LOG_DIR="$(dirname "$0")/../logs"
 mkdir -p "$LOG_DIR" || true
 echo "[$(date -Iseconds)] $AGENT_ID session_start_hook fired" \

@@ -254,6 +254,15 @@ STALL_HASH=${STALL_HASH:-}
 STALL_HASH_SINCE=${STALL_HASH_SINCE:-0}
 STALL_ACTED_AT=${STALL_ACTED_AT:-0}
 
+# ─── Stale-busy pane-hash state (cmd_217 D-1) ───
+# Separate state from STALL_HASH/STALL_HASH_SINCE above — the stale-busy
+# safety net (§ force-idle sites below) and is_stalled_pane() share only
+# the pane_hash_frozen_sec() mechanism, never the state itself, so their
+# thresholds (stale_busy_limit=300s vs stall_after_sec=480s default) never
+# mix (gunshi_report.yaml design_4: "閾値は混ぜるな").
+STALE_BUSY_HASH=${STALE_BUSY_HASH:-}
+STALE_BUSY_HASH_SINCE=${STALE_BUSY_HASH_SINCE:-0}
+
 # ─── Liveness/notify state (cmd_218) ───
 # STALL_ACTION_TAKEN: set by attempt_stall_recovery() the instant it actually
 # sends keys; consumed by the main loop to defer delivery one tick (SE-2).
@@ -301,35 +310,61 @@ estimated_tokens: $ESTIMATED_TOKENS_TOTAL
 EOF
 }
 
-# cmd_217 §2-3: 装填検査（自己申告する機構）。
-# watcherは「busy印が一度でも現れたか」を自ら数える。nudge送出
-# （＝ターンを起こしたはずの出来事）を N 回行ってもなお busy印が
-# 一度も現れなければ、UserPromptSubmit hook が未装填の可能性を
-# [HOOK-UNARMED] として一度だけログ＋通知する。逆に現れれば
-# [HOOK-ARMED] を一度だけログする。claude以外のCLIは busy印を
-# 使わぬため対象外。
+# cmd_217 §2-3 + design_2是正: 装填検査（自己申告する機構）。
+# UPS_MARK_PROVENANCE: check_hook_armed() は ups印
+# (/tmp/shogun_ups_<agent>, user_prompt_submit_hook.sh だけが touch する
+# 専用の証跡) のみを見る。busy印は3者共有の集約物であり、mtimeがどれだけ
+# 進んでも「何が動かしたか」を復元できない（session_start_hookが/clear
+# のたびに同じ印を touch するため）。ups印なら出所は一つしかなく、
+# 「mtime前進 = UserPromptSubmit hookが発火した」を意味論そのものに
+# できる。
+#
+# HOOK_ARMED_DEFERRED_EVAL: 判定は遅延評価でなければならぬ。hookが
+# 発火するのは send-keys のおよそ1秒後であり、check_hook_armed() は
+# 送出成功の直後に同期で呼ばれる——その場でups印のmtimeを見ても
+# 間に合わない。ゆえに「今回のnudge」の判定は「次回のcheck_hook_armed()
+# 呼び出し」まで遅延させる（HOOK_CHECK_PENDING）。判定は1回分の
+# nudgeだけ遅れるが、UNARMEDは元よりN回後の判定ゆえ実害無し。
 HOOK_ARMED_CHECK_N=${HOOK_ARMED_CHECK_N:-3}
 NUDGE_SEND_COUNT=${NUDGE_SEND_COUNT:-0}
 HOOK_ARMED_LOGGED=${HOOK_ARMED_LOGGED:-0}
 HOOK_UNARMED_LOGGED=${HOOK_UNARMED_LOGGED:-0}
+HOOK_CHECK_PENDING=${HOOK_CHECK_PENDING:-0}
+UPS_MTIME_PRE=${UPS_MTIME_PRE:-0}
+MISS_COUNT=${MISS_COUNT:-0}
 
 check_hook_armed() {
     local cli
     cli=$(get_effective_cli_type)
     [[ "$cli" == "claude" ]] || return 0
 
-    NUDGE_SEND_COUNT=$((NUDGE_SEND_COUNT + 1))
+    local ups_file="${IDLE_FLAG_DIR:-/tmp}/shogun_ups_${AGENT_ID}"
+    local now_mtime
+    now_mtime=$(stat -c %Y "$ups_file" 2>/dev/null || echo 0)
 
-    if [ -f "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}" ]; then
-        if [ "$HOOK_ARMED_LOGGED" -eq 0 ]; then
-            echo "[$(date)] [HOOK-ARMED] $AGENT_ID: UserPromptSubmit hook busy印を確認 (nudge x${NUDGE_SEND_COUNT})" >&2
-            HOOK_ARMED_LOGGED=1
+    # 前回のnudgeに対する保留中の判定を、まず先に片付ける。
+    if [ "$HOOK_CHECK_PENDING" -eq 1 ]; then
+        if [ "$now_mtime" -gt "$UPS_MTIME_PRE" ] 2>/dev/null; then
+            if [ "$HOOK_ARMED_LOGGED" -eq 0 ]; then
+                echo "[$(date)] [HOOK-ARMED] $AGENT_ID: UserPromptSubmit hook ups印を確認 (nudge x${NUDGE_SEND_COUNT})" >&2
+                HOOK_ARMED_LOGGED=1
+            fi
+            HOOK_CHECK_PENDING=0
+        else
+            MISS_COUNT=$((MISS_COUNT + 1))
         fi
-        return 0
     fi
 
-    if [ "$NUDGE_SEND_COUNT" -ge "$HOOK_ARMED_CHECK_N" ] && [ "$HOOK_UNARMED_LOGGED" -eq 0 ]; then
-        echo "[$(date)] [HOOK-UNARMED] $AGENT_ID: UserPromptSubmit hook が未装填の可能性 (nudge x${NUDGE_SEND_COUNT}, busy印一度も出現せず)" >&2
+    NUDGE_SEND_COUNT=$((NUDGE_SEND_COUNT + 1))
+
+    # ARMED確定後は新たな保留を立てない（以後の呼び出しは完全に無害化）。
+    if [ "$HOOK_ARMED_LOGGED" -eq 0 ]; then
+        UPS_MTIME_PRE="$now_mtime"
+        HOOK_CHECK_PENDING=1
+    fi
+
+    if [ "$MISS_COUNT" -ge "$HOOK_ARMED_CHECK_N" ] && [ "$HOOK_UNARMED_LOGGED" -eq 0 ] && [ "$HOOK_ARMED_LOGGED" -eq 0 ]; then
+        echo "[$(date)] [HOOK-UNARMED] $AGENT_ID: UserPromptSubmit hook が未装填の可能性 (nudge x${NUDGE_SEND_COUNT}, ups印一度もmtime前進せず)" >&2
         type branch_policy_notify &>/dev/null && branch_policy_notify "[HOOK-UNARMED] ${AGENT_ID}: UserPromptSubmit hook 未装填の疑い(nudge x${NUDGE_SEND_COUNT})" 2>/dev/null || true
         HOOK_UNARMED_LOGGED=1
     fi
@@ -1161,22 +1196,34 @@ stall_busy() {
     fi
 }
 
-# is_stalled_pane: type-A (interactive-modal-style) stall detection.
-# True only when busy AND the pane content hash has been unchanged for
-# stall_after_sec. This is the false-positive guard — genuine long-running
-# turns keep printing tokens/spinner, so the hash keeps changing.
-is_stalled_pane() {
-    local now
+# ─── STALE_BUSY_REQUIRES_FROZEN_PANE: shared pane-hash-freeze core (cmd_217 D-1) ───
+# Computes how long PANE_TARGET's content hash has been unchanged. Shared by
+# is_stalled_pane() below (stall_after_sec threshold) and the 300s stale-busy
+# safety net (stale_busy_limit threshold, further down this file) — same
+# mechanism (screen movement = alive), separate state per caller
+# (gunshi_report.yaml design_4: "hash不変判定部分のみを共有し、閾値は
+# 混ぜるな").
+#
+# NOTE: must be called directly (pane_hash_frozen_sec VAR1 VAR2), never via
+# command substitution ($(pane_hash_frozen_sec ...)) — command substitution
+# forks a subshell, and the nameref writes to the caller's hash/since state
+# would be silently lost the instant that subshell exits. The result is
+# returned via the global PANE_HASH_FROZEN_SEC instead of stdout.
+#
+# Args: $1 = name of caller's hash-value variable (nameref)
+#       $2 = name of caller's hash-since variable (nameref)
+# On success: sets PANE_HASH_FROZEN_SEC to the number of seconds the hash
+# has been unchanged (0 on first observation / on a hash change), returns 0.
+# On pane capture failure or empty capture (indeterminate — pane gone, tmux
+# hiccup): clears the caller's hash var, clears PANE_HASH_FROZEN_SEC,
+# returns 1. Never treat capture failure as "frozen" (T-D4/M9: 判定不能を
+# 固着と断ずるな).
+PANE_HASH_FROZEN_SEC=""
+pane_hash_frozen_sec() {
+    local -n _phf_hash="$1"
+    local -n _phf_since="$2"
+    local now capture_output capture_rc
     now=$(date +%s)
-
-    # Not busy → not stalled. Reset tracking state.
-    if ! stall_busy; then
-        STALL_HASH=""
-        STALL_HASH_SINCE=0
-        return 1
-    fi
-
-    local capture_output capture_rc
     capture_output=$(timeout 2 tmux capture-pane -t "$PANE_TARGET" -p 2>/dev/null)
     capture_rc=$?
     # Capture failure or empty pane (e.g. pane gone) → indeterminate, do nothing.
@@ -1184,23 +1231,43 @@ is_stalled_pane() {
     # cksum of zero bytes still yields a non-empty checksum ("4294967295"), so
     # testing the hash for emptiness would never catch this case.
     if [ "$capture_rc" -ne 0 ] || [ -z "$capture_output" ]; then
-        STALL_HASH=""
+        _phf_hash=""
+        PANE_HASH_FROZEN_SEC=""
         return 1
     fi
 
     local h
     h=$(printf '%s' "$capture_output" | cksum | awk '{print $1}')
 
-    if [ "$h" != "$STALL_HASH" ]; then
-        STALL_HASH="$h"
-        STALL_HASH_SINCE="$now"
-        return 1  # screen moved — alive
+    if [ "$h" != "$_phf_hash" ]; then
+        _phf_hash="$h"
+        _phf_since="$now"
+        PANE_HASH_FROZEN_SEC=0
+        return 0  # screen moved — alive
     fi
+
+    PANE_HASH_FROZEN_SEC=$((now - _phf_since))
+    return 0
+}
+
+# is_stalled_pane: type-A (interactive-modal-style) stall detection.
+# True only when busy AND the pane content hash has been unchanged for
+# stall_after_sec. This is the false-positive guard — genuine long-running
+# turns keep printing tokens/spinner, so the hash keeps changing.
+is_stalled_pane() {
+    # Not busy → not stalled. Reset tracking state.
+    if ! stall_busy; then
+        STALL_HASH=""
+        STALL_HASH_SINCE=0
+        return 1
+    fi
+
+    pane_hash_frozen_sec STALL_HASH STALL_HASH_SINCE || return 1
 
     # Same hash persisting — check duration against threshold
     local stall_after_sec
     stall_after_sec=$(stall_policy_query stall_after_sec 2>/dev/null) || stall_after_sec=480
-    [ $((now - STALL_HASH_SINCE)) -ge "$stall_after_sec" ]
+    [ "$PANE_HASH_FROZEN_SEC" -ge "$stall_after_sec" ]
 }
 
 # ─── Pane focus detection (human safety) ───
@@ -1402,6 +1469,19 @@ send_wakeup() {
 # ─── Send wake-up nudge with Escape prefix ───
 # Phase 2 escalation: Copilot/Kimi get Escape×2 + single Ctrl-C + nudge.
 # Claude/Codex/OpenCode fall back to a plain nudge.
+#
+# cmd_217 design_3 C-1 (記述是正のみ、コード変更ではない): AC4第3経路
+# （エスカレーション）は claude 型エージェントに対しては「順序を直せば
+# 到達する」ものではなく、そもそも段が無い。この関数を上から読むと、
+# cli=claude の場合は下記の早期return（"claude: suppressing Escape
+# escalation" ログ行）で plain nudge へ落ちて即 return するため、そこから下にある
+# agent_has_self_watch()・agent_is_busy() のガード順序や pane_has_open_
+# modal() は claude に対しては構造上到達不能である（gunshi_report.yaml
+# design_3参照。以前の記述「self-watch早期returnとbusyガードの順序
+# 見直し」は、claudeの実際の配送経路を指したものではなかった）。
+# claude 向けの実際の配送は Stop hook + plain nudge の二段のみであり、
+# 三段目は無い。第3段の新設（C-2）はN-3の病を悪化させ得るため本PRの
+# 範囲外——別cmdとして将軍へ上申済み（着地後の再評価は家老が📌へ記録）。
 send_wakeup_with_escape() {
     local unread_count="$1"
     local nudge="inbox${unread_count}"
@@ -1912,19 +1992,44 @@ for s in data.get('specials', []):
             # unread messages, force-create idle flag. This recovers from false-busy
             # deadlock where stop_hook failed to create the flag.
             local stale_busy_limit=300  # 5 minutes
-            if [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ] && [ "$((now - FIRST_UNREAD_SEEN))" -ge "$stale_busy_limit" ]; then
+            # cmd_217 D-3: この閾値の名は FIRST_UNREAD_SEEN のままだが、
+            # このbusy分岐に限っては「未読が現れてからbusyで居続けた齢」
+            # ≒busy印の齢の近似として使っている（未読=まさに今取り組んで
+            # いるタスクそのものであり得るため——N-3の実例参照）。
+            local busy_flag_age_sec=$((now - FIRST_UNREAD_SEEN))
+            local force_idle=0
+            if [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ] && [ "$busy_flag_age_sec" -ge "$stale_busy_limit" ]; then
+                # cmd_217 D-1 STALE_BUSY_REQUIRES_FROZEN_PANE: age だけでは
+                # 「本物の仕事（busyかつ画面が動いている）」と「本物の固着
+                # （busyかつ画面が動いていない）」を区別できない（N-3:
+                # 300秒安全網がレビュー中の軍師自身へ誤発火した実例）。
+                # is_stalled_pane()と同じ機構（pane_hash_frozen_sec）で
+                # 画面停止も併せて要求する。閾値はstall_after_secと
+                # 混ぜず、この安全網自身のstale_busy_limitを使う。
+                local hash_frozen_sec hash_capture_rc
+                pane_hash_frozen_sec STALE_BUSY_HASH STALE_BUSY_HASH_SINCE
+                hash_capture_rc=$?
+                hash_frozen_sec="$PANE_HASH_FROZEN_SEC"
+                if [ "$hash_capture_rc" -eq 0 ] && [ "$hash_frozen_sec" -ge "$stale_busy_limit" ]; then
+                    force_idle=1
+                fi
+                # else: 画面が動いている、または capture 不能（判定不能を
+                # 固着と断じない、T-D4）→ force_idle=0 のまま下のelseへ。
+            fi
+
+            if [ "$force_idle" -eq 1 ]; then
                 # cmd_217 AC3/§3: this is the SOLE upper bound on permanent-busy
                 # under the two-marker design (Stop hook不発 is the only failure
                 # mode that can produce it). Wording + one-shot ntfy make the
                 # hook-unarmed suspicion visible instead of silently recovering.
                 if [[ "$busy_cli" == "claude" ]]; then
-                    echo "[$(date)] WARNING: $AGENT_ID busy for $((now - FIRST_UNREAD_SEEN))s with $normal_count unread — forcing idle flag (stale busy recovery; hook不発の疑い)" >&2
+                    echo "[$(date)] WARNING: $AGENT_ID busy for ${busy_flag_age_sec}s with $normal_count unread AND pane frozen for ${hash_frozen_sec}s — forcing idle flag (stale busy recovery; hook不発の疑い)" >&2
                     if [ "${STALE_BUSY_NTFY_SENT:-0}" -eq 0 ]; then
-                        type branch_policy_notify &>/dev/null && branch_policy_notify "${AGENT_ID}: ${stale_busy_limit}秒busy継続のため強制idle化(hook不発の疑い)" 2>/dev/null || true
+                        type branch_policy_notify &>/dev/null && branch_policy_notify "${AGENT_ID}: ${stale_busy_limit}秒busy継続+画面停止のため強制idle化(hook不発の疑い)" 2>/dev/null || true
                         STALE_BUSY_NTFY_SENT=1
                     fi
                 else
-                    echo "[$(date)] WARNING: $AGENT_ID busy for $((now - FIRST_UNREAD_SEEN))s with $normal_count unread — forcing idle flag (stale busy recovery)" >&2
+                    echo "[$(date)] WARNING: $AGENT_ID busy for ${busy_flag_age_sec}s with $normal_count unread AND pane frozen for ${hash_frozen_sec}s — forcing idle flag (stale busy recovery)" >&2
                 fi
                 touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}"
                 # Fall through to normal nudge/escalation below
@@ -2044,19 +2149,34 @@ for s in data.get('specials', []):
             local special_now
             special_now=$(date +%s)
             local stale_busy_limit=300  # 5 minutes — same bound as the normal-message net above
-            if [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ] && [ "$((special_now - FIRST_UNREAD_SEEN))" -ge "$stale_busy_limit" ]; then
-                local special_busy_cli
-                special_busy_cli=$(get_effective_cli_type)
-                if [[ "$special_busy_cli" == "claude" ]]; then
-                    echo "[$(date)] WARNING: $AGENT_ID busy for $((special_now - FIRST_UNREAD_SEEN))s with a deferred special pending — forcing idle flag (stale busy recovery; hook不発の疑い)" >&2
-                    if [ "${STALE_BUSY_NTFY_SENT:-0}" -eq 0 ]; then
-                        type branch_policy_notify &>/dev/null && branch_policy_notify "${AGENT_ID}: ${stale_busy_limit}秒busy継続のため強制idle化(hook不発の疑い、延期中特殊型あり)" 2>/dev/null || true
-                        STALE_BUSY_NTFY_SENT=1
+            local special_busy_flag_age_sec=$((special_now - FIRST_UNREAD_SEEN))
+            if [ "${FIRST_UNREAD_SEEN:-0}" -gt 0 ] && [ "$special_busy_flag_age_sec" -ge "$stale_busy_limit" ]; then
+                # cmd_217 D-1 STALE_BUSY_REQUIRES_FROZEN_PANE: same hash-frozen
+                # AND as the normal-message net above — age alone is not the
+                # signature of a genuine stall (N-3). Shares STALE_BUSY_HASH/
+                # STALE_BUSY_HASH_SINCE with that site (same continuous
+                # freeze-tracking across cycles; the two branches are
+                # mutually exclusive per invocation).
+                local hash_frozen_sec hash_capture_rc
+                pane_hash_frozen_sec STALE_BUSY_HASH STALE_BUSY_HASH_SINCE
+                hash_capture_rc=$?
+                hash_frozen_sec="$PANE_HASH_FROZEN_SEC"
+                if [ "$hash_capture_rc" -eq 0 ] && [ "$hash_frozen_sec" -ge "$stale_busy_limit" ]; then
+                    local special_busy_cli
+                    special_busy_cli=$(get_effective_cli_type)
+                    if [[ "$special_busy_cli" == "claude" ]]; then
+                        echo "[$(date)] WARNING: $AGENT_ID busy for ${special_busy_flag_age_sec}s with a deferred special pending AND pane frozen for ${hash_frozen_sec}s — forcing idle flag (stale busy recovery; hook不発の疑い)" >&2
+                        if [ "${STALE_BUSY_NTFY_SENT:-0}" -eq 0 ]; then
+                            type branch_policy_notify &>/dev/null && branch_policy_notify "${AGENT_ID}: ${stale_busy_limit}秒busy継続+画面停止のため強制idle化(hook不発の疑い、延期中特殊型あり)" 2>/dev/null || true
+                            STALE_BUSY_NTFY_SENT=1
+                        fi
+                    else
+                        echo "[$(date)] WARNING: $AGENT_ID busy for ${special_busy_flag_age_sec}s with a deferred special pending AND pane frozen for ${hash_frozen_sec}s — forcing idle flag (stale busy recovery)" >&2
                     fi
-                else
-                    echo "[$(date)] WARNING: $AGENT_ID busy for $((special_now - FIRST_UNREAD_SEEN))s with a deferred special pending — forcing idle flag (stale busy recovery)" >&2
+                    touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}"
                 fi
-                touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}"
+                # else: screen still moving, or capture indeterminate — do
+                # not force idle (T-D4).
             fi
         fi
         return 0
