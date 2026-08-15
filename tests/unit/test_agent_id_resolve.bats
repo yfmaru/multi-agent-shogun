@@ -166,7 +166,16 @@ teardown() {
 #     returns $$ itself as pane_pid, so the /proc/<pid>/status read never
 #     runs). AGENT_ID_RESOLVE_L2_START_PID lets the start pid be a real
 #     grandchild — the walk must climb two real PPid hops to reach the
-#     pane_pid, exercising the /proc read gunshi flagged as untested. ───
+#     pane_pid, exercising the /proc read gunshi flagged as untested.
+#
+#     macOS runner note: macOS has no /proc at all (unlike test_task_
+#     complete.bats's EXP-002/004, which reproduce a *missing-permission*
+#     /proc that Linux still has). On Darwin the PPid read is
+#     unconditionally impossible, so resolve_agent_id_l2 cannot climb
+#     past its own start pid there — assert THAT as the correct Darwin
+#     behavior (mirrors the repo's existing uname-branch convention)
+#     rather than skipping (production runs on WSL2/Linux; the ladder's
+#     L1 still covers macOS in practice). ───
 
 @test "T-A1-dynamic: resolve_agent_id_l2 climbs real multi-hop /proc ancestry (grandchild start_pid → parent → grandparent pane_pid)" {
     local script="$IDLE_FLAG_DIR/l2_dynamic.sh"
@@ -199,8 +208,15 @@ SCRIPT
     [ "$status" -eq 0 ]
     ! echo "$output" | grep -q "SETUP_FAILED_SAME_PID" \
         || { echo "test setup bug: nested subshell BASHPID equals the top-level pid, no real hop exercised"; false; }
-    echo "$output" | grep -q "AGENT=multihopagent VIA=l2" \
-        || { echo "expected L2 to resolve via a real 2-hop /proc ancestry walk (start_pid != pane_pid); output: $output"; false; }
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # macOSには/procが元から無く、PPid読み取りは原理的に不能。
+        # ゆえに1段目で当たらねば必ず失敗する——それが正しい挙動。
+        echo "$output" | grep -q "AGENT= VIA=" \
+            || { echo "expected L2 to fail cleanly on Darwin (no /proc to climb); output: $output"; false; }
+    else
+        echo "$output" | grep -q "AGENT=multihopagent VIA=l2" \
+            || { echo "expected L2 to resolve via a real 2-hop /proc ancestry walk (start_pid != pane_pid); output: $output"; false; }
+    fi
 }
 
 # ─── AC-I1/T-217-11-style: the hook script itself still honors exit 0
