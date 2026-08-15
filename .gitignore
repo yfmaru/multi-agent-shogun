@@ -49,6 +49,9 @@
 # cmd_171: usage_limit_state (type-C stall detection) library
 !lib/usage_limit.sh
 
+# cmd_217: AGENT_ID_RESOLVE_LADDER library (shared by user_prompt_submit_hook.sh)
+!lib/agent_id_resolve.sh
+
 # Multi-CLI: Codex auto-load file
 !AGENTS.md
 
@@ -106,6 +109,7 @@ scripts/seo_qc.sh
 !scripts/stop_hook_inbox.sh
 !scripts/session_start_hook.sh
 !scripts/user_prompt_submit_hook.sh
+!scripts/post_tool_use_hook.sh
 !scripts/agent_status.sh
 !scripts/ratelimit_check.sh
 !scripts/switch_cli.sh

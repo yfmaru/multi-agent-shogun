@@ -117,11 +117,33 @@ wait_for_log() {
     # from an earlier test in this shared tmux session) and the agent reads
     # as idle by the new default, so the 300s stale-busy net this test
     # exercises never fires within its wait window.
-    touch "$flag_dir/shogun_busy_ashigaru1"
+    # Backdate by 2s, not a plain `touch` (=now): agent_turn_state() ties
+    # (mtime_busy >= mtime_idle) resolve to busy (safety-first), and mtimes
+    # never change again once set. With STALE_BUSY_HASH/_SINCE pre-seeded
+    # (below), force-idle can fire within the SAME wall-clock second the
+    # watcher starts — a plain-`touch` busy印 would then tie (or lose to) a
+    # same-second idle印, locking the agent busy PERMANENTLY (no future poll
+    # ever re-touches either marker, so the tie never breaks on its own).
+    # Root-caused via CI (gh run 31891038460): task never reached "done"
+    # despite "forcing idle flag" firing — the idle印 it wrote was tied by
+    # this exact race.
+    touch -d "@$(( $(date +%s) - 2 ))" "$flag_dir/shogun_busy_ashigaru1"
 
-    # Start mock in busy state before unread messages arrive.
-    send_to_pane "$ashigaru1_pane" "busy_hold 12"
-    sleep 1
+    # cmd_217 QC是正 (gunshi_qc_217_pr111 ac3_note_for_karo / D-1): the
+    # safety net now also requires the pane hash to be frozen — the whole
+    # point of D-1 is that a genuinely MOVING screen (real work) must never
+    # be force-idled, only a genuinely STILL one may. "busy_hold N" (used
+    # here pre-D-1) prints a new counter line every second, so the screen
+    # never stops moving and D-1 correctly refuses to fire — this test's
+    # own premise (age alone triggers the net) is exactly the N-3 false
+    # positive D-1 was built to eliminate. Do not resurrect it. Instead:
+    # leave the pane genuinely static (nothing writes to it) and seed
+    # STALE_BUSY_HASH/_SINCE to match — the same fast-forward trick
+    # FIRST_UNREAD_SEEN already uses for busy-age, applied to freeze-age.
+    local prehash
+    prehash=$(tmux capture-pane -t "$ashigaru1_pane" -p 2>/dev/null)
+    prehash=$(printf '%s' "$prehash" | cksum | awk '{print $1}')
+    local hash_since=$(( $(date +%s) - 420 ))
 
     cp "$PROJECT_ROOT/tests/e2e/fixtures/task_ashigaru1_basic.yaml" \
         "$E2E_QUEUE/queue/tasks/ashigaru1.yaml"
@@ -133,6 +155,8 @@ wait_for_log() {
     watcher_pid=$(
         IDLE_FLAG_DIR="$flag_dir" \
         FIRST_UNREAD_SEEN="$first_unread_seen" \
+        STALE_BUSY_HASH="$prehash" \
+        STALE_BUSY_HASH_SINCE="$hash_since" \
         bash "$E2E_QUEUE/scripts/inbox_watcher.sh" "ashigaru1" "$ashigaru1_pane" "copilot" \
             > "$log_file" 2>&1 &
         echo $!
@@ -173,14 +197,23 @@ wait_for_log() {
     local ashigaru_idle_flag="$flag_dir/shogun_idle_ashigaru1"
     first_unread_seen=$(( $(date +%s) - 420 ))
 
-    # Same busy印 seeding as E2E-010-B — see its comment for why this is
-    # required regardless of the "copilot" argument below (effective_cli
-    # follows the pane's live @agent_cli option, which setup_e2e_session
-    # defaults to "claude" for every pane).
-    touch "$flag_dir/shogun_busy_ashigaru1"
+    # Same busy印 seeding as E2E-010-B (backdated 2s — see its comment for
+    # why a plain `touch` here would tie against a same-second force-idle
+    # touch and lock the agent busy permanently) — required regardless of
+    # the "copilot" argument below (effective_cli follows the pane's live
+    # @agent_cli option, which setup_e2e_session defaults to "claude" for
+    # every pane).
+    touch -d "@$(( $(date +%s) - 2 ))" "$flag_dir/shogun_busy_ashigaru1"
 
-    send_to_pane "$ashigaru1_pane" "busy_hold 12"
-    sleep 1
+    # cmd_217 QC是正 (D-1): same reasoning as E2E-010-B — "busy_hold" keeps
+    # the screen moving by design (a new counter line every second), which
+    # is exactly the "genuine work" case D-1 must NOT force-idle. Leave the
+    # pane static and seed STALE_BUSY_HASH/_SINCE from an actual snapshot
+    # instead of relying on age alone.
+    local prehash
+    prehash=$(tmux capture-pane -t "$ashigaru1_pane" -p 2>/dev/null)
+    prehash=$(printf '%s' "$prehash" | cksum | awk '{print $1}')
+    local hash_since=$(( $(date +%s) - 420 ))
 
     cp "$PROJECT_ROOT/tests/e2e/fixtures/task_ashigaru1_basic.yaml" \
         "$E2E_QUEUE/queue/tasks/ashigaru1.yaml"
@@ -203,6 +236,8 @@ for m in data.get('messages', []) or []:
     watcher_pid=$(
         IDLE_FLAG_DIR="$flag_dir" \
         FIRST_UNREAD_SEEN="$first_unread_seen" \
+        STALE_BUSY_HASH="$prehash" \
+        STALE_BUSY_HASH_SINCE="$hash_since" \
         bash "$E2E_QUEUE/scripts/inbox_watcher.sh" "ashigaru1" "$ashigaru1_pane" "copilot" \
             > "$log_file" 2>&1 &
         echo $!
