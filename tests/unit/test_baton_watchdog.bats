@@ -1541,6 +1541,8 @@ YAML
 #   T-A12: 抑止ログ——抑止に入る周期に1行、同条件で2周期回しても2行目は出ぬ
 #   T-A13: 再武装ログ——抑止中に痕跡が古くなるとgateB re-armedが出て発火する
 #   T-A14: 状態の巻き戻し——抑止された周期でCONDITION_SINCE等が0へ戻る
+#   T-A7b: 相対パスがcwdから解決できても拒む（絶対パス検査の単独責務）
+#   T-A8b: 指し先がディレクトリなら拒む（regular file検査の単独責務）
 #   T-A15: 構造検査——shogun_transcript_の出現が読み手2関数の内側に限られる
 # ═══════════════════════════════════════════════════════════════
 
@@ -1704,6 +1706,61 @@ YAML
     "
     [ "$status" -eq 0 ]
     grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A7b / T-A8b: 劣化ガードの層を1枚ずつ切り分ける（軍師の変異試験M4/M5対応） ---
+# T-A7とT-A8だけでは、絶対パス検査・指し先存在検査のどちらを撤去しても
+# 下流の別の門（存在検査／statの失敗）が同じ検体を拾ってしまい緑のまま
+# 通る。以下2件は各門が単独で担っている責務——「静かになりすぎる」側の
+# 穴——を名指しで固定する。
+
+@test "T-A7b: a RELATIVE marker path that would resolve from cwd is still rejected (absolute-path guard)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    # cwd から実際に解決できてしまう相対パスを置く。絶対パス検査が
+    # 無ければ「新しい生存の証拠」として通ってしまい、番犬は永久に黙る。
+    mkdir -p "$TEST_TMPDIR/relroot"
+    echo '{}' > "$TEST_TMPDIR/relroot/resolvable.jsonl"
+    printf 'resolvable.jsonl\n' > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru1"
+
+    run bash -c "
+        cd '$TEST_TMPDIR/relroot'
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "relative path resolved from cwd was accepted as liveness evidence"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-A8b: a marker pointing at a DIRECTORY is rejected (regular-file guard; stat alone would succeed)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    # ディレクトリは stat が成功してしまう（かつ中身が変わるたび mtime が
+    # 進む）ため、regular file 検査を落とすと「永久に生きている」痕跡に
+    # なりうる——事前検死1（永久沈黙）そのものの経路である。
+    mkdir -p "$TEST_TMPDIR/transcripts/a_directory"
+    printf '%s\n' "$TEST_TMPDIR/transcripts/a_directory" > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru1"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "a directory was accepted as liveness evidence"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
 
 # --- T-A9: 衝突検出 ---
