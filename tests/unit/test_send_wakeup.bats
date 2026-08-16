@@ -103,7 +103,13 @@ MOCK
     mkdir -p "$TEST_INBOX_DIR"
 
     # Default mock control variables
-    export MOCK_CAPTURE_PANE=""
+    # cmd_229 AC-4: pane_input_safety() now gates every claude-type Enter
+    # route, and an empty capture classifies as `unknown` (deny) rather than
+    # the old "not modal" (allow) default. A bare idle prompt is the
+    # baseline "safe" screen for every test that isn't specifically
+    # exercising a modal/working/unknown fixture — those tests set their own
+    # MOCK_CAPTURE_PANE and override this default.
+    export MOCK_CAPTURE_PANE="❯"
     export MOCK_SENDKEYS_RC=0
     export MOCK_PANE_CLI=""
     export MOCK_PANE_ACTIVE=""
