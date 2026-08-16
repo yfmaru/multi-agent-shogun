@@ -19,6 +19,13 @@
 #              「差し替えの検体」と「/clear相当の検体」は意味として別物
 #              であり、たまたま同じ一手で両方確かめられているに過ぎない
 #              （cmd_226 将軍追加AC-11の趣旨）
+#   TC-UPS-03b: /clear相当の**独立**検体（書き手→読み手を貫く）——
+#              印が前セッションの凍ったtranscriptを指す状態から新セッションの
+#              最初のプロンプトを与え、baton_watchdog_agent_liveness_mtime()が
+#              **新しい**transcriptの齢を返すことを確かめる。TC-UPS-03は印の
+#              中身しか見ぬ書き手側の検査であり、実害が出るのは読み手側で
+#              ある（凍った齢が単調に古くなりゲートBを倒す）。将軍追加AC-11
+#              「検査まで一つに間引かぬこと」に応える
 #   TC-UPS-04: transcript_path空 — 印を作らず既存の印も壊さぬ
 #   TC-UPS-05: 相対パス — 書かぬ。既存の印も壊さぬ（AC-3）
 #   TC-UPS-06: AGENT_ID=shogun — 印を作らぬ（AC-4）
@@ -95,6 +102,46 @@ marker_path() {
     [ "$status" -eq 0 ]
     [ "$(cat "$(marker_path)")" = "/fake/sessionB.jsonl" ] \
         || { echo "expected marker to be replaced with pathB; got: $(cat "$(marker_path)" 2>/dev/null)"; false; }
+}
+
+@test "TC-UPS-03b: /clear specimen (writer->reader) — after a new session's first prompt, the watchdog reads the NEW transcript's mtime, not the frozen previous-session one (AC-11, second failure mode)" {
+    # F-4（第2の失敗様態）の独立検体。TC-UPS-03は「印の中身が差し替わる」
+    # ことだけを見る書き手側の検査だが、実害が出るのは**読み手**である——
+    # /clear後、印が前セッションの凍ったtranscriptを指し続けると、
+    # baton_watchdog_agent_liveness_mtime() が単調に古くなる齢を返し、
+    # 1800秒でゲートBが倒れて no_progress が誤って撃たれる。
+    # ここでは書き手→読み手を貫いて、その齢が実際に若返ることを確かめる。
+    local frozen="$IDLE_FLAG_DIR/sessionA.jsonl"
+    local fresh="$IDLE_FLAG_DIR/sessionB.jsonl"
+    printf '{"old":1}\n' > "$frozen"
+    printf '{"new":1}\n' > "$fresh"
+    # 前セッションのtranscriptは /clear 以後追記されぬ = 凍っている
+    touch -d '2 hours ago' "$frozen"
+
+    # /clear 直前のStop hookが遺した印（= 凍った指し先を指す）
+    printf '%s\n' "$frozen" > "$(marker_path)"
+
+    # /clear 後、新セッションの最初のプロンプトが届く
+    run_ups_hook "{\"session_id\":\"s2\",\"transcript_path\":\"$fresh\"}"
+    [ "$status" -eq 0 ] || { echo "expected exit 0, got $status; output: $output"; false; }
+
+    local frozen_mtime fresh_mtime observed
+    frozen_mtime=$(stat -c %Y "$frozen" 2>/dev/null || stat -f %m "$frozen")
+    fresh_mtime=$(stat -c %Y "$fresh" 2>/dev/null || stat -f %m "$fresh")
+
+    observed=$(
+        __BATON_WATCHDOG_TESTING__=1 IDLE_FLAG_DIR="$IDLE_FLAG_DIR" bash -c '
+            source "'"$SCRIPT_DIR"'/scripts/baton_watchdog.sh"
+            baton_watchdog_agent_liveness_mtime ashigaru1
+        '
+    ) || { echo "liveness mtime lookup failed entirely (expected the fresh transcript to be readable)"; false; }
+
+    [ "$observed" = "$fresh_mtime" ] || {
+        echo "watchdog read mtime=$observed; expected the NEW transcript's $fresh_mtime."
+        echo "frozen(previous session)=$frozen_mtime — reading that value is the F-4 failure mode."
+        echo "marker now contains: $(cat "$(marker_path)" 2>/dev/null)"
+        false
+    }
 }
 
 @test "TC-UPS-04: empty transcript_path creates no marker and does not clobber an existing one" {
