@@ -126,6 +126,11 @@ setup() {
     > "$SHOGUN_NOTIFY_LOG"
     > "$PGREP_LOG"
 
+    # cmd_226: 生存痕跡(shogun_transcript_<agent>)の置き場をフィクスチャ内へ
+    # 隔離する。本番の/tmp/shogun_transcript_*を読み書きさせない。
+    export IDLE_FLAG_DIR="$TEST_TMPDIR/idle_flags"
+    mkdir -p "$IDLE_FLAG_DIR"
+
     # baton_watchdog_notify_shogun は "$ROOT/scripts/inbox_write.sh" を直接
     # 呼ぶため（ROOT=フィクスチャroot）、フィクスチャ内にモックを配置する。
     cat > "$FIXTURE_ROOT/scripts/inbox_write.sh" << STUB
@@ -319,6 +324,30 @@ write_quiet_settings() {
             echo "  baton_ntfy_deferred_max_entries: $5"
         fi
     } >> "$FIXTURE_ROOT/config/settings.yaml"
+}
+
+# cmd_226: liveness_stall_after_sec等、新規キーの追記専用ヘルパー。
+# write_settingsは既に11個の位置引数を持ち、12個目を足すと取り違えの
+# 温床になるため（memory feedback_state_count_as_transcription_checksum
+# の精神）、この形にした。write_settings呼び出しの直後に使うこと。
+append_settings_line() {
+    echo "$1" >> "$FIXTURE_ROOT/config/settings.yaml"
+}
+
+# cmd_226: 生存痕跡印($1=agent)を作り、指し先ファイル
+# ($TEST_TMPDIR/transcripts/<agent>.jsonl)を用意する。
+# $2=指し先のmtime齢(秒。省略時は0=今)。指し先の絶対パスをechoする
+# （呼び出し側が後で touch -d し直す等に使えるよう）。
+write_liveness_marker() {
+    local agent="$1" age="${2:-0}" target
+    mkdir -p "$TEST_TMPDIR/transcripts"
+    target="$TEST_TMPDIR/transcripts/${agent}.jsonl"
+    echo '{}' > "$target"
+    if [ "$age" -gt 0 ]; then
+        touch -d "@$(( $(date +%s) - age ))" "$target"
+    fi
+    printf '%s\n' "$target" > "$IDLE_FLAG_DIR/shogun_transcript_${agent}"
+    printf '%s' "$target"
 }
 
 # --- TC-BATON-001: 未読0・active0・未完cmdあり が閾値継続 → 検知 ---
@@ -1486,6 +1515,425 @@ YAML
     grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG"
     grep -q "no_progress: agent=ashigaru7" "$SHOGUN_NOTIFY_LOG"
     grep -q "subtask_178_pc2_daily_consumption_log_v2" "$SHOGUN_NOTIFY_LOG"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 【cmd_226 / LIVENESS_TRACE_GATE_B】B-4bのゲートB（生存痕跡）
+#
+# ゲートA（既存・progress_stall_after_sec未更新）だけでは、稼働中agentの
+# 正当な長考でも90分で誤検知していた。生存の痕跡
+# (shogun_transcript_<agent> → 指し先transcriptのmtime)が
+# liveness_stall_after_sec以上動いていない、または取得できない時に限り
+# ANDで発火させる。
+#
+#   T-A1: 本日の再現検体——ゲートA成立(artifact古い)+痕跡が新しい→発火せぬ
+#   T-A2: 真の固着——ゲートA成立+痕跡も古い→従来どおり発火し文面が一致
+#   T-A3: 警報が増えぬことの直接検査——ゲートA不成立+痕跡が古い→発火せぬ
+#   T-A4: ゲートA不成立+痕跡が新しい→発火せぬ
+#   T-A5: 劣化(a) 印が存在せぬ→発火する
+#   T-A6: 劣化(b) 印が空ファイル→発火する
+#   T-A7: 劣化(c) 印の中身が相対パス/ゴミ文字列→発火する
+#   T-A8: 劣化(d) 指し先のファイルが存在せぬ→発火する
+#   T-A9: 衝突——2体の印が同一の指し先(新しい)を持つ→双方とも発火する
+#   T-A10: 閾値が設定から読まれる——liveness_stall_after_secを小さくすると
+#          同じ痕跡齢で発火側へ変わる
+#   T-A11: tmux不使用の不変条件——抑止が起きた周期でもMOCK_TMUX_LOGが空
+#   T-A12: 抑止ログ——抑止に入る周期に1行、同条件で2周期回しても2行目は出ぬ
+#   T-A13: 再武装ログ——抑止中に痕跡が古くなるとgateB re-armedが出て発火する
+#   T-A14: 状態の巻き戻し——抑止された周期でCONDITION_SINCE等が0へ戻る
+#   T-A7b: 相対パスがcwdから解決できても拒む（絶対パス検査の単独責務）
+#   T-A8b: 指し先がディレクトリなら拒む（regular file検査の単独責務）
+#   T-A15: 構造検査——shogun_transcript_の出現が読み手2関数の内側に限られる
+# ═══════════════════════════════════════════════════════════════
+
+# --- T-A1: 本日の再現検体 ---
+
+@test "T-A1: gate A true (stale artifact) + fresh liveness marker → does NOT fire" {
+    write_settings true 5 60 "" "" 5 60   # progress_stall_after_sec=5
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 2   # liveness age=2s < 30s threshold
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A2: 真の固着 ---
+
+@test "T-A2: gate A true + gate B true (stale marker too) → fires with the unchanged message shape" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 100   # liveness age=100s >= 30s threshold
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "no_progress: agent=ashigaru1 task_id=subtask_1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "(バトン保持のまま5s+無進捗)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A3: 警報が増えぬことの直接検査 ---
+
+@test "T-A3: gate A false (fresh artifact) + stale liveness marker → does NOT fire" {
+    write_settings true 5 60 "" "" 100 60   # progress_stall_after_sec=100 (fresh)
+    append_settings_line "  liveness_stall_after_sec: 5"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    write_liveness_marker ashigaru1 999   # liveness stale, but gate A never opens
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A4: ゲートA不成立+痕跡も新しい ---
+
+@test "T-A4: gate A false + fresh liveness marker → does NOT fire" {
+    write_settings true 5 60 "" "" 100 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    write_liveness_marker ashigaru1 1
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A5〜T-A8: 劣化ガード（4件とも「証拠なし→発火側」） ---
+
+@test "T-A5: degradation (a) marker file absent → fires (fail-loud default)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    # 印を一切作らない
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-A6: degradation (b) marker file empty → fires" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    : > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru1"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-A7: degradation (c) marker content is a relative path / garbage → fires" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    printf 'relative/path/session.jsonl\n' > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru1"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-A8: degradation (d) marker points to a nonexistent file → fires" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    printf '%s\n' "$TEST_TMPDIR/transcripts/does_not_exist.jsonl" > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru1"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A7b / T-A8b: 劣化ガードの層を1枚ずつ切り分ける（軍師の変異試験M4/M5対応） ---
+# T-A7とT-A8だけでは、絶対パス検査・指し先存在検査のどちらを撤去しても
+# 下流の別の門（存在検査／statの失敗）が同じ検体を拾ってしまい緑のまま
+# 通る。以下2件は各門が単独で担っている責務——「静かになりすぎる」側の
+# 穴——を名指しで固定する。
+
+@test "T-A7b: a RELATIVE marker path that would resolve from cwd is still rejected (absolute-path guard)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    # cwd から実際に解決できてしまう相対パスを置く。絶対パス検査が
+    # 無ければ「新しい生存の証拠」として通ってしまい、番犬は永久に黙る。
+    mkdir -p "$TEST_TMPDIR/relroot"
+    echo '{}' > "$TEST_TMPDIR/relroot/resolvable.jsonl"
+    printf 'resolvable.jsonl\n' > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru1"
+
+    run bash -c "
+        cd '$TEST_TMPDIR/relroot'
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "relative path resolved from cwd was accepted as liveness evidence"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-A8b: a marker pointing at a DIRECTORY is rejected (regular-file guard; stat alone would succeed)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    # ディレクトリは stat が成功してしまう（かつ中身が変わるたび mtime が
+    # 進む）ため、regular file 検査を落とすと「永久に生きている」痕跡に
+    # なりうる——事前検死1（永久沈黙）そのものの経路である。
+    mkdir -p "$TEST_TMPDIR/transcripts/a_directory"
+    printf '%s\n' "$TEST_TMPDIR/transcripts/a_directory" > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru1"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "a directory was accepted as liveness evidence"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A9: 衝突検出 ---
+
+@test "T-A9: two agents' markers point to the same fresh target → BOTH fire (misresolution safety net)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml" << 'YAML'
+task:
+  task_id: subtask_2
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" "$FIXTURE_ROOT/queue/tasks/ashigaru2.yaml"
+
+    local target
+    target=$(write_liveness_marker ashigaru1 2)   # fresh target, would normally suppress
+    printf '%s\n' "$target" > "$IDLE_FLAG_DIR/shogun_transcript_ashigaru2"   # collides
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "no_progress: agent=ashigaru2" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A10: 閾値が設定から読まれる ---
+
+@test "T-A10: liveness threshold is read from config — lowering it flips the same marker age to stalled" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 20"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 10   # age=10s < 20s threshold → suppressed
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 5"
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 10   # same age=10s, now >= 5s threshold → fires
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A11: tmux不使用の不変条件 ---
+
+@test "T-A11: MOCK_TMUX_LOG stays empty even during a gate-B-suppressed cycle" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 2
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$MOCK_TMUX_LOG" ] || { cat "$MOCK_TMUX_LOG"; false; }
+}
+
+# --- T-A12: 抑止ログは遷移時のみ ---
+
+@test "T-A12: suppression log line appears once on entry, not again on a second identical cycle" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 2
+
+    run bash -c "
+        source '$TEST_HARNESS' 2>&1
+        check_b4b_once
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    local count
+    count=$(echo "$output" | grep -c "B-4b suppressed: agent=ashigaru1")
+    [ "$count" -eq 1 ] || { echo "$output"; false; }
+}
+
+# --- T-A13: 再武装ログ ---
+
+@test "T-A13: gate B re-arms and fires once the marker goes stale mid-suppression" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 5"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    local target
+    target=$(write_liveness_marker ashigaru1 1)   # fresh → suppressed at first
+
+    run bash -c "
+        source '$TEST_HARNESS' 2>&1
+        check_b4b_once
+        touch -d \"@\$(( \$(date +%s) - 100 ))\" '$target'
+        touch -d \"@\$(( \$(date +%s) - 100 ))\" '$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml'
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "B-4b suppressed: agent=ashigaru1" || { echo "$output"; false; }
+    echo "$output" | grep -q "B-4b gateB re-armed: agent=ashigaru1" || { echo "$output"; false; }
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# --- T-A14: 状態の巻き戻し ---
+
+@test "T-A14: B4B_CONDITION_SINCE resets to 0 during a suppressed cycle" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 100   # stale → fires, CONDITION_SINCE set
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        echo \"SINCE1=\${B4B_CONDITION_SINCE[ashigaru1]}\"
+        printf '%s\n' '$TEST_TMPDIR/transcripts/ashigaru1.jsonl' > '$IDLE_FLAG_DIR/shogun_transcript_ashigaru1'
+        touch '$TEST_TMPDIR/transcripts/ashigaru1.jsonl'
+        check_b4b_once
+        echo \"SINCE2=\${B4B_CONDITION_SINCE[ashigaru1]}\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SINCE1="* ]]
+    [[ "$output" != *"SINCE1=0"* ]] || { echo "$output"; false; }
+    [[ "$output" == *"SINCE2=0"* ]] || { echo "$output"; false; }
+}
+
+# --- T-A15: 構造検査（AC-3の機械的固定） ---
+
+@test "T-A15: shogun_transcript_ literal is confined to the two designated reader functions (AC-3 structural pin)" {
+    local total in_mtime in_collision
+    total=$(grep -c 'shogun_transcript_' "$WATCHDOG_SCRIPT")
+    in_mtime=$(awk '/^baton_watchdog_agent_liveness_mtime\(\) \{/,/^\}/' "$WATCHDOG_SCRIPT" | grep -c 'shogun_transcript_')
+    in_collision=$(awk '/^baton_watchdog_liveness_collision\(\) \{/,/^\}/' "$WATCHDOG_SCRIPT" | grep -c 'shogun_transcript_')
+    [ "$total" -eq "$((in_mtime + in_collision))" ] || { grep -n 'shogun_transcript_' "$WATCHDOG_SCRIPT"; false; }
 }
 
 # ═══════════════════════════════════════════════════════════════

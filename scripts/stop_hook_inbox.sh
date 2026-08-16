@@ -47,6 +47,30 @@ if [ "$AGENT_ID" = "shogun" ]; then
     exit 0
 fi
 
+# ─── cmd_226 / LIVENESS_TRACE_GATE_B: 生存痕跡の対応付けを記録 ───
+# transcript(JSONL)を追記するのはClaude Code自身である。ここで
+# 記録するのは「どのファイルか」だけ。baton_watchdogはこの印を
+# 読み、指し先のmtimeでB-4bのゲートBを判定する。
+# 書けなかった場合は黙って諦めてよい——読み手側の劣化ガードが
+# 「証拠なし＝発火側」へ倒すため、沈黙にはならぬ。
+__TRACE_PATH=$(printf '%s' "$INPUT" | python3 -c \
+    "import sys,json; print(json.load(sys.stdin).get('transcript_path',''))" \
+    2>/dev/null || true)
+__TRACE_DIR="${IDLE_FLAG_DIR:-/tmp}"
+if [ -n "$__TRACE_PATH" ]; then
+    __TRACE_TMP="$__TRACE_DIR/.shogun_transcript_${AGENT_ID}.$$"
+    if printf '%s\n' "$__TRACE_PATH" > "$__TRACE_TMP" 2>/dev/null; then
+        mv -f "$__TRACE_TMP" "$__TRACE_DIR/shogun_transcript_${AGENT_ID}" \
+            2>/dev/null || rm -f "$__TRACE_TMP" 2>/dev/null || true
+    fi
+else
+    # 2>/dev/nullを>>より前に置く: logs/ディレクトリが無いとリダイレクト
+    # 自体の open 失敗がシェルの生stderrへ漏れ、bats等の出力キャプチャを
+    # 汚染する（順序を逆にすると2>/dev/nullが適用される前に失敗する）。
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] transcript_path unresolved (agent=${AGENT_ID})" \
+        2>/dev/null >> "$SCRIPT_DIR/logs/hook_transcript_trace.log" || true
+fi
+
 # ─── Define inbox path early (used in multiple places below) ───
 INBOX="$SCRIPT_DIR/queue/inbox/${AGENT_ID}.yaml"
 

@@ -37,6 +37,27 @@ Layer 4: Session context — volatile (CLAUDE.md auto-loaded, instructions/*.md,
 **履歴**: Layer 1はMemory MCPだったが、2026-08-06 cmd_204で不採用とした
 （entities 0/relations 0の空の器であり、Claude Codeのファイルメモリと二重化していたため）。
 
+## Liveness Signals (cmd_226)
+
+番犬（`baton_watchdog.sh`）等が「agentが生きているか」を判定する際に使う痕跡は
+複数あり、それぞれ書き手・読み手・測るものが異なる。一覧できねば混乱を生むため
+（旧設計R-3）、ここへ1つにまとめる。
+
+| 信号 | 書き手 | 読み手 | 何を測るか | 取れぬ時どちらへ倒すか |
+|------|--------|--------|-----------|----------------------|
+| busy印・idle印 | hook・inbox_watcher | inbox_watcher | ターン状態 | idle寄り |
+| pane hash | inbox_watcher(自前) | inbox_watcher | 画面の動き | 判定不能扱い |
+| ups印 | UserPromptSubmit hook | session_start | hook武装の有無 | 未武装扱い |
+| transcript痕跡 | Claude Code(追記) | baton_watchdog | CLIの活動 | **発火側** |
+
+transcript痕跡は`${IDLE_FLAG_DIR:-/tmp}/shogun_transcript_<agent>`に
+transcript(JSONL)の絶対パスを1行のみ書いた印であり、`scripts/stop_hook_inbox.sh`
+がAGENT_ID解決直後に毎ターン書き直す。transcript自体を追記するのはClaude Code
+自身であって我らのコードではない——**我らが維持せぬ痕跡だけが、我らの不注意で
+死なぬ**という設計判断による（cmd_217でbusy印が数時間黙って死んだ教訓）。
+`baton_watchdog.sh`の`baton_watchdog_agent_liveness_mtime()`が印→指し先→mtimeを
+辿り、取得できなければ「生存の証拠なし」として発火側へ倒す（劣化ガード）。
+
 ## Project Management
 
 System manages ALL white-collar work, not just self-improvement. Project folders can be external (outside this repo). `projects/` is git-ignored (contains secrets).
