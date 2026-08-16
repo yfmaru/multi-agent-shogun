@@ -586,6 +586,12 @@ Karo and Gunshi update dashboard.md. Gunshi updates during quality check aggrega
 5. **当日分より古い記述は`logs/dashboard_archive/`または`logs/daily/`
    へ退避する。** dashboardは主が読む窓であって履歴の保管庫ではない。
    退避先のファイル名・粒度は家老が決めてよい。
+6. **dashboard冒頭の「最終更新」の入れ子には上限を設ける。** 「最終
+   更新」＋直前の「前回更新」1件、**合計2段まで**とし、それを超える
+   段は都度`logs/dashboard_archive/`（既存の年月日別ファイルの作法
+   どおり）へ退避する。退避のたびに本体の「📁詳細アーカイブ」節へ、
+   退避先ファイル名と何が入っているかを追記し、後から辿れるように
+   する。
 
 ### 🐸 Frog / Streak Section Template (dashboard.md)
 

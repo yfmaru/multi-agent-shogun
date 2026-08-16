@@ -162,6 +162,9 @@ Karo makes final OK/NG decision and unblocks next tasks
    当該cmdへ`awaiting: lord`と`awaiting_since: "<現在時刻のISO8601>"`の
    両方を書く。片方だけでは安全網の計時が番犬プロセスの再起動をまたげぬ
 5. 当日分より古い記述は残さず、家老が退避先へ移すに任せる
+6. dashboard冒頭の「最終更新」の入れ子は「最終更新」＋「前回更新」
+   1件の**合計2段まで**とし、超えた段は`logs/dashboard_archive/`へ
+   退避し「📁詳細アーカイブ」節へ退避先を追記する
 
 ## Branch & PR Policy — 軍師の責務
 
