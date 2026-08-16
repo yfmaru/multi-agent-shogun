@@ -48,15 +48,42 @@ Layer 4: Session context — volatile (CLAUDE.md auto-loaded, instructions/*.md,
 | busy印・idle印 | hook・inbox_watcher | inbox_watcher | ターン状態 | idle寄り |
 | pane hash | inbox_watcher(自前) | inbox_watcher | 画面の動き | 判定不能扱い |
 | ups印 | UserPromptSubmit hook | session_start | hook武装の有無 | 未武装扱い |
-| transcript痕跡 | Claude Code(追記) | baton_watchdog | CLIの活動 | **発火側** |
+| transcript痕跡 | Stop hook・UserPromptSubmit hook（指し先の追記はClaude Code自身） | baton_watchdog | CLIの活動 | **発火側** |
 
 transcript痕跡は`${IDLE_FLAG_DIR:-/tmp}/shogun_transcript_<agent>`に
-transcript(JSONL)の絶対パスを1行のみ書いた印であり、`scripts/stop_hook_inbox.sh`
-がAGENT_ID解決直後に毎ターン書き直す。transcript自体を追記するのはClaude Code
-自身であって我らのコードではない——**我らが維持せぬ痕跡だけが、我らの不注意で
-死なぬ**という設計判断による（cmd_217でbusy印が数時間黙って死んだ教訓）。
-`baton_watchdog.sh`の`baton_watchdog_agent_liveness_mtime()`が印→指し先→mtimeを
-辿り、取得できなければ「生存の証拠なし」として発火側へ倒す（劣化ガード）。
+transcript(JSONL)の絶対パスを1行のみ書いた印である。transcript自体を追記する
+のはClaude Code自身であって我らのコードではない——**我らが維持せぬ痕跡だけが、
+我らの不注意で死なぬ**という設計判断による（cmd_217でbusy印が数時間黙って
+死んだ教訓）。`baton_watchdog.sh`の`baton_watchdog_agent_liveness_mtime()`が
+印→指し先→mtimeを辿り、取得できなければ「生存の証拠なし」として発火側へ
+倒す（劣化ガード）。
+
+**書き手は2つ（cmd_226 LIVENESS_TRACE_AT_TURN_START）**:
+- `scripts/stop_hook_inbox.sh`（AGENT_ID解決直後、ターンが**終わる**時）
+- `scripts/user_prompt_submit_hook.sh`（AGENT_ID解決直後、ターンが**始まる**時）
+
+Stop hookのみが書く設計だった当初、no_progress警報が実戦初回で誤検知した
+——原因は「ターンを終えぬほど長く働いている者＝守るべき相手のところにだけ
+証拠が無い」という逆相関構造。加えて、`/clear`のたびsession_idとともに
+transcriptのパスが変わるため、ターンを終えるまで痕跡は**前セッションの
+凍ったtranscript**を指し続ける第2の失敗様態も存在した（軍師実測F-4、
+`queue/reports/gunshi_report.yaml`の`gunshi_design_226_turn_start_liveness`）。
+UserPromptSubmit hookでも同一形式・同一パスへ書く（差し替え）ことで、
+両方の失敗様態が同じ一手で塞がる。書式・原子性（tmp書き→`mv -f`）は
+両hookで揃えてある。
+
+`AGENT_ID = shogun`では痕跡を書かぬ（Stop hookの扱いと揃える）——
+`baton_watchdog_list_agents()`が見るのは`queue/tasks/*.yaml`であり、
+`queue/tasks/shogun.yaml`は存在せぬためshogunはB-4bの評価対象外で、
+読み手が居ない。**将来`queue/tasks/shogun.yaml`が生まれたら、この
+判断は見直しを要する。**
+
+**閾値の妥当性**: 生きた4agentの実transcript（計4,150区間）を解析した
+ところ、ターン内の追記間隔は最大503秒（p99は55秒）、ターン間の空白は
+最小でも4,951秒——両者は明確に分離しており、`liveness_stall_after_sec`
+の既定値1800秒はその谷の中に在る（ターン内最大の3.6倍、ターン間最小の
+0.36倍）。すなわち本信号は「長考中」と「バトンを抱えたまま止まって
+いる」を実際に区別できる。
 
 ## Project Management
 
