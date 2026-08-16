@@ -156,6 +156,11 @@ DEFAULT_BATON_WATCHDOG = {
     # 煩い」という理由だけで引き上げると、将軍への督促間隔も黙って
     # 一緒に伸びる——値を変える際はこの結合を思い出すこと。
     "baton_lost_repeat_after_sec": 900,
+    # cmd_226: B-4bのゲートB(生存痕跡)専用の閾値。ゲートAの
+    # progress_stall_after_secとは意味の異なる別の時計であり、流用しない
+    # (痕跡=shogun_transcript_<agent>の指し先mtimeがこの秒数以上
+    # 進んでいなければ「生存の証拠なし」とみなし発火側へ倒す)。
+    "liveness_stall_after_sec": 1800,
     "usage_warn_pct": 80,
     "usage_resume_below_pct": 50,
     "usage_check_interval_sec": 300,
@@ -193,7 +198,7 @@ def policy_get(key):
 
 if query in ("enabled", "periodic_clear_enabled", "baton_ntfy_quiet_enabled"):
     print("true" if policy_get(query) is True else "false")
-elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec", "baton_lost_repeat_after_sec", "baton_external_repeat_after_sec", "baton_external_default_budget_sec", "baton_ntfy_quiet_max_span_min", "baton_ntfy_deferred_max_entries"):
+elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec", "baton_lost_repeat_after_sec", "baton_external_repeat_after_sec", "baton_external_default_budget_sec", "baton_ntfy_quiet_max_span_min", "baton_ntfy_deferred_max_entries", "liveness_stall_after_sec"):
     print(int(policy_get(query)))
 elif query in ("baton_ntfy_quiet_start", "baton_ntfy_quiet_end", "baton_ntfy_quiet_tz"):
     print(str(policy_get(query)))

@@ -703,6 +703,12 @@ if [ "$SETUP_ONLY" = false ]; then
     rm -f /tmp/shogun_idle_* /tmp/shogun_busy_* /tmp/shogun_ups_* /tmp/shogun_session_*
     echo "idle/busy/ups/session flags cleared"
 
+    # cmd_226: 生存痕跡の対応付け印も掃除する。掃除漏れは安全な向き
+    # （残れば前セッションの凍ったtranscriptを指すだけでゲートBは
+    # 発火側へ倒れる）——PR#111が上のrm -f行を触るため、あえて行を
+    # 分けて衝突を避けている。
+    rm -f /tmp/shogun_transcript_*
+
     log_war "👑 全軍にエージェントCLIを召喚中..."
 
     # 将軍: CLI Adapter経由でコマンド構築

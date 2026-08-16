@@ -1761,6 +1761,7 @@ check_d1_once() {
 declare -A B4B_CONDITION_SINCE=()  # agent -> 条件(i)(ii)が揃い始めたepoch(0なら未計測)
 declare -A B4B_NOTIFIED=()         # 主経路(将軍inbox)の二重通知防止ガード（agentごと）
 declare -A B4B_NTFY_NOTIFIED=()    # 副経路(ntfy)の二重通知防止ガード（agentごと）
+declare -A B4B_SUPPRESSED=()       # cmd_226: ゲートB不成立で抑止中か（agentごと。遷移ログ用）
 
 # queue/tasks/*.yaml が存在するエージェント名を1行1件で返す
 # （ファイル名から拡張子を除いたもの）。
@@ -1854,10 +1855,62 @@ baton_watchdog_agent_progress_mtime() {
     echo "$max"
 }
 
+# ═══════════════════════════════════════════════════════════════
+# cmd_226 / LIVENESS_TRACE_GATE_B: B-4bのゲートB（生存痕跡）
+# ═══════════════════════════════════════════════════════════════
+# 痕跡を読む箇所はこの3関数の内側に限定する（AC-3）。呼び手には
+# 「生存の証拠が無い（＝発火側）」という既に倒れた真偽値しか渡さぬ。
+
+# 痕跡の指し先のmtimeを返す。取得できなければ非0（＝証拠なし）。
+# 【劣化ガードの唯一の実装箇所】ここを通らぬ痕跡の読み方を
+# 足してはならぬ。
+baton_watchdog_agent_liveness_mtime() {
+    local agent="$1" marker path m
+    marker="${IDLE_FLAG_DIR:-/tmp}/shogun_transcript_${agent}"
+    [ -f "$marker" ] || return 1
+    path=$(head -1 "$marker" 2>/dev/null) || return 1
+    [ -n "$path" ] || return 1
+    case "$path" in /*) ;; *) return 1 ;; esac   # 絶対パスのみ受理
+    [ -f "$path" ] || return 1
+    baton_watchdog_liveness_collision "$agent" "$path" && return 1
+    m=$(baton_watchdog_file_mtime "$path") || return 1
+    [ -n "$m" ] || return 1
+    echo "$m"
+}
+
+# 別エージェントの印が同じ指し先を持つなら衝突とみなす。
+# hookのagent_id誤解決（cmd_217で実証済み）により2エージェントの印が
+# 同一transcriptを指す事態への安全網——正常時は起こり得ぬ（session_id
+# は一意）ゆえ、同一パスの重複は誤解決の確実な指紋である。
+baton_watchdog_liveness_collision() {
+    local agent="$1" path="$2" f other
+    for f in "${IDLE_FLAG_DIR:-/tmp}"/shogun_transcript_*; do
+        [ -f "$f" ] || continue
+        other=$(basename "$f"); other="${other#shogun_transcript_}"
+        [ "$other" = "$agent" ] && continue
+        [ "$(head -1 "$f" 2>/dev/null)" = "$path" ] && return 0
+    done
+    return 1
+}
+
+# ゲートB本体。真(0)＝生存の証拠なし＝発火側。
+# 副産物として B4B_LIVENESS_AGE にログ用の齢を残す。
+B4B_LIVENESS_AGE=""
+baton_watchdog_agent_liveness_stalled() {
+    local agent="$1" now="$2" threshold="$3" m age
+    m=$(baton_watchdog_agent_liveness_mtime "$agent") || {
+        B4B_LIVENESS_AGE="unknown"
+        return 0            # 証拠なし → 発火側（劣化ガード）
+    }
+    age=$((now - m))
+    B4B_LIVENESS_AGE="$age"
+    [ "$age" -ge "$threshold" ]
+}
+
 # B-4bを1回だけ判定する。check_once()・check_d1_once()とは完全に独立した
 # 関数であり、それらを呼ばない・その内部にも触れない。
 check_b4b_once() {
-    local agent now stall_threshold ntfy_threshold
+    local agent now stall_threshold ntfy_threshold liveness_threshold
     local progress_mtime stalled_for elapsed task_id
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
@@ -1867,6 +1920,7 @@ check_b4b_once() {
     now=$(date +%s)
     stall_threshold=$(baton_watchdog_query progress_stall_after_sec)
     ntfy_threshold=$(baton_watchdog_query baton_b4b_ntfy_after_sec)
+    liveness_threshold=$(baton_watchdog_query liveness_stall_after_sec)
 
     while IFS= read -r agent; do
         [ -n "$agent" ] || continue
@@ -1876,28 +1930,52 @@ check_b4b_once() {
             stalled_for=$((now - progress_mtime))
 
             if [ "$stalled_for" -ge "$stall_threshold" ]; then
-                if [ "${B4B_CONDITION_SINCE[$agent]:-0}" -eq 0 ]; then
-                    B4B_CONDITION_SINCE[$agent]=$now
-                fi
-                elapsed=$((now - B4B_CONDITION_SINCE[$agent]))
-
-                # 主経路: 将軍inbox通知。既存どおり検知した時点で無条件・
-                # 即座に発火する（progress_stall_after_sec秒分の無更新
-                # 自体が継続の証拠であり、追加の待機は挟まない）。
-                if [ "${B4B_NOTIFIED[$agent]:-0}" -eq 0 ]; then
-                    task_id=$(baton_watchdog_task_id "$agent")
-                    baton_watchdog_notify_shogun "no_progress: agent=${agent} task_id=${task_id} stalled_for=${stalled_for}s (バトン保持のまま${stall_threshold}s+無進捗)"
-                    B4B_NOTIFIED[$agent]=1
-                fi
-
-                # 副経路: ntfy（主のスマホ）。エージェントごとに独立した
-                # 閾値・ガードで管理する。失敗許容——失敗してもログに
-                # 残すのみで将軍inbox通知には無関係。
-                if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "${B4B_NTFY_NOTIFIED[$agent]:-0}" -eq 0 ]; then
-                    if ! branch_policy_notify "no_progress: agent=${agent} stalled_for=${stalled_for}s (${ntfy_threshold}s+検知継続・ntfy)"; then
-                        echo "[$(date)] [baton_watchdog] B-4b ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+                # cmd_226: ゲートB（生存痕跡）。ゲートAが成立していても
+                # 生存の証拠があれば抑止する——ANDである以上、既存の
+                # 発火経路が緩む側へは一切変わらない。
+                if baton_watchdog_agent_liveness_stalled "$agent" "$now" "$liveness_threshold"; then
+                    # ── 従来どおりの発火経路（一切変更しない） ──
+                    if [ "${B4B_SUPPRESSED[$agent]:-0}" -eq 1 ]; then
+                        echo "[$(date)] [baton_watchdog] B-4b gateB re-armed: agent=${agent} liveness_age=${B4B_LIVENESS_AGE}s" >&2
+                        B4B_SUPPRESSED[$agent]=0
                     fi
-                    B4B_NTFY_NOTIFIED[$agent]=1
+
+                    if [ "${B4B_CONDITION_SINCE[$agent]:-0}" -eq 0 ]; then
+                        B4B_CONDITION_SINCE[$agent]=$now
+                    fi
+                    elapsed=$((now - B4B_CONDITION_SINCE[$agent]))
+
+                    # 主経路: 将軍inbox通知。既存どおり検知した時点で無条件・
+                    # 即座に発火する（progress_stall_after_sec秒分の無更新
+                    # 自体が継続の証拠であり、追加の待機は挟まない）。
+                    if [ "${B4B_NOTIFIED[$agent]:-0}" -eq 0 ]; then
+                        task_id=$(baton_watchdog_task_id "$agent")
+                        baton_watchdog_notify_shogun "no_progress: agent=${agent} task_id=${task_id} stalled_for=${stalled_for}s (バトン保持のまま${stall_threshold}s+無進捗)"
+                        B4B_NOTIFIED[$agent]=1
+                    fi
+
+                    # 副経路: ntfy（主のスマホ）。エージェントごとに独立した
+                    # 閾値・ガードで管理する。失敗許容——失敗してもログに
+                    # 残すのみで将軍inbox通知には無関係。
+                    if [ "$elapsed" -ge "$ntfy_threshold" ] && [ "${B4B_NTFY_NOTIFIED[$agent]:-0}" -eq 0 ]; then
+                        if ! branch_policy_notify "no_progress: agent=${agent} stalled_for=${stalled_for}s (${ntfy_threshold}s+検知継続・ntfy)"; then
+                            echo "[$(date)] [baton_watchdog] B-4b ntfy notify failed (branch_policy_notify non-zero); shogun inbox notification unaffected" >&2
+                        fi
+                        B4B_NTFY_NOTIFIED[$agent]=1
+                    fi
+                else
+                    # ── ゲートA成立・ゲートB不成立 → 抑止 ──
+                    if [ "${B4B_SUPPRESSED[$agent]:-0}" -eq 0 ]; then
+                        echo "[$(date)] [baton_watchdog] B-4b suppressed: agent=${agent} gateA=true gateB=false stalled_for=${stalled_for}s liveness_age=${B4B_LIVENESS_AGE}s" >&2
+                        B4B_SUPPRESSED[$agent]=1
+                    fi
+                    # 抑止中は起点を巻き戻す（cmd_226 state_semantics）——
+                    # ゲートBが倒れた瞬間「30分前から死んでいた」ように
+                    # 見えるのを防ぐ。事実は「artifactは止まっていたが
+                    # 当人は生きていた」である。
+                    B4B_CONDITION_SINCE[$agent]=0
+                    B4B_NOTIFIED[$agent]=0
+                    B4B_NTFY_NOTIFIED[$agent]=0
                 fi
             else
                 # 条件(ii)が崩れた＝進捗が観測された。次に条件が揃った
@@ -1905,12 +1983,14 @@ check_b4b_once() {
                 B4B_CONDITION_SINCE[$agent]=0
                 B4B_NOTIFIED[$agent]=0
                 B4B_NTFY_NOTIFIED[$agent]=0
+                B4B_SUPPRESSED[$agent]=0
             fi
         else
             # 条件(i)が崩れた＝バトンを保持していない（未着手 or 納品済み）。
             B4B_CONDITION_SINCE[$agent]=0
             B4B_NOTIFIED[$agent]=0
             B4B_NTFY_NOTIFIED[$agent]=0
+            B4B_SUPPRESSED[$agent]=0
         fi
     done < <(baton_watchdog_list_agents)
 }
