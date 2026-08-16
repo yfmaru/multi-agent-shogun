@@ -501,3 +501,36 @@ HARNESS
     run bash -c "source '$harness' && stall_busy"
     [ "$status" -eq 0 ] || { echo "stall_busy must still report busy via the screen-side OR term even though marks are inverted; output: $output"; false; }
 }
+
+# ─── 軍師QC追加（cmd_229 QC-1/QC-2）─────────────────────────────
+# 変異試験の独立検算で、下の2枝を捕らえる試験が1つも無いことを実測した。
+# どちらも挙動は正しいが、無検査のまま着地すれば次の改修で無言で崩れる。
+#
+#   QC-1 (M7a): 判定規則6の「未知の画面形状 → unknown」。TC-GATE-01の
+#        検体（空capture）は規則1で先に落ちるため、この受け皿——AC4が
+#        P3（未知の画面はアンカー列挙で尽くせぬ）に対して置いた
+#        ホワイトリストの底——には一度も触れていなかった。
+#   QC-2 (Mhint): safe判定の `bypass permissions on` 枝。welcome検体は
+#        裸の❯も併せ持つため、この枝を消しても全試験が緑のままであった。
+#        本番paneの末尾ヒント行は幅49で `cycle` が切り詰められるため、
+#        アンカーの選び方そのものが設計判断（§2 anchor_note）である。
+
+@test "TC-GATE-07 (QC-1): an unrecognized screen shape falls through to unknown (rule 6 — the whitelist floor that P3 relies on)" {
+    setup_lib_only
+    # モーダル脚注も 'esc to interrupt' も積まれた入力行も裸プロンプトも
+    # 安全ヒントも無い画面。ホワイトリストの底に落ちねばならぬ。
+    MOCK_CAPTURE_PANE=$'Some future Claude Code UI nobody has seen yet\nwith two perfectly ordinary looking lines'
+    run pane_input_safety "fake:0.0"
+    [ "$output" = "unknown" ] || {
+        echo "未知の画面形状は unknown へ落ちねばならぬ (AC4/P3)。got: $output"; false; }
+}
+
+@test "TC-GATE-08 (QC-2): the safe-hint anchor alone classifies safe, with no bare prompt present (width-49 truncated form)" {
+    setup_lib_only
+    # 幅49の足軽6号・7号で実測された切り詰め形（`cycle` が消えている）。
+    # 裸の❯を含めぬことで、この枝だけを単独で検査する。
+    MOCK_CAPTURE_PANE=$'────────────────────────\n  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to      \xc2\xb7'
+    run pane_input_safety "fake:0.0"
+    [ "$output" = "safe" ] || {
+        echo "安全ヒント行だけでも safe と判ぜねば、幅49のpaneへEnterが届かなくなる。got: $output"; false; }
+}
