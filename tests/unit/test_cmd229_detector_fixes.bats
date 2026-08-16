@@ -17,7 +17,7 @@
 # テスト構成:
 #   TC-PEEL-01: G1（モーダル+積まれた1行）→ 3述語すべてbusy/true
 #   TC-PEEL-02: G1から積まれた行を除いたもの → 3述語すべて不変（保存）
-#   TC-PEEL-03: G7（モーダル+積まれた2行）→ 深い窓で3述語すべて拾う
+#   TC-PEEL-03: G7（モーダル+積まれた複数行の貼り付け）→ 深い窓で3述語すべて拾う
 #   TC-PEEL-04: G6（許可確認ダイアログ+積まれたnudge）→ pane_awaiting_input=true
 #   TC-GATE-01: G9（空capture）→ unknown
 #   TC-GATE-02: G8（'esc to interrupt'）→ working
@@ -44,10 +44,22 @@ G1_CAPTURE=$'\xe2\x9d\xaf Call the AskUserQuestion tool right now to ask me\n  t
 # G2: same as G1 but without the queued line (footer is the true bottom).
 G2_CAPTURE=$'\xe2\x9d\xaf Call the AskUserQuestion tool right now to ask me\n  to pick a color, with options red, blue, and green.\n  Do not do anything else.\n\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n \xe2\x98\x90 Color\n\nPick a color:\n\n\xe2\x9d\xaf 1. Red\n    Red\n 2. Blue\n    Blue\n 3. Green\n    Green\n 4. Type something.\n\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n 5. Chat about this\n\nEnter to select \xc2\xb7 \xe2\x86\x91/\xe2\x86\x93 to navigate \xc2\xb7 Esc to cancel'
 
-# G7: G1 with a SECOND queued row appended (no prompt glyph — a wrapped
-# continuation), pushing the footer/blank separator to depth 6 in a 10-line
-# window (AC-3: tail -5 alone cannot recover it, tail -10 can).
-G7_CAPTURE="${G1_CAPTURE}"$'\n  --force'
+# G7: G2 (footer, no queued content) + a DOUBLE blank line + a 4-row
+# continuation block (no prompt glyph — a wrapped multi-line paste).
+# Two things had to be true for this specimen to earn its keep as a
+# mutation-battery guard (both verified by actually reverting the
+# corresponding code and confirming red — see git history of this file):
+#   - The footer must be pushed to position 7-from-bottom. A single
+#     extra queued row (position 4) is NOT enough — tail -5's own
+#     window already reaches that. AGENT_STATUS_DEEP_TAIL=10 only
+#     matters once the gap is this large (M4).
+#   - The blank line immediately below the footer must be DOUBLED, not
+#     single. A single blank does not distinguish the deep-scan awk's
+#     `if(b!="")prev=b` guard from an unconditional `prev=b` — only a
+#     second, immediately-following blank line (which resets b to ""
+#     before the unconditional assignment would fire) exposes it (M6,
+#     gunshi_report.yaml awk_note).
+G7_CAPTURE="${G2_CAPTURE}"$'\n\n\n\xe2\x9d\xaf /clear\n  --force\n  --dry-run\n  --verbose'
 
 # G6: REAL_BUSY_TAIL (same permission-dialog footer captured live for
 # cmd_209/cmd_219 — tests/unit/test_liveness_tick.bats) with a queued nudge
@@ -110,7 +122,7 @@ setup_lib_only() {
     [ "$status" -eq 0 ] || { echo "expected awaiting_input without peeling, got $status"; false; }
 }
 
-@test "TC-PEEL-03: G7 (modal footer + 2 queued lines) — deep window (10) still recovers the footer" {
+@test "TC-PEEL-03: G7 (modal footer + a multi-row queued paste) — deep window (10) still recovers the footer" {
     setup_lib_only
     MOCK_CAPTURE_PANE="$G7_CAPTURE"
     run agent_is_busy_check "fake:0.0" claude
@@ -194,6 +206,57 @@ teardown() {
     rm -rf "$TEST_TMPDIR"
 }
 
+@test "TC-GATE-01b: send_wakeup sends no Enter at all when pane_input_safety=unknown (G9, empty capture) — full gate integration, not just the unit-level verdict" {
+    local harness="$TEST_TMPDIR/test_harness.sh"
+    cat > "$harness" << HARNESS
+#!/bin/bash
+AGENT_ID="gate01b_agent"
+PANE_TARGET="test:0.0"
+CLI_TYPE="claude"
+INBOX="$TEST_INBOX_DIR/gate01b_agent.yaml"
+LOCKFILE="\${INBOX}.lock"
+SCRIPT_DIR="$PROJECT_ROOT"
+export IDLE_FLAG_DIR="$TEST_TMPDIR"
+touch "$TEST_TMPDIR/shogun_idle_gate01b_agent"
+
+tmux() {
+    echo "tmux \$*" >> "$MOCK_LOG"
+    if echo "\$*" | grep -q "capture-pane"; then
+        printf '%s' ""
+        return 0
+    fi
+    if echo "\$*" | grep -q "send-keys"; then
+        return 0
+    fi
+    if echo "\$*" | grep -q "show-options"; then
+        echo ""
+        return 0
+    fi
+    if echo "\$*" | grep -q "list-clients"; then
+        return 0
+    fi
+    if echo "\$*" | grep -q "display-message"; then
+        echo "mock_session"
+        return 0
+    fi
+    return 0
+}
+timeout() { shift; "\$@"; }
+pgrep() { return 1; }
+sleep() { :; }
+export -f tmux timeout pgrep sleep
+
+export __INBOX_WATCHER_TESTING__=1
+source "$WATCHER_SCRIPT"
+HARNESS
+    chmod +x "$harness"
+
+    run bash -c "source '$harness' && send_wakeup 1"
+    [ "$status" -eq 0 ] || { echo "send_wakeup should still return 0 (daemon-safe); output: $output"; false; }
+    echo "$output" | grep -qF "pane_input_safety=unknown" || { echo "expected the gate to log unknown; output: $output"; false; }
+    ! grep -qE "send-keys -t test:0\.0 Enter$" "$MOCK_LOG" || { echo "unknown must never be treated as safe — this is the exact hole M7 (the AC-4 mutation battery's core mutation) reopens; log: $(cat "$MOCK_LOG")"; false; }
+}
+
 @test "TC-TOCTOU-01: send_wakeup aborts before Enter when the gate flips to modal mid-retry (untouched unread)" {
     local harness="$TEST_TMPDIR/test_harness.sh"
     cat > "$harness" << HARNESS
@@ -254,6 +317,45 @@ HARNESS
     [ "$status" -eq 0 ] || { echo "send_wakeup should still return 0 (daemon-safe); output: $output"; false; }
     echo "$output" | grep -qF "TOCTOU guard" || { echo "expected the TOCTOU abort log line; output: $output"; false; }
     ! grep -qE "send-keys -t test:0\.0 Enter$" "$MOCK_LOG" || { echo "Enter must NOT have been sent once the gate flipped to modal; log: $(cat "$MOCK_LOG")"; false; }
+}
+
+@test "AC-6-STREAK: unknown_gate_track_streak notifies exactly once at the threshold, not before, and resets on a non-unknown verdict" {
+    local harness="$TEST_TMPDIR/test_harness.sh"
+    local ntfy_log="$TEST_TMPDIR/ntfy.log"
+    > "$ntfy_log"
+    cat > "$harness" << HARNESS
+#!/bin/bash
+AGENT_ID="streak_agent"
+PANE_TARGET="test:0.0"
+CLI_TYPE="claude"
+SCRIPT_DIR="$PROJECT_ROOT"
+export IDLE_FLAG_DIR="$TEST_TMPDIR"
+stall_policy_query() { echo "5"; }
+branch_policy_notify() { echo "NOTIFY: \$1" >> "$ntfy_log"; return 0; }
+export -f stall_policy_query branch_policy_notify
+export __INBOX_WATCHER_TESTING__=1
+source "$WATCHER_SCRIPT"
+HARNESS
+    chmod +x "$harness"
+
+    run bash -c "source '$harness'
+        for i in 1 2 3 4; do unknown_gate_track_streak unknown; done
+        [ -s '$ntfy_log' ] && echo 'NOTIFIED_TOO_EARLY'
+        unknown_gate_track_streak unknown
+        [ -s '$ntfy_log' ] || echo 'NOT_NOTIFIED_AT_THRESHOLD'
+        unknown_gate_track_streak safe
+        unknown_gate_track_streak unknown
+        unknown_gate_track_streak unknown
+        unknown_gate_track_streak unknown
+        unknown_gate_track_streak unknown
+        unknown_gate_track_streak unknown
+        n=\$(grep -c NOTIFY '$ntfy_log')
+        echo \"NOTIFY_COUNT=\$n\"
+    "
+    [ "$status" -eq 0 ] || false
+    ! echo "$output" | grep -qF "NOTIFIED_TOO_EARLY" || { echo "must not notify before the 5th consecutive unknown; output: $output"; false; }
+    ! echo "$output" | grep -qF "NOT_NOTIFIED_AT_THRESHOLD" || { echo "must notify exactly at the 5th consecutive unknown; output: $output"; false; }
+    echo "$output" | grep -qF "NOTIFY_COUNT=2" || { echo "expected exactly 2 notifications total (5th of the first streak + 5th of the second, after a safe verdict reset the counter); output: $output"; false; }
 }
 
 @test "TC-RESTART-01a: init_turn_state_marks preserves marks when the CLI predates them (保存側)" {
