@@ -30,6 +30,104 @@
 #     Gate 2: 類型Aの検知（is_stalled_pane） — unknownならEscapeのみ、okなら全段
 # ═══════════════════════════════════════════════════════════════
 
+# ─── init_turn_state_marks (cmd_229 AC-7/S-3) ───
+# Defined here, before the testing guard below, for two reasons: (1) bats
+# can call it directly with mocked tmux/ps/stat regardless of
+# __INBOX_WATCHER_TESTING__, and (2) the guard's own body calls it at
+# script-load time in production mode — a function def placed after that
+# call site is simply not yet callable ("command not found" under set -e,
+# which kills the whole watcher before the main loop ever starts; this is
+# not hypothetical, an E2E run caught it). See defect2_design.
+# reference_implementation in queue/reports/gunshi_report.yaml for the
+# design this implements almost verbatim.
+#
+# final_rule:
+#   cli_start   := now - etimes(CLIプロセス)
+#   newest_mark := max(mtime(busy印), mtime(idle印))   （どちらも無ければ -∞）
+#   if 印が1つも無い OR cli_start > newest_mark:
+#       touch idle印        # 真に新しいCLI。welcome画面＝idleで正しい
+#   else:
+#       何もせぬ（ログのみ）  # 印は走っているCLIのものである。触るな
+#
+# なぜこれで十分か（AC3 非可逆性との整合）: この規則は状態を保存する
+# だけで生成せぬ。busyを作りもせず、idleを作りもせず、既にある真実を
+# そのまま残す。既に反転してしまった印（idle印>busy印）は直しはせぬ
+# ——欠陥1の是正（stall_busy()のOR右項、画面側）が回復経路になる。
+init_turn_state_marks() {
+    local flag_dir="${IDLE_FLAG_DIR:-/tmp}"
+    local busy_flag="${flag_dir}/shogun_busy_${AGENT_ID}"
+    local idle_flag="${flag_dir}/shogun_idle_${AGENT_ID}"
+
+    local newest=-1 m t
+    for m in "$busy_flag" "$idle_flag"; do
+        [ -f "$m" ] || continue
+        t=$(stat -c %Y "$m" 2>/dev/null || echo -1)
+        if [ "$t" -gt "$newest" ] 2>/dev/null; then
+            newest="$t"
+        fi
+    done
+
+    if [ "$newest" -lt 0 ]; then
+        touch "$idle_flag"
+        echo "[$(date)] Created initial idle flag for $AGENT_ID (no prior marks)" >&2
+        return 0
+    fi
+
+    # CLI本体の起動時刻を求める。pane_pid は pane のシェルであり CLI ではない
+    # （実測: cmd_229 §5, gunshi_report.yaml correction_to_rca_draft ——
+    # RCA試作案の pane_pid=etimes 直用は switch_cli.sh によるCLI入替を
+    # 検知できず誤り）。ps --ppid でその子から CLI を探す。pgrep は使わぬ
+    # （CLAUDE.md「pgrep Self-Match Pitfall」— ラッパのcmdlineに自己マッチ）。
+    local pane_pid cli_etimes cli_start=-1
+    pane_pid=$(timeout 2 tmux display-message -t "$PANE_TARGET" -p '#{pane_pid}' 2>/dev/null || true)
+    if [ -n "$pane_pid" ]; then
+        # Bounded manually, not via `timeout ps ...`: measured live (cmd_229
+        # E2E) that `timeout`'s own child/FD handling does not reliably
+        # bound `ps` when this function runs inside a deeply-backgrounded
+        # subprocess tree (bats → backgrounded watcher) — the command
+        # substitution hung waiting on a pipe that never closed, even with
+        # `timeout -k`. This has never been observed against a real pane's
+        # watcher process (only in that nested test harness), but the
+        # fallback must be bulletproof regardless of why — an unbounded
+        # wait here blocks the whole watcher forever, which is strictly
+        # worse than the "cannot identify CLI" degradation this function
+        # already has a designed answer for.
+        local ps_tmp
+        ps_tmp="$(mktemp "${TMPDIR:-/tmp}/shogun_ps_ppid.XXXXXX" 2>/dev/null || echo "/tmp/shogun_ps_ppid.$$")"
+        ps --ppid "$pane_pid" -o etimes=,comm= >"$ps_tmp" 2>/dev/null &
+        local ps_bg_pid=$!
+        local ps_waited=0
+        while kill -0 "$ps_bg_pid" 2>/dev/null && [ "$ps_waited" -lt 20 ]; do
+            sleep 0.1
+            ps_waited=$((ps_waited + 1))
+        done
+        if kill -0 "$ps_bg_pid" 2>/dev/null; then
+            kill -9 "$ps_bg_pid" 2>/dev/null || true
+        fi
+        wait "$ps_bg_pid" 2>/dev/null || true
+        cli_etimes=$(awk -v c="$CLI_TYPE" '$2==c {print $1; exit}' "$ps_tmp" 2>/dev/null)
+        rm -f "$ps_tmp" 2>/dev/null || true
+        if [ -n "$cli_etimes" ]; then
+            cli_start=$(( $(date +%s) - cli_etimes ))
+        fi
+    fi
+
+    # degradation_direction (gunshi_report.yaml): CLIプロセスを特定できぬ
+    # 場合（ps失敗・CLIが直接の子でない・comm名が違う）はcli_start=-1の
+    # ままとなり、保存側へ倒れる。理由は両側の失敗の有界性が非対称だから
+    # ——保存側の誤り(真に新しいCLIが古いbusy印を引き継ぐ)は300秒
+    # stale-busy網が解く(有界)。touch側の誤り(欠陥2の再演)は解く者が
+    # 居らぬ(無界)。cli_start=-1のとき `$cli_start -gt $newest` は常に
+    # 偽ゆえ、下のif文はこの縮退方向を自然に満たす（追加分岐は不要）。
+    if [ "$cli_start" -ge 0 ] && [ "$cli_start" -gt "$newest" ]; then
+        touch "$idle_flag"
+        echo "[$(date)] Created initial idle flag for $AGENT_ID (CLI newer than marks — fresh CLI)" >&2
+    else
+        echo "[$(date)] Preserving turn-state marks for $AGENT_ID (marks belong to the running CLI; cli_start=$cli_start newest_mark=$newest)" >&2
+    fi
+    return 0
+}
+
 # ─── Testing guard ───
 # When __INBOX_WATCHER_TESTING__=1, only function definitions are loaded.
 # Argument parsing, inotifywait check, and main loop are skipped.
@@ -69,9 +167,13 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
     # underneath keeps running mid-turn: the fresh watcher process would blow
     # away a live busy印 and go permanently blind to that turn (2026-08-16
     # RCA: exactly this, for 48 minutes). init_turn_state_marks() (defined
-    # below, outside this testing guard, so bats can call it directly)
-    # distinguishes the two cases by comparing the CLI process's own start
-    # time against the marks already on disk.
+    # above this testing guard — it must be, since this call executes at
+    # script-load time before the guard's body would otherwise define it;
+    # a real E2E run caught this the first time it was defined below the
+    # call site: "command not found", inbox_watcher exiting under set -e
+    # before ever reaching the main loop) distinguishes the two cases by
+    # comparing the CLI process's own start time against the marks already
+    # on disk.
     if [[ "$CLI_TYPE" == "claude" ]]; then
         init_turn_state_marks
     fi
@@ -156,75 +258,6 @@ if ! command -v timeout &>/dev/null; then
     }
   fi
 fi
-
-# ─── init_turn_state_marks (cmd_229 AC-7/S-3) ───
-# Defined outside the testing guard above (unlike the old inline touch it
-# replaces) so bats can call it directly with mocked tmux/ps/stat — see
-# defect2_design.reference_implementation in queue/reports/gunshi_report.yaml
-# for the design this implements almost verbatim.
-#
-# final_rule:
-#   cli_start   := now - etimes(CLIプロセス)
-#   newest_mark := max(mtime(busy印), mtime(idle印))   （どちらも無ければ -∞）
-#   if 印が1つも無い OR cli_start > newest_mark:
-#       touch idle印        # 真に新しいCLI。welcome画面＝idleで正しい
-#   else:
-#       何もせぬ（ログのみ）  # 印は走っているCLIのものである。触るな
-#
-# なぜこれで十分か（AC3 非可逆性との整合）: この規則は状態を保存する
-# だけで生成せぬ。busyを作りもせず、idleを作りもせず、既にある真実を
-# そのまま残す。既に反転してしまった印（idle印>busy印）は直しはせぬ
-# ——欠陥1の是正（stall_busy()のOR右項、画面側）が回復経路になる。
-init_turn_state_marks() {
-    local flag_dir="${IDLE_FLAG_DIR:-/tmp}"
-    local busy_flag="${flag_dir}/shogun_busy_${AGENT_ID}"
-    local idle_flag="${flag_dir}/shogun_idle_${AGENT_ID}"
-
-    local newest=-1 m t
-    for m in "$busy_flag" "$idle_flag"; do
-        [ -f "$m" ] || continue
-        t=$(stat -c %Y "$m" 2>/dev/null || echo -1)
-        if [ "$t" -gt "$newest" ] 2>/dev/null; then
-            newest="$t"
-        fi
-    done
-
-    if [ "$newest" -lt 0 ]; then
-        touch "$idle_flag"
-        echo "[$(date)] Created initial idle flag for $AGENT_ID (no prior marks)" >&2
-        return 0
-    fi
-
-    # CLI本体の起動時刻を求める。pane_pid は pane のシェルであり CLI ではない
-    # （実測: cmd_229 §5, gunshi_report.yaml correction_to_rca_draft ——
-    # RCA試作案の pane_pid=etimes 直用は switch_cli.sh によるCLI入替を
-    # 検知できず誤り）。ps --ppid でその子から CLI を探す。pgrep は使わぬ
-    # （CLAUDE.md「pgrep Self-Match Pitfall」— ラッパのcmdlineに自己マッチ）。
-    local pane_pid cli_etimes cli_start=-1
-    pane_pid=$(timeout 2 tmux display-message -t "$PANE_TARGET" -p '#{pane_pid}' 2>/dev/null || true)
-    if [ -n "$pane_pid" ]; then
-        cli_etimes=$(ps --ppid "$pane_pid" -o etimes=,comm= 2>/dev/null \
-            | awk -v c="$CLI_TYPE" '$2==c {print $1; exit}')
-        if [ -n "$cli_etimes" ]; then
-            cli_start=$(( $(date +%s) - cli_etimes ))
-        fi
-    fi
-
-    # degradation_direction (gunshi_report.yaml): CLIプロセスを特定できぬ
-    # 場合（ps失敗・CLIが直接の子でない・comm名が違う）はcli_start=-1の
-    # ままとなり、保存側へ倒れる。理由は両側の失敗の有界性が非対称だから
-    # ——保存側の誤り(真に新しいCLIが古いbusy印を引き継ぐ)は300秒
-    # stale-busy網が解く(有界)。touch側の誤り(欠陥2の再演)は解く者が
-    # 居らぬ(無界)。cli_start=-1のとき `$cli_start -gt $newest` は常に
-    # 偽ゆえ、下のif文はこの縮退方向を自然に満たす（追加分岐は不要）。
-    if [ "$cli_start" -ge 0 ] && [ "$cli_start" -gt "$newest" ]; then
-        touch "$idle_flag"
-        echo "[$(date)] Created initial idle flag for $AGENT_ID (CLI newer than marks — fresh CLI)" >&2
-    else
-        echo "[$(date)] Preserving turn-state marks for $AGENT_ID (marks belong to the running CLI; cli_start=$cli_start newest_mark=$newest)" >&2
-    fi
-    return 0
-}
 
 # ─── Escalation state ───
 # Time-based escalation: track how long unread messages have been waiting

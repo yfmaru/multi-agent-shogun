@@ -67,7 +67,19 @@ wait_for_log() {
         "$E2E_QUEUE/queue/tasks/ashigaru1.yaml"
 
     # Keep mock in busy state before clear_command arrives.
-    send_to_pane "$ashigaru1_pane" "busy_hold 2"
+    # cmd_229: this must outlast the ~4s from here to the /clear write below
+    # (sleep 2 + watcher startup + sleep 2), or the mock genuinely finishes
+    # its busy period before the check runs and the test is asserting
+    # nothing. "busy_hold 2" used to pass anyway only because the mock's
+    # generic "$ " idle prompt matched none of agent_is_busy_check()'s idle
+    # anchors, so a stale "esc to interrupt" line lingering in the tail-5
+    # window kept tripping the catch-all busy-text scan well past when the
+    # mock had actually gone idle — the fix that made the mock's claude
+    # idle prompt a realistic bare "❯" (matching real Claude Code, needed
+    # for the AC-4 pane_input_safety() gate elsewhere in this file) closed
+    # that accidental loophole and exposed the true race. 8s gives a
+    # comfortable margin over the ~4s the setup below actually needs.
+    send_to_pane "$ashigaru1_pane" "busy_hold 8"
     sleep 2
 
     tmux set-option -p -t "$ashigaru1_pane" @agent_cli "copilot"

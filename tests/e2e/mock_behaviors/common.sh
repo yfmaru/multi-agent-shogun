@@ -150,7 +150,16 @@ show_prompt() {
         touch "${_flag_dir}/shogun_idle_${MOCK_AGENT_ID}" 2>/dev/null || true
     fi
     case "$cli_type" in
-        claude) echo -e "\n\$ " ;;
+        # cmd_229 AC-4: the strict claude-only pane_input_safety() gate
+        # requires a recognizable real-Claude-Code idle prompt (bare `❯`,
+        # or a "bypass permissions on" hint line) to classify a screen as
+        # `safe`. A generic "$ " shell prompt — realistic for no actual
+        # CLI — always fell through to `unknown` under the new gate and
+        # sent no Enter, timing out every E2E scenario that waits for the
+        # mock to receive a nudge/startup-prompt/clear (measured: 7
+        # E2E-008/009/010 cases). Match what AC6a's live capture of a real
+        # Claude Code idle screen actually showed.
+        claude) echo -e "\n❯ " ;;
         codex)  echo -e "\n? for shortcuts                100% context left\n\$ " ;;
         opencode) echo -e "\n  ┃\n  ┃  Ask anything...\n  ┃\n\n                                                ctrl+p commands\n" ;;
         *)      echo -e "\n\$ " ;;
