@@ -52,7 +52,12 @@ exit 1
 MOCK
     chmod +x "$MOCK_PGREP"
 
-    export MOCK_CAPTURE_PANE=""
+    # cmd_229 AC-4: pane_input_safety() now gates every claude-type Enter
+    # route; an empty capture classifies `unknown` (deny), not the old
+    # "not modal" (allow). Default to a bare idle prompt so tests that
+    # don't specifically exercise a modal/working/unknown fixture keep
+    # exercising the send path.
+    export MOCK_CAPTURE_PANE="❯"
     export MOCK_PANE_CLI=""
 
     cat > "$WATCHER_HARNESS" << HARNESS

@@ -1,0 +1,85 @@
+# cmd_229 AC6a — live modal capture provenance (2026-08-16, ashigaru3)
+#
+# Captured with a real `claude --dangerously-skip-permissions` process
+# (Claude Code v2.1.233) in a Test-Rules-5-compliant scratch tmux session
+# (`scratch_ashigaru3_cmd229_modal`, self-terminating `timeout -s HUP 1800
+# bash`, closed via `send-keys exit Enter` after capture — no kill/pkill
+# used), pane width 54 (ashigaru3's production width, per gunshi_report.yaml
+# AC6b measured_table). All captures via `tmux capture-pane -t <pane> -p -J`.
+#
+# The byte-exact fixture text (welcome screen, the real AskUserQuestion
+# modal, and the derived G1/G2/G7/G6/G8/G9 specimens) lives in
+# tests/unit/test_cmd229_detector_fixes.bats as WELCOME_CAPTURE /
+# G1_CAPTURE / G2_CAPTURE / G7_CAPTURE / G6_CAPTURE — embedding raw
+# terminal screen text (with its varying leading whitespace) here as YAML
+# scalars is fragile to indentation rules, so this file stays prose-only
+# and points at the bats file as the single source of truth for bytes.
+
+specimen_1_welcome_screen:
+  purpose: >-
+    TC-GATE-04 / decision_rule_if_welcome_is_unknown. Verdict measured:
+    SAFE (the bottom hint row contains "bypass permissions on", which is
+    the pane_input_safety() safe anchor — the row survives at width 54
+    without truncation; gunshi_report.yaml's width-49 truncation finding
+    does not apply here). R2 (send_startup_prompt) is NOT restricted to
+    the legacy binary gate.
+  source: real, unmodified live capture
+  where_the_bytes_live: "tests/unit/test_cmd229_detector_fixes.bats — WELCOME_CAPTURE"
+
+specimen_2_modal_no_queued_input:
+  purpose: >-
+    Triggered by prompting the nested claude instance to call the
+    AskUserQuestion tool ("pick a color: red/blue/green"). Same UI
+    family as the accident (cmd_229 RCA references "3. Type
+    something." — present as option 4). Footer text is byte-identical
+    to what the G1/G7/G6 specimens are built on.
+  source: real, unmodified live capture
+  where_the_bytes_live: "tests/unit/test_cmd229_detector_fixes.bats — G2_CAPTURE"
+
+honest_note_on_g1_g7:
+  title: "queued input UNDER an open modal — three live attempts did not reproduce it in one frame"
+  detail: |
+    Three live attempts to reproduce a visibly-queued line beneath an
+    open modal's footer in a single capture did NOT succeed:
+      1. Typing text via `send-keys -l` while the modal was already
+         open — the app appears to consume/discard non-navigation
+         keystrokes.
+      2. `send-keys -l` during the ~1s "thinking" window just before
+         the modal renders — the modal's own render pass appears to
+         replace the input line with no trace of the queued text.
+      3. `tmux paste-buffer` during the same window — this DID prove
+         the app retains a hidden input-buffer state across a modal
+         (the pasted "/clear" text reappeared at the prompt once the
+         modal was dismissed via Escape), but it stayed invisible for
+         the ENTIRE time the modal was on screen — it never rendered
+         in the same frame as the modal.
+
+    This is consistent with the defect1 mechanism being a genuine RACE
+    CONDITION in production (it took an automated 3x-retry storm hitting
+    a narrow timing window to manifest once in 8 days of fleet operation
+    — see gunshi_report.yaml the_defect_chain), not a steady-state
+    renderable UI state reachable through ordinary interactive typing.
+
+    Per this repository's own established precedent for this exact
+    class of bug (tests/integration/test_stall_detect_livepane.bats
+    T-MODAL-01..04, cmd_209 — the ORIGINAL modal-footer detection bug
+    was also reproduced via ANSI absolute-cursor-positioning synthesis,
+    not live interactive typing, because Claude Code paints its TUI
+    with absolute positioning that a terminal's own line-wrap can't
+    fake), G1/G7/G6 in the bats test are constructed the same way:
+    byte-identical real-captured content (specimen_2's modal, and the
+    REAL_BUSY_TAIL permission-dialog footer already captured live for
+    cmd_209/cmd_219 — see tests/unit/test_liveness_tick.bats) with a
+    deterministic queued-input row appended. The modal CONTENT is real;
+    the LAYERING (queued row below it) is synthesized to hit the exact
+    race window that live typing could not reliably reproduce in three
+    attempts. Exact construction and the byte math (which line lands
+    in which tail window, at which depth) is documented next to each
+    fixture definition in tests/unit/test_cmd229_detector_fixes.bats.
+
+ac6b_ac6c_note: |
+  AC6b (live fleet, no regression) and AC6c (watcher restart) are not
+  committed as static fixtures here — see the PR body for the
+  re-measured judgment table and the scratch-session restart simulation
+  output. AC6b is a live 9-pane snapshot that changes every run by
+  definition; AC6c uses synthetic marker files under a scratch tmpdir.

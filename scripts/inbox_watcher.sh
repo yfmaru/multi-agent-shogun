@@ -30,6 +30,104 @@
 #     Gate 2: 類型Aの検知（is_stalled_pane） — unknownならEscapeのみ、okなら全段
 # ═══════════════════════════════════════════════════════════════
 
+# ─── init_turn_state_marks (cmd_229 AC-7/S-3) ───
+# Defined here, before the testing guard below, for two reasons: (1) bats
+# can call it directly with mocked tmux/ps/stat regardless of
+# __INBOX_WATCHER_TESTING__, and (2) the guard's own body calls it at
+# script-load time in production mode — a function def placed after that
+# call site is simply not yet callable ("command not found" under set -e,
+# which kills the whole watcher before the main loop ever starts; this is
+# not hypothetical, an E2E run caught it). See defect2_design.
+# reference_implementation in queue/reports/gunshi_report.yaml for the
+# design this implements almost verbatim.
+#
+# final_rule:
+#   cli_start   := now - etimes(CLIプロセス)
+#   newest_mark := max(mtime(busy印), mtime(idle印))   （どちらも無ければ -∞）
+#   if 印が1つも無い OR cli_start > newest_mark:
+#       touch idle印        # 真に新しいCLI。welcome画面＝idleで正しい
+#   else:
+#       何もせぬ（ログのみ）  # 印は走っているCLIのものである。触るな
+#
+# なぜこれで十分か（AC3 非可逆性との整合）: この規則は状態を保存する
+# だけで生成せぬ。busyを作りもせず、idleを作りもせず、既にある真実を
+# そのまま残す。既に反転してしまった印（idle印>busy印）は直しはせぬ
+# ——欠陥1の是正（stall_busy()のOR右項、画面側）が回復経路になる。
+init_turn_state_marks() {
+    local flag_dir="${IDLE_FLAG_DIR:-/tmp}"
+    local busy_flag="${flag_dir}/shogun_busy_${AGENT_ID}"
+    local idle_flag="${flag_dir}/shogun_idle_${AGENT_ID}"
+
+    local newest=-1 m t
+    for m in "$busy_flag" "$idle_flag"; do
+        [ -f "$m" ] || continue
+        t=$(stat -c %Y "$m" 2>/dev/null || echo -1)
+        if [ "$t" -gt "$newest" ] 2>/dev/null; then
+            newest="$t"
+        fi
+    done
+
+    if [ "$newest" -lt 0 ]; then
+        touch "$idle_flag"
+        echo "[$(date)] Created initial idle flag for $AGENT_ID (no prior marks)" >&2
+        return 0
+    fi
+
+    # CLI本体の起動時刻を求める。pane_pid は pane のシェルであり CLI ではない
+    # （実測: cmd_229 §5, gunshi_report.yaml correction_to_rca_draft ——
+    # RCA試作案の pane_pid=etimes 直用は switch_cli.sh によるCLI入替を
+    # 検知できず誤り）。ps --ppid でその子から CLI を探す。pgrep は使わぬ
+    # （CLAUDE.md「pgrep Self-Match Pitfall」— ラッパのcmdlineに自己マッチ）。
+    local pane_pid cli_etimes cli_start=-1
+    pane_pid=$(timeout 2 tmux display-message -t "$PANE_TARGET" -p '#{pane_pid}' 2>/dev/null || true)
+    if [ -n "$pane_pid" ]; then
+        # Bounded manually, not via `timeout ps ...`: measured live (cmd_229
+        # E2E) that `timeout`'s own child/FD handling does not reliably
+        # bound `ps` when this function runs inside a deeply-backgrounded
+        # subprocess tree (bats → backgrounded watcher) — the command
+        # substitution hung waiting on a pipe that never closed, even with
+        # `timeout -k`. This has never been observed against a real pane's
+        # watcher process (only in that nested test harness), but the
+        # fallback must be bulletproof regardless of why — an unbounded
+        # wait here blocks the whole watcher forever, which is strictly
+        # worse than the "cannot identify CLI" degradation this function
+        # already has a designed answer for.
+        local ps_tmp
+        ps_tmp="$(mktemp "${TMPDIR:-/tmp}/shogun_ps_ppid.XXXXXX" 2>/dev/null || echo "/tmp/shogun_ps_ppid.$$")"
+        ps --ppid "$pane_pid" -o etimes=,comm= >"$ps_tmp" 2>/dev/null &
+        local ps_bg_pid=$!
+        local ps_waited=0
+        while kill -0 "$ps_bg_pid" 2>/dev/null && [ "$ps_waited" -lt 20 ]; do
+            sleep 0.1
+            ps_waited=$((ps_waited + 1))
+        done
+        if kill -0 "$ps_bg_pid" 2>/dev/null; then
+            kill -9 "$ps_bg_pid" 2>/dev/null || true
+        fi
+        wait "$ps_bg_pid" 2>/dev/null || true
+        cli_etimes=$(awk -v c="$CLI_TYPE" '$2==c {print $1; exit}' "$ps_tmp" 2>/dev/null)
+        rm -f "$ps_tmp" 2>/dev/null || true
+        if [ -n "$cli_etimes" ]; then
+            cli_start=$(( $(date +%s) - cli_etimes ))
+        fi
+    fi
+
+    # degradation_direction (gunshi_report.yaml): CLIプロセスを特定できぬ
+    # 場合（ps失敗・CLIが直接の子でない・comm名が違う）はcli_start=-1の
+    # ままとなり、保存側へ倒れる。理由は両側の失敗の有界性が非対称だから
+    # ——保存側の誤り(真に新しいCLIが古いbusy印を引き継ぐ)は300秒
+    # stale-busy網が解く(有界)。touch側の誤り(欠陥2の再演)は解く者が
+    # 居らぬ(無界)。cli_start=-1のとき `$cli_start -gt $newest` は常に
+    # 偽ゆえ、下のif文はこの縮退方向を自然に満たす（追加分岐は不要）。
+    if [ "$cli_start" -ge 0 ] && [ "$cli_start" -gt "$newest" ]; then
+        touch "$idle_flag"
+        echo "[$(date)] Created initial idle flag for $AGENT_ID (CLI newer than marks — fresh CLI)" >&2
+    else
+        echo "[$(date)] Preserving turn-state marks for $AGENT_ID (marks belong to the running CLI; cli_start=$cli_start newest_mark=$newest)" >&2
+    fi
+    return 0
+}
+
 # ─── Testing guard ───
 # When __INBOX_WATCHER_TESTING__=1, only function definitions are loaded.
 # Argument parsing, inotifywait check, and main loop are skipped.
@@ -61,11 +159,23 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
 
     echo "[$(date)] inbox_watcher started — agent: $AGENT_ID, pane: $PANE_TARGET, cli: $CLI_TYPE" >&2
 
-    # Fix: CLI starts at welcome screen = idle. Create idle flag so watcher
-    # doesn't false-busy deadlock waiting for a stop_hook that never fires.
+    # cmd_229 AC-7/S-3 (defect2_design PRESERVE_TURN_STATE_ACROSS_WATCHER_RESTART):
+    # this used to be an unconditional `touch idle印` — correct the first time
+    # this script ever starts for a pane (CLI starts at welcome screen = idle),
+    # but wrong every time the watcher itself is merely restarted (e.g. the
+    # Lord replacing it per CLAUDE.md's daemon-swap procedure) while the CLI
+    # underneath keeps running mid-turn: the fresh watcher process would blow
+    # away a live busy印 and go permanently blind to that turn (2026-08-16
+    # RCA: exactly this, for 48 minutes). init_turn_state_marks() (defined
+    # above this testing guard — it must be, since this call executes at
+    # script-load time before the guard's body would otherwise define it;
+    # a real E2E run caught this the first time it was defined below the
+    # call site: "command not found", inbox_watcher exiting under set -e
+    # before ever reaching the main loop) distinguishes the two cases by
+    # comparing the CLI process's own start time against the marks already
+    # on disk.
     if [[ "$CLI_TYPE" == "claude" ]]; then
-        touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}"
-        echo "[$(date)] Created initial idle flag for $AGENT_ID (CLI starts idle)" >&2
+        init_turn_state_marks
     fi
 
     # Source cli_adapter for get_startup_prompt() (Codex needs startup prompt after /new)
@@ -712,6 +822,63 @@ PY
     ) 200>"$LOCKFILE" 2>/dev/null
 }
 
+# ─── Enter-injection gate (cmd_229 AC-4, single unconditional-fail acceptance
+# criterion) ───
+# All 6 routes that can send Enter into a claude-type pane (R1 send_cli_command,
+# R2 send_startup_prompt, R3 send_context_reset, R4 send_wakeup, R5
+# send_wakeup_with_escape, R6 attempt_stall_recovery's stall ladder) call this
+# instead of the old binary pane_has_open_modal()/pane_awaiting_input() gates.
+# Non-claude panes keep whichever legacy binary predicate the route already
+# used (scope_of_strict_gate — gunshi_report.yaml §2: non-claude画面構えは
+# 本番不在で実測できておらぬ)。
+#
+# claude_pane_may_enter <pane_target> <cli_type> <legacy_predicate_name>
+# Returns 0 (allow) / 1 (deny). Logs the pane_input_safety() verdict and
+# feeds unknown_gate_track_streak() (AC-6) — every call site, claude and
+# non-claude, funnels through here so the streak counter sees the true
+# per-attempt rate regardless of which route triggered it.
+claude_pane_may_enter() {
+    local pane_target="$1" cli_type="$2" legacy_predicate="$3"
+
+    if [[ "$cli_type" == "claude" ]]; then
+        local verdict
+        verdict=$(pane_input_safety "$pane_target")
+        echo "[$(date)] [ENTER-GATE] $AGENT_ID: pane_input_safety=$verdict" >&2
+        unknown_gate_track_streak "$verdict"
+        [[ "$verdict" == "safe" || "$verdict" == "working" ]]
+        return
+    fi
+
+    # Non-claude: legacy two-value gate, unchanged (allow unless the legacy
+    # predicate reports true — i.e. modal/awaiting-input open).
+    ! "$legacy_predicate" "$pane_target"
+}
+
+# unknown_gate_track_streak <verdict> (cmd_229 AC-6)
+# A silently-suppressed Enter is the exact shape cmd_218 "鳴らぬ番犬" fixed
+# for stall detection — this closes the same hole for the AC-4 gate. Any
+# non-unknown verdict resets the streak and the one-shot notify flag (same
+# episode-reset pattern as STALL_NTFY_SENT / STALE_BUSY_NTFY_SENT).
+UNKNOWN_GATE_STREAK=${UNKNOWN_GATE_STREAK:-0}
+UNKNOWN_GATE_NTFY_SENT=${UNKNOWN_GATE_NTFY_SENT:-0}
+unknown_gate_track_streak() {
+    local verdict="$1"
+    if [[ "$verdict" != "unknown" ]]; then
+        UNKNOWN_GATE_STREAK=0
+        UNKNOWN_GATE_NTFY_SENT=0
+        return 0
+    fi
+    UNKNOWN_GATE_STREAK=$((UNKNOWN_GATE_STREAK + 1))
+    local threshold
+    threshold=$(stall_policy_query unknown_gate_notify_after 2>/dev/null) || threshold=5
+    if [ "$UNKNOWN_GATE_STREAK" -ge "$threshold" ] && [ "${UNKNOWN_GATE_NTFY_SENT:-0}" -eq 0 ]; then
+        UNKNOWN_GATE_NTFY_SENT=1
+        echo "[$(date)] [ENTER-GATE] $AGENT_ID: pane_input_safety=unknown が ${UNKNOWN_GATE_STREAK}回連続 — Enter送出を見送り中" >&2
+        type branch_policy_notify &>/dev/null && branch_policy_notify "${AGENT_ID}: pane_input_safety=unknownが${UNKNOWN_GATE_STREAK}回連続 — Enter送出を見送り中(未読が届かぬ可能性)" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # ─── Send CLI command via pty direct write ───
 # For /clear and /model only. These are CLI commands, not conversation messages.
 # CLI_TYPE別分岐: claude→そのまま, codex→/clear対応・/modelスキップ,
@@ -735,14 +902,16 @@ send_cli_command() {
     local effective_cli
     effective_cli=$(get_effective_cli_type)
 
-    # Modal gate (cmd_209 subtask_209_modal_gate_fix): this function sends
-    # C-c (line ~716) in addition to Enter. C-c during an open modal is a
-    # different kind of destruction (turn interruption) than Enter, so the
-    # entire route is gated here rather than gating Enter alone. Uses the
-    # narrow pane_has_open_modal() predicate, NOT agent_is_busy_check() —
-    # gating on busy-in-general would reintroduce the nudge-deadlock the
-    # idle-flag design already fears (spinner flicker → permanent stall).
-    if pane_has_open_modal "$PANE_TARGET"; then
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix; cmd_229 AC-4 R1): this
+    # function sends C-c (line ~716) in addition to Enter. C-c during an open
+    # modal is a different kind of destruction (turn interruption) than
+    # Enter, so the entire route is gated here rather than gating Enter
+    # alone. NOT agent_is_busy_check() — gating on busy-in-general would
+    # reintroduce the nudge-deadlock the idle-flag design already fears
+    # (spinner flicker → permanent stall). claude type uses the strict
+    # three-value gate (pane_input_safety via claude_pane_may_enter);
+    # non-claude keeps the legacy pane_has_open_modal() binary gate.
+    if ! claude_pane_may_enter "$PANE_TARGET" "$effective_cli" pane_has_open_modal; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing CLI command ($cmd)" >&2
         # cmd_220 subtask2 QC-1: this is a transient state, not a final
         # disposition — the modal will eventually close on its own. Tell the
@@ -941,12 +1110,19 @@ send_startup_prompt() {
         echo "[$(date)] [STARTUP] $AGENT_ID still busy after 15s — proceeding with startup prompt anyway" >&2
     fi
 
-    # Modal gate (cmd_209 subtask_209_modal_gate_fix): the busy-poll above
-    # proceeds anyway after 15s even if still busy, so it cannot be relied
-    # on to stop an Enter into an open modal. Check the narrow modal
-    # predicate right before sending — NOT agent_is_busy_check() (that would
-    # reintroduce the nudge-deadlock the idle-flag design already fears).
-    if pane_has_open_modal "$PANE_TARGET"; then
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix; cmd_229 AC-4 R2): the
+    # busy-poll above proceeds anyway after 15s even if still busy, so it
+    # cannot be relied on to stop an Enter into an open modal. Check right
+    # before sending — NOT agent_is_busy_check() (that would reintroduce the
+    # nudge-deadlock the idle-flag design already fears). claude type uses
+    # the strict three-value gate; non-claude keeps the legacy binary gate.
+    # decision_rule_if_welcome_is_unknown (gunshi_report.yaml §2-4): this is
+    # the one route where an unmeasured `unknown` verdict on the welcome
+    # screen could stop出陣 itself — see docs/architecture.md for the
+    # live-captured welcome-screen verdict this cmd measured (AC6a).
+    local startup_gate_cli
+    startup_gate_cli=$(get_effective_cli_type)
+    if ! claude_pane_may_enter "$PANE_TARGET" "$startup_gate_cli" pane_has_open_modal; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing startup prompt" >&2
         return 0  # Never return 1 — set -euo pipefail would kill the watcher daemon
     fi
@@ -994,13 +1170,14 @@ send_context_reset() {
         return 0
     fi
 
-    # Modal gate (cmd_209 subtask_209_modal_gate_fix): this function had no
-    # busy guard at all before this fix. Use the narrow pane_has_open_modal()
-    # predicate, not agent_is_busy_check() (see send_cli_command for why).
-    # cmd_217: modal-skip now returns 1 (defer) instead of 0 — the sole
-    # caller wraps this call in `if send_context_reset; then ...` so a
-    # non-zero return here means "retry next cycle", not "watcher dies".
-    if pane_has_open_modal "$PANE_TARGET"; then
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix; cmd_229 AC-4 R3): this
+    # function had no busy guard at all before this fix. Not
+    # agent_is_busy_check() (see send_cli_command for why). cmd_217:
+    # modal-skip now returns 1 (defer) instead of 0 — the sole caller wraps
+    # this call in `if send_context_reset; then ...` so a non-zero return
+    # here means "retry next cycle", not "watcher dies". claude type uses
+    # the strict three-value gate; non-claude keeps the legacy binary gate.
+    if ! claude_pane_may_enter "$PANE_TARGET" "$effective_cli" pane_has_open_modal; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing context reset" >&2
         return 1
     fi
@@ -1390,14 +1567,17 @@ send_wakeup() {
         return 0
     fi
 
-    # Modal gate (cmd_209 subtask_209_modal_gate_fix): the busy-check at
-    # 優先度3 above (agent_is_busy) is a no-op for claude agents — see RCA
-    # gunshi_rca_209_modal_autoclose.yaml. Add a narrow, separate gate here
-    # using pane_has_open_modal(), NOT agent_is_busy_check() (gating on
-    # busy-in-general would reintroduce the nudge-deadlock the idle-flag
-    # design already fears). Do NOT clear unread here — this only skips
-    # delivery, it does not mean delivery completed.
-    if pane_has_open_modal "$PANE_TARGET"; then
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix; cmd_229 AC-4 R4): the
+    # busy-check at 優先度3 above (agent_is_busy) is a no-op for claude
+    # agents — see RCA gunshi_rca_209_modal_autoclose.yaml. Add a narrow,
+    # separate gate here, NOT agent_is_busy_check() (gating on busy-in-general
+    # would reintroduce the nudge-deadlock the idle-flag design already
+    # fears). Do NOT clear unread here — this only skips delivery, it does
+    # not mean delivery completed. claude type uses the strict three-value
+    # gate; non-claude keeps the legacy binary gate.
+    local effective_cli_for_nudge
+    effective_cli_for_nudge=$(get_effective_cli_type)
+    if ! claude_pane_may_enter "$PANE_TARGET" "$effective_cli_for_nudge" pane_has_open_modal; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing nudge" >&2
         return 0
     fi
@@ -1411,8 +1591,6 @@ send_wakeup() {
     # Codex suggestion UI dismissal: typing any character dismisses the autocomplete
     # suggestion prompt (› Implement {feature} etc.) that traps idle agents.
     # Sequence: "x" (dismiss suggestion) → C-u (clear input) → nudge → Enter
-    local effective_cli_for_nudge
-    effective_cli_for_nudge=$(get_effective_cli_type)
     if [[ "$effective_cli_for_nudge" == "codex" ]]; then
         timeout 5 tmux send-keys -t "$PANE_TARGET" "x" 2>/dev/null || true
         sleep 0.3
@@ -1434,6 +1612,15 @@ send_wakeup() {
             continue
         fi
         sleep 0.3
+        # cmd_229 AC-5 TOCTOU: the gate above ran once, before the retry loop
+        # began. Up to 3 iterations of C-u+text+Enter (~1.1s each, 3s+ total)
+        # pass before this Enter fires — long enough for a modal to open in
+        # between (agent自身がAskUserQuestionをいつでも開き得る). Re-evaluate
+        # immediately before EACH Enter, not just once at entry.
+        if ! claude_pane_may_enter "$PANE_TARGET" "$effective_cli_for_nudge" pane_has_open_modal; then
+            echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal opened mid-retry — aborting nudge before Enter (TOCTOU guard, attempt $((attempt+1)))" >&2
+            return 0
+        fi
         timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null || true
         sleep 0.5
         if [[ "$effective_cli_for_nudge" == "codex" ]]; then
@@ -1534,11 +1721,14 @@ send_wakeup_with_escape() {
         return 0
     fi
 
-    # Modal gate (cmd_209 subtask_209_modal_gate_fix): claude/codex/opencode/
-    # antigravity already fall back to send_wakeup() above (gated there).
-    # This is the remaining raw path (copilot/kimi/etc.) — same narrow
-    # pane_has_open_modal() predicate, not agent_is_busy_check().
-    if pane_has_open_modal "$PANE_TARGET"; then
+    # Modal gate (cmd_209 subtask_209_modal_gate_fix; cmd_229 AC-4 R5):
+    # claude/codex/opencode/antigravity already fall back to send_wakeup()
+    # above (gated there — claude's own gate is unreachable here by
+    # construction). This is the remaining raw path (copilot/kimi/etc.) —
+    # claude_pane_may_enter() with the same legacy fallback as before, kept
+    # for symmetry with the other 5 routes should this function's early
+    # returns ever change.
+    if ! claude_pane_may_enter "$PANE_TARGET" "$effective_cli" pane_has_open_modal; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing Escape+nudge" >&2
         return 0
     fi
@@ -1719,23 +1909,31 @@ attempt_stall_recovery() {
 
     echo "[$(date)] [STALL] $AGENT_ID: still stalled after Escape — nudge" >&2
 
-    # Modal gate (cmd_216 F-3 ii → cmd_219 STALL_AWAITING_INPUT_GATE): this
-    # route sends "inbox?" + Enter directly via tmux send-keys, bypassing
-    # send_wakeup entirely — so PR#97's 5-route gate table never covered it
-    # (gunshi QC finding, the 6th route). Enter into an open modal
-    # confirms/selects an option exactly as it would via send_wakeup (see
-    # T-MODAL-GATE-01) — gate it the same way, before sending anything.
-    # cmd_219: pane_has_open_modal() misses the permission-confirm dialog
-    # footer (' Esc to cancel · Tab to amend'); pane_awaiting_input() covers
-    # it. pane_has_open_modal() itself stays untouched (used elsewhere by
-    # PR#97's Enter gate).
-    if pane_awaiting_input "$PANE_TARGET"; then
+    # Modal gate (cmd_216 F-3 ii → cmd_219 STALL_AWAITING_INPUT_GATE; cmd_229
+    # AC-4 R6): this route sends "inbox?" + Enter directly via tmux
+    # send-keys, bypassing send_wakeup entirely — so PR#97's 5-route gate
+    # table never covered it (gunshi QC finding, the 6th route). Enter into
+    # an open modal confirms/selects an option exactly as it would via
+    # send_wakeup (see T-MODAL-GATE-01) — gate it the same way, before
+    # sending anything. claude type uses the strict three-value gate;
+    # non-claude keeps the legacy pane_awaiting_input() binary gate (it
+    # covers the permission-confirm dialog footer that pane_has_open_modal()
+    # misses).
+    local stall_gate_cli
+    stall_gate_cli=$(get_effective_cli_type)
+    if ! claude_pane_may_enter "$PANE_TARGET" "$stall_gate_cli" pane_awaiting_input; then
         echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing stall-ladder nudge" >&2
         return 0
     fi
 
     timeout 5 tmux send-keys -t "$PANE_TARGET" "inbox?" 2>/dev/null || true
     sleep 0.3
+    # cmd_229 AC-5 TOCTOU: re-evaluate immediately before Enter — the text
+    # send + 0.3s sleep above is exactly the kind of gap P2 (TOCTOU) names.
+    if ! claude_pane_may_enter "$PANE_TARGET" "$stall_gate_cli" pane_awaiting_input; then
+        echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal opened between text and Enter — aborting stall-ladder nudge (TOCTOU guard)" >&2
+        return 0
+    fi
     timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null || true
 
     sleep 30
@@ -1851,6 +2049,13 @@ process_unread() {
             # Shogun: only clear input when pane is not active (Lord is away)
             if [ "$AGENT_ID" = "shogun" ] && pane_is_active; then
                 : # Lord may be typing — skip C-u
+            # cmd_229 AC-8: this C-u had no gate at all before this fix. If a
+            # modal with a free-text option is open (e.g. the accident's
+            # "3. Type something." choice), this C-u would erase whatever
+            # the Lord had started typing into it. Same judgment as the
+            # Enter routes — claude strict gate, non-claude legacy binary.
+            elif ! claude_pane_may_enter "$PANE_TARGET" "$fastpath_idle_flag_cli" pane_has_open_modal; then
+                echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing fast-path C-u" >&2
             else
                 timeout 2 tmux send-keys -t "$PANE_TARGET" C-u 2>/dev/null || true
             fi
@@ -2220,6 +2425,9 @@ for s in data.get('specials', []):
             # Shogun: only clear input when pane is not active (Lord is away)
             if [ "$AGENT_ID" = "shogun" ] && pane_is_active; then
                 : # Lord may be typing — skip C-u
+            # cmd_229 AC-8: same ungated-C-u fix as the fast-path branch above.
+            elif ! claude_pane_may_enter "$PANE_TARGET" "$idle_flag_cli" pane_has_open_modal; then
+                echo "[$(date)] [SKIP-MODAL] $AGENT_ID: modal open — suppressing all-read C-u" >&2
             else
                 timeout 2 tmux send-keys -t "$PANE_TARGET" C-u 2>/dev/null || true
             fi

@@ -12,6 +12,66 @@
 #   agent_is_busy_check "multiagent:agents.0"
 #   state=$(get_pane_state_label "multiagent:agents.3")
 
+# ─── agent_status_bottom_block: shared bottom-block scanner (cmd_229 AC-1/2/3) ───
+# agent_is_busy_check() / pane_has_open_modal() / pane_awaiting_input() used
+# to each carry their own verbatim copy of
+#   awk 'NF{b=b $0} !NF{b=""} END{print b}'
+# — three independent copies of the same footer-scanning logic. When a
+# queued input line (e.g. an accidentally-sent `❯ /clear`) landed BELOW a
+# modal's footer, that copy's 5-line tail scan lost the footer text
+# entirely and all three predicates went blind at once (cmd_229 RCA:
+# 2026-08-16, 48-minute stall detector blackout). Consolidating into this
+# single function makes "fix all three" structural — no call site defines
+# its own scanning awk anymore; all three now call this one function.
+#
+# AGENT_STATUS_QUEUED_INPUT_RE matches a prompt glyph followed by queued
+# TEXT (`❯ /clear`). It deliberately does NOT match a bare prompt (`❯`
+# alone, or `❯ ` with only trailing whitespace) — lib/agent_status.sh:147's
+# idle check already treats a bare prompt as the explicit idle marker, and
+# peeling on a bare prompt would make T-MODAL-03 (footer residue above a
+# bare bottom prompt) false-busy. This is not an arbitrary choice; it is
+# this file's existing idle definition, extended rather than overridden.
+AGENT_STATUS_QUEUED_INPUT_RE='^[[:space:]]*[❯>›][[:space:]]+[^[:space:]]'
+AGENT_STATUS_DEEP_TAIL=${AGENT_STATUS_DEEP_TAIL:-10}
+
+# agent_status_bottom_block <full_capture>
+# Returns (stdout) the bottom contiguous non-empty block to run anchor
+# checks against.
+#
+# Branch 1 (unpeeled): tail -5, same as every predicate did before this
+# consolidation. Byte-for-byte identical to the pre-cmd_229 output on every
+# existing fixture — this is an addition, not a behavior change, for the
+# common case.
+#
+# Branch 2 (peeled): only taken when branch 1's block itself looks like a
+# queued input line. Scans a deeper window (AGENT_STATUS_DEEP_TAIL, default
+# 10 lines — a queued line taking 2 rows can push the real footer past
+# tail -5) and returns the contiguous non-empty block ABOVE the queued
+# line, i.e. the footer that was hidden underneath it.
+#
+# awk_note (this exact form is load-bearing, see gunshi_report.yaml
+# defect1_design.awk_note): branch 2's awk is NOT the same shape as branch
+# 1's. It stashes the last non-empty accumulated block into `prev` BEFORE
+# resetting on a blank line (`!NF{if(b!="")prev=b; b=""}`), so a run of
+# several blank lines between the footer and the queued line does not wipe
+# `prev`. The END guard `if(b!="" && prev=="")prev=b` covers the case where
+# the deep window contains no blank line at all (footer and queued line are
+# adjacent). Dropping either piece loses the footer on a 2-line queued
+# fixture (measured: G7 in gunshi_report.yaml).
+agent_status_bottom_block() {
+    local full="$1" b
+    b=$(printf '%s\n' "$full" | tail -5 \
+        | awk 'NF{b=b $0} !NF{b=""} END{print b}')
+
+    if ! printf '%s\n' "$b" | grep -qE "$AGENT_STATUS_QUEUED_INPUT_RE"; then
+        printf '%s\n' "$b"
+        return
+    fi
+
+    printf '%s\n' "$full" | tail -"$AGENT_STATUS_DEEP_TAIL" \
+        | awk 'NF{b=b $0} !NF{if(b!="")prev=b; b=""} END{if(b!="" && prev=="")prev=b; print prev}'
+}
+
 # agent_is_busy_check <pane_target> [cli_type]
 # tmux paneの末尾5行からCLI固有のidle/busyパターンを検出する。
 # Returns: 0=busy, 1=idle, 2=pane不在
@@ -133,7 +193,7 @@ agent_is_busy_check() {
     # text, so T-BUSY-008's false-busy scenario stays unreachable and the
     # last-line rule above is untouched.
     local bottom_block
-    bottom_block=$(echo "$pane_tail" | awk 'NF{b=b $0} !NF{b=""} END{print b}')
+    bottom_block=$(agent_status_bottom_block "$full_capture")
     if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓'; then
         return 0  # busy — an interactive modal is waiting for input
     fi
@@ -214,7 +274,7 @@ pane_has_open_modal() {
     fi
 
     local bottom_block
-    bottom_block=$(echo "$pane_tail" | awk 'NF{b=b $0} !NF{b=""} END{print b}')
+    bottom_block=$(agent_status_bottom_block "$full_capture")
     if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓|enter to confirm'; then
         return 0  # モーダル表示中
     fi
@@ -260,7 +320,7 @@ pane_awaiting_input() {
     fi
 
     local bottom_block
-    bottom_block=$(echo "$pane_tail" | awk 'NF{b=b $0} !NF{b=""} END{print b}')
+    bottom_block=$(agent_status_bottom_block "$full_capture")
 
     if echo "$bottom_block" | grep -qiE 'esc to interrupt'; then
         return 1  # 働いている印。入力待ちではない（除外規則、最優先）
@@ -271,6 +331,94 @@ pane_awaiting_input() {
     fi
 
     return 1
+}
+
+# pane_input_safety <pane_target>
+# cmd_229 AC-4 (単独不合格条件, ENTER_REQUIRES_POSITIVE_SAFE_SCREEN):
+# 「モーダルでなければ撃つ」（ブラックリスト）から「安全な入力欄だと
+# 名指しできる時だけ撃つ」（ホワイトリスト）への反転。
+# claude型paneに対するEnter送出経路6つ（R1〜R6、scripts/inbox_watcher.sh）
+# は全てこの関数の判定を通す。呼び手は safe/working のときだけEnterを
+# 送出すること。非claude型paneは対象外（本番不在で画面構えを実測でき
+# ておらぬため — queue/reports/gunshi_report.yaml ac4_analysis
+# scope_of_strict_gate）。
+#
+# なぜ二値ではなく四値か: 二値（modal/not-modal）は「判定できぬ」を
+# 「モーダルでない」へ畳んで撃つ側へ倒す。それが3つの残存経路を生んだ
+# （P1: capture失敗・空画面の畳み込み、P2: TOCTOU、P3: 未知の画面形状は
+# ブラックリストで尽くせぬ）。四値化しホワイトリストへ反転すれば、
+# 「判定できぬ」も「未知の画面」も自動的に撃たぬ側へ落ちる。
+#
+# 標準出力へ4値のいずれかを書く（返り値ではない — 三値以上を返り値の
+# 数値では素直に表せぬため、agent_turn_state と同じ様式に合わせる）:
+#   safe     … 通常の入力欄が見えている。Enter可
+#   modal    … 入力待ちと名指しできる。Enter不可
+#   working  … 'esc to interrupt' が在る＝働いている。Enter可（テキストは
+#              queueされEnterは失われる。既存の意図どおりの挙動）
+#   unknown  … いずれとも名指しできぬ。Enter不可
+#
+# 判定順（queue/reports/gunshi_report.yaml ac4_analysis.recommended_design.
+# classification_rules を厳守。除外規則が最優先——pane_awaiting_input と
+# 同じ規律）:
+#   1. tail5 が空白のみ → unknown（capture失敗・再描画中。pane不在も
+#      ここに含む）
+#   2. 剥ぎ済み末尾ブロック（agent_status_bottom_block）に 'esc to
+#      interrupt' が在れば working（アンカーと同時に現れても working
+#      優先）
+#   3. 次に剥ぎ済み末尾ブロックに await系アンカーが在れば modal
+#   4. tail5（未剥ぎ・生の5行）に「文字を伴う入力行」（積まれた入力）が
+#      在れば unknown — 剥いだ結果その下にモーダルが無くとも、何かが
+#      積まれていること自体が「素の入力欄ではない」印である
+#   5. tail5 に裸の入力行、または安全ヒントが在れば safe
+#   6. それ以外は unknown
+#
+# anchor_note: 安全ヒントのアンカーは `bypass permissions on` とせよ。
+# `(shift+tab to cycle)` を含めてはならぬ——幅49の足軽6号・7号では実測で
+# `(shift+tab to      ·` と切り詰められ `cycle` が消える
+# （gunshi_report.yaml §7 実測表）。
+pane_input_safety() {
+    local pane_target="$1"
+
+    if ! tmux display-message -t "$pane_target" -p '#{pane_id}' &>/dev/null; then
+        echo "unknown"  # pane不在。撃たぬ側へ倒す
+        return
+    fi
+
+    local full_capture pane_tail
+    full_capture=$(timeout 2 tmux capture-pane -t "$pane_target" -p -J 2>/dev/null)
+    pane_tail=$(echo "$full_capture" | tail -5)
+
+    if [[ -z "$pane_tail" ]]; then
+        echo "unknown"  # capture失敗・再描画中（P1）
+        return
+    fi
+
+    local bottom_block
+    bottom_block=$(agent_status_bottom_block "$full_capture")
+
+    if echo "$bottom_block" | grep -qiE 'esc to interrupt'; then
+        echo "working"
+        return
+    fi
+
+    if echo "$bottom_block" | grep -qiE 'enter to select|to navigate|↑/↓|enter to confirm|esc to cancel|tab to amend'; then
+        echo "modal"
+        return
+    fi
+
+    if echo "$pane_tail" | grep -qE "$AGENT_STATUS_QUEUED_INPUT_RE"; then
+        echo "unknown"  # 何かが積まれている＝素の入力欄ではない
+        return
+    fi
+
+    if echo "$pane_tail" | grep -qE '^[[:space:]]*[❯›][[:space:]]*$' \
+        || echo "$pane_tail" | grep -qiF 'bypass permissions on' \
+        || echo "$pane_tail" | grep -qE '(\? for shortcuts|context left)'; then
+        echo "safe"
+        return
+    fi
+
+    echo "unknown"  # 未知の画面形状（P3）。撃たぬ側へ倒す
 }
 
 # opencode_has_busy_animation <capture_text>

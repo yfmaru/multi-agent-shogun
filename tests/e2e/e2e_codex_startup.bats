@@ -171,9 +171,22 @@ dump_watcher_log() {
     local ashigaru1_pane
     ashigaru1_pane=$(pane_target 1)
 
+    # cmd_229: isolated IDLE_FLAG_DIR (same pattern as E2E-008-F below).
+    # init_turn_state_marks() now PRESERVES existing busy/idle marks it
+    # finds at watcher startup instead of unconditionally overwriting
+    # them — correct behavior for a real restart, but it means this test
+    # is no longer immune to whatever /tmp/shogun_{busy,idle}_ashigaru1
+    # happen to already contain (e.g. this repo's own real fleet, which
+    # runs a real ashigaru1). Without isolation a stale busy印 there can
+    # make agent_turn_state() report busy forever and the task never
+    # completes — measured directly causing this test to fail.
+    local flag_dir
+    flag_dir=$(mktemp -d "/tmp/e2e_idle_flags_claude_no_startup_XXXXXX")
+    export IDLE_FLAG_DIR="$flag_dir"
+
     # 1. Respawn pane with claude mock
     tmux respawn-pane -k -t "$ashigaru1_pane" \
-        "MOCK_CLI_TYPE=claude MOCK_AGENT_ID=ashigaru1 MOCK_PROCESSING_DELAY=1 MOCK_PROJECT_ROOT=$E2E_QUEUE bash $PROJECT_ROOT/tests/e2e/mock_cli.sh"
+        "IDLE_FLAG_DIR=$flag_dir MOCK_CLI_TYPE=claude MOCK_AGENT_ID=ashigaru1 MOCK_PROCESSING_DELAY=1 MOCK_PROJECT_ROOT=$E2E_QUEUE bash $PROJECT_ROOT/tests/e2e/mock_cli.sh"
     sleep 2
     tmux set-option -p -t "$ashigaru1_pane" @agent_cli "claude"
 

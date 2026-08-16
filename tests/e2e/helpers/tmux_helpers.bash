@@ -28,14 +28,19 @@ pane_target() {
 }
 
 # ─── pane_is_idle ───
-# Check if a pane shows an idle prompt ($ or ?).
+# Check if a pane shows an idle prompt ($, ❯, or ?).
 # Returns 0 if idle, 1 if busy.
 # Usage: pane_is_idle <pane_target>
+#
+# cmd_229: the claude mock's idle prompt changed from a generic "$ " to
+# a realistic "❯ " (matching real Claude Code — see mock_behaviors/
+# common.sh show_prompt()). "$ " stays recognized here too — the codex
+# mock still uses it, and it's cheap to keep both.
 pane_is_idle() {
     local pane="$1"
     local content
     content=$(tmux capture-pane -t "$pane" -p 2>/dev/null | tail -5)
-    if echo "$content" | grep -qE '^\$\s*$'; then
+    if echo "$content" | grep -qE '^[❯$]\s*$'; then
         return 0
     fi
     if echo "$content" | grep -qE '\? for shortcuts'; then
