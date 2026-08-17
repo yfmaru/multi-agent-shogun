@@ -42,8 +42,16 @@ if [ -z "$AGENT_ID" ]; then
     exit 0
 fi
 
-# Shogun is the Lord's conversation pane — skip stop hook entirely
+# Shogun is the Lord's conversation pane — skip stop hook entirely.
+# cmd_230 FAKE_BUSY_POST_RESTART_FIX 是正3（finding_2(a)）: shogunには
+# busy印の書き手が2つある(session_start_hook.sh, post_tool_use_hook.sh)
+# 一方、idle印の書き手が構造上1つも無く、agent_turn_state("shogun")は
+# 初回busy印以降永久にbusyを返す（現時点で読み手2つが偶然shogunを除外
+# しており実害は無いが、次にshogun paneを読む処理が増えた瞬間に欠陥化
+# する——queue/reports/gunshi_report.yaml finding_2）。ブロック判定には
+# 一切関与させず、早期returnの直前にidle印だけをtouchする。
 if [ "$AGENT_ID" = "shogun" ]; then
+    touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_shogun" 2>/dev/null || true
     exit 0
 fi
 

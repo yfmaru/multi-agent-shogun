@@ -36,18 +36,26 @@ fi
 # あった——「解決できた者が、できぬ者のために書き置く」構図）。
 # stdin は DATA として扱うのみで、中身を実行することは絶対にしない。
 # stdin が空・不正JSONでも必ず exit 0 契約を守る（timeoutで包む）。
+# 同じstdin JSONからsource（startup/resume/clear/compact）も併せて
+# 読み取る（cmd_230 FAKE_BUSY_POST_RESTART_FIX 是正1）——stdinは1回しか
+# 読めぬため、session_idとsourceを同時に取り出す。
 HOOK_SESSION_ID=""
+HOOK_SOURCE=""
 if [ ! -t 0 ]; then
     _stdin_json=$(timeout 1 cat 2>/dev/null || true)
     if [ -n "$_stdin_json" ] && command -v python3 &>/dev/null; then
-        HOOK_SESSION_ID=$(printf '%s' "$_stdin_json" | python3 -c '
+        _stdin_parsed=$(printf '%s' "$_stdin_json" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
     print(d.get("session_id", ""))
+    print(d.get("source", ""))
 except Exception:
     print("")
+    print("")
 ' 2>/dev/null || true)
+        HOOK_SESSION_ID=$(printf '%s\n' "$_stdin_parsed" | sed -n '1p')
+        HOOK_SOURCE=$(printf '%s\n' "$_stdin_parsed" | sed -n '2p')
     fi
 fi
 if [ -n "$HOOK_SESSION_ID" ]; then
@@ -56,16 +64,24 @@ fi
 
 LOG_DIR="$(dirname "$0")/../logs"
 mkdir -p "$LOG_DIR" || true
-echo "[$(date -Iseconds)] $AGENT_ID session_start_hook fired" \
+echo "[$(date -Iseconds)] $AGENT_ID session_start_hook fired (source=${HOOK_SOURCE:-unknown})" \
     >> "$LOG_DIR/session_start_hook.log" || true
 
-# cmd_217: session開始直後は必ず作業に入る（Session Start手順の実行）ので
-# busy印を打つ。二枚の印の新旧mtime比較方式 (lib/agent_status.sh:
-# agent_turn_state) の入力の一つ。既存のwatcher起動時idle印touch
-# (inbox_watcher.sh) と競合しても、本hookのほうが後段（起動→watcher起動
-# より後にsessionが立ち上がる順）なのでbusy側が勝つのが自然だが、順序が
-# 逆転しても同秒同着はbusy側に倒す設計のため安全側に働く。
-touch "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}" 2>/dev/null || true
+# cmd_230 FAKE_BUSY_POST_RESTART_FIX 是正1（策B・根治）:
+# busy印は source が clear/compact の時に限り打つ。この2つは「走って
+# いるセッションへ /clear・compaction が撃ち込まれた」事象であり、直後に
+# 必ずターンが続く——busy印は正しい。source=startup（CLI起動直後、welcome
+# 画面でnudgeを待つ）や resume・未検出・JSON解析失敗では、ターンが続く
+# 保証が無い（実測: 2026-08-17 20:52再起動直後、10体中6体がsource=startup
+# でbusy印を押され、次のnudgeまで最大27分38秒idleのままbusy扱いされ続けた
+# ——queue/reports/gunshi_report.yaml finding_1）。ここで押さずとも、真に
+# 繁忙になった瞬間はUserPromptSubmit hookが必ずbusy印を打つため取りこぼしは
+# 無い。
+case "$HOOK_SOURCE" in
+    clear|compact)
+        touch "${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}" 2>/dev/null || true
+        ;;
+esac
 
 case "$AGENT_ID" in
     shogun|karo|gunshi)
