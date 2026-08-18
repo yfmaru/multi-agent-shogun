@@ -492,6 +492,43 @@ STUB
     [[ "$output" == *"STRAY_SESSION: scratch_a3_225_z"* ]] || { echo "$output"; false; }
 }
 
+@test "a worktree that initialized a submodule folds successfully with --yes (cmd_222 follow-up: 'working trees containing submodules cannot be moved or removed')" {
+    # Self-contained local submodule remote — no network access, and no
+    # $TEST_MAIN entanglement: this exercises exactly the git-internal
+    # state (a worktree-private git-dir/modules directory) that blocks
+    # `git worktree remove`, independent of the actual submodule content.
+    git init -q --bare "$TEST_TMPDIR/subrepo.git"
+    git -C "$TEST_TMPDIR/subrepo.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/subseed"
+    git -C "$TEST_TMPDIR/subseed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/subseed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/subseed" checkout -q -b main
+    echo sub > "$TEST_TMPDIR/subseed/sub.txt"
+    git -C "$TEST_TMPDIR/subseed" add sub.txt
+    git -C "$TEST_TMPDIR/subseed" commit -q -m sub
+    git -C "$TEST_TMPDIR/subseed" remote add origin "$TEST_TMPDIR/subrepo.git"
+    git -C "$TEST_TMPDIR/subseed" push -q -u origin main
+
+    path="$(mk_clean_worktree submodule_fold)"
+    git -C "$path" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/subrepo.git" sub
+    git -C "$path" commit -q -m "add submodule"
+    git -C "$path" push -q origin "feat/submodule_fold"
+
+    # Sanity: this fixture really did trip the actual git precondition this
+    # test protects against — the worktree-private submodule metadata
+    # directory exists (deinit alone does not remove it; see fold_worktree()).
+    wt_gitdir="$(git -C "$path" rev-parse --git-dir)"
+    [ -d "$wt_gitdir/modules" ] || { echo "fixture did not initialize a submodule in this worktree"; false; }
+
+    git -C "$TEST_MAIN" merge -q --ff-only "feat/submodule_fold"
+    git -C "$TEST_MAIN" push -q origin develop
+
+    run bash "$FOLD" "$path" --yes
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [[ "$output" == *"FOLDED"* ]] || { echo "$output"; false; }
+    [ ! -d "$path" ]
+}
+
 @test "--sweep folds every eligible worktree and blocks the rest, main worktree untouched" {
     ok_path="$(mk_clean_worktree sweep_ok)"
     git -C "$TEST_MAIN" merge -q --ff-only "feat/sweep_ok"
