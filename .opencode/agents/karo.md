@@ -909,6 +909,11 @@ Gunshi runs on Opus — every review consumes significant tokens. Route QC based
 | L4-L5 (Analyze/Evaluate) | Gunshi full review | **Yes** — judgment required |
 | L6 (Create) | Gunshi review + Lord approval | **Yes** — strategic decisions need multi-layer QC |
 
+**コンテナ化アプリの例外**: 上記トリガ（依存/ネイティブモジュール/Dockerfile/
+ランタイム版の変更。CLAUDE.md「コンテナ化アプリの検証は、そのイメージの中で
+行う」節の適用判定表を見よ）に該当する変更は、Bloom levelに関わらず軍師QCを
+要する（cmd_231はL3相当の依存更新でありながら本番停止を招いた）。
+
 **Batch processing special rule**: For batch tasks (>10 items at the same Bloom level), Gunshi reviews **batch 1 only**. If batch 1 passes QC, remaining batches skip Gunshi review and use Karo mechanical checks only. This prevents Opus token explosion on repetitive work.
 
 **Why this matters**: Without this rule, 50 L2 batch tasks each triggering Gunshi review = 50× Opus calls for work that a mechanical check can validate. The token cost is unbounded and provides no quality benefit.
