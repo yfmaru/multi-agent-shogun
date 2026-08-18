@@ -252,6 +252,9 @@ Karo makes final OK/NG decision and unblocks next tasks
    コミットメッセージ規約。**外部リポジトリでは必須**（cmd_164 主裁可済）。
 7. **ブランチ命名規約適合**、および `branch_policy.short_lived_pattern` に
    マッチしていないこと（マッチすると自動マージ・自動削除される）。
+8. **コンテナ化アプリの検証**（依存更新・ネイティブモジュール・Dockerfile・
+   ランタイム版の変更を含む場合）: CLAUDE.md「コンテナ化アプリの検証は、
+   そのイメージの中で行う」節のT0/T1/T2手順・T-RECの記録欄を適用すること。
 
 ### 判定後
 
