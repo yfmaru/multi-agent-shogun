@@ -115,11 +115,26 @@ init_turn_state_marks() {
     # degradation_direction (gunshi_report.yaml): CLIプロセスを特定できぬ
     # 場合（ps失敗・CLIが直接の子でない・comm名が違う）はcli_start=-1の
     # ままとなり、保存側へ倒れる。理由は両側の失敗の有界性が非対称だから
-    # ——保存側の誤り(真に新しいCLIが古いbusy印を引き継ぐ)は300秒
-    # stale-busy網が解く(有界)。touch側の誤り(欠陥2の再演)は解く者が
-    # 居らぬ(無界)。cli_start=-1のとき `$cli_start -gt $newest` は常に
-    # 偽ゆえ、下のif文はこの縮退方向を自然に満たす（追加分岐は不要）。
-    if [ "$cli_start" -ge 0 ] && [ "$cli_start" -gt "$newest" ]; then
+    # ——保存側の誤り(真に新しいCLIが古いbusy印を引き継ぐ)は実効約640秒の
+    # stale-busy網が解く(有界。300秒到達後、画面凍結300秒をさらに要する
+    # 二段構え——queue/reports/gunshi_report.yaml finding_3)。touch側の
+    # 誤り(欠陥2の再演)は解く者が居らぬ(無界)。cli_start=-1のとき
+    # `$cli_start -gt $newest` は常に偽ゆえ、下のif文はこの縮退方向を
+    # 自然に満たす（追加分岐は不要）。
+    #
+    # cmd_230 FAKE_BUSY_POST_RESTART_FIX 是正2（策A・多重防御）: CLI起動
+    # 時刻はps etimes=の整数秒から逆算されるため±1秒の丸め誤差を持つ。
+    # session_start_hookはCLI起動とほぼ同時刻に発火してbusy印を押すため、
+    # cli_startとbusy印mtimeが同値（tie）になり得る——旧判定
+    # `cli_start -gt newest` はこのtieを「保存」側へ倒し、session開始時の
+    # busy印を「進行中ターンの印」と誤認する（実測: 20:52再起動で10体中6体
+    # が該当し、最大27分38秒idleのままbusy扱いされ続けた）。TOL=2秒の
+    # 許容幅を設け、「CLI起動と同時刻(±TOL秒)の印は起動に伴う印であり、
+    # 進行中ターンの印ではない」とみなす。安全性: 真に進行中のターンの印が
+    # CLI起動の±2秒以内に在ることはあり得ぬ（そのCLIは起動したばかりで
+    # ターンが進行しているはずがない）ため、誤って保存を捨てる危険は無い。
+    local -r TOL=2
+    if [ "$cli_start" -ge 0 ] && [ "$cli_start" -gt "$((newest - TOL))" ]; then
         touch "$idle_flag"
         echo "[$(date)] Created initial idle flag for $AGENT_ID (CLI newer than marks — fresh CLI)" >&2
     else
