@@ -588,6 +588,80 @@ STUB
     [ -d "$caller/.git/modules/sub2" ] || { echo "F-1 regressed: caller's submodule metadata subdir is gone. output: $output"; false; }
 }
 
+@test "N-1 regression: main worktree of its own repo with its own .git/modules populated is never deleted, even outside a directory literally named worktrees (gunshi QC on PR#118, non-blocking: the */worktrees/* guard line in deinit_worktree_submodules() has no test covering its effect; this now also travels the same main_repo ABORT path as N-2)" {
+    git init -q --bare "$TEST_TMPDIR/subN1.git"
+    git -C "$TEST_TMPDIR/subN1.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/subN1seed"
+    git -C "$TEST_TMPDIR/subN1seed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/subN1seed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/subN1seed" checkout -q -b main
+    echo subn1 > "$TEST_TMPDIR/subN1seed/subn1.txt"
+    git -C "$TEST_TMPDIR/subN1seed" add subn1.txt
+    git -C "$TEST_TMPDIR/subN1seed" commit -q -m subn1
+    git -C "$TEST_TMPDIR/subN1seed" remote add origin "$TEST_TMPDIR/subN1.git"
+    git -C "$TEST_TMPDIR/subN1seed" push -q -u origin main
+
+    # A plain clone NOT placed under any directory literally named
+    # "worktrees" -- its own git-dir is $victim/.git, which never matches
+    # `*/worktrees/*` regardless of the guard line's presence. This is the
+    # case the */worktrees/* line alone was already protecting; nothing
+    # exercised that protection before this test.
+    victim="$TEST_TMPDIR/n1_main_repo"
+    git clone -q "$TEST_TMPDIR/origin.git" "$victim"
+    git -C "$victim" config user.email "test@example.com"
+    git -C "$victim" config user.name "Test User"
+    git -C "$victim" checkout -q develop
+    git -C "$victim" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/subN1.git" subn1
+    git -C "$victim" commit -q -m "add submodule to n1 victim"
+    git -C "$victim" push -q origin develop
+
+    # Sanity: victim really has its own populated .git/modules -- the
+    # resource this test protects.
+    [ -d "$victim/.git/modules/subn1" ] || { echo "fixture did not initialize victim's own submodule metadata"; false; }
+
+    run bash "$FOLD" "$victim" --yes
+    [[ "$output" == *"ABORT"* ]] || { echo "N-1 regressed: no ABORT for a main-worktree self-target. output: $output"; false; }
+    [ -d "$victim/.git/modules/subn1" ] || { echo "N-1 regressed: victim's own submodule metadata was deleted. output: $output"; false; }
+}
+
+@test "N-2 permanent fix: a main worktree placed under a directory literally named 'worktrees' is never folded, even though its git-dir path shape fools the */worktrees/* guard (gunshi QC on PR#118, non-blocking: main_repo self-target check added right after main_repo is resolved, before deinit_worktree_submodules() is ever called)" {
+    git init -q --bare "$TEST_TMPDIR/subN2.git"
+    git -C "$TEST_TMPDIR/subN2.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/subN2seed"
+    git -C "$TEST_TMPDIR/subN2seed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/subN2seed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/subN2seed" checkout -q -b main
+    echo subn2 > "$TEST_TMPDIR/subN2seed/subn2.txt"
+    git -C "$TEST_TMPDIR/subN2seed" add subn2.txt
+    git -C "$TEST_TMPDIR/subN2seed" commit -q -m subn2
+    git -C "$TEST_TMPDIR/subN2seed" remote add origin "$TEST_TMPDIR/subN2.git"
+    git -C "$TEST_TMPDIR/subN2seed" push -q -u origin main
+
+    # The directory component literally named "worktrees" is what fools
+    # the */worktrees/* path-shape guard: $victim/.git matches the glob
+    # even though $victim is a genuine main worktree, not a real git
+    # worktree-of-a-worktree.
+    mkdir -p "$TEST_TMPDIR/worktrees"
+    victim="$TEST_TMPDIR/worktrees/n2_main_repo"
+    git clone -q "$TEST_TMPDIR/origin.git" "$victim"
+    git -C "$victim" config user.email "test@example.com"
+    git -C "$victim" config user.name "Test User"
+    git -C "$victim" checkout -q develop
+    git -C "$victim" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/subN2.git" subn2
+    git -C "$victim" commit -q -m "add submodule to n2 victim"
+    git -C "$victim" push -q origin develop
+
+    # Sanity: this fixture really trips the path-shape confusion this test
+    # protects against.
+    wt_gitdir="$(git -C "$victim" rev-parse --absolute-git-dir)"
+    [[ "$wt_gitdir" == */worktrees/* ]] || { echo "fixture did not reproduce the */worktrees/* path-shape confusion: $wt_gitdir"; false; }
+    [ -d "$victim/.git/modules/subn2" ] || { echo "fixture did not initialize victim's own submodule metadata"; false; }
+
+    run bash "$FOLD" "$victim" --yes
+    [[ "$output" == *"ABORT"* ]] || { echo "N-2 regressed: no ABORT for a main-worktree self-target under a directory named worktrees. output: $output"; false; }
+    [ -d "$victim/.git/modules/subn2" ] || { echo "N-2 regressed: victim's own submodule metadata was deleted. output: $output"; false; }
+}
+
 @test "--sweep folds every eligible worktree and blocks the rest, main worktree untouched" {
     ok_path="$(mk_clean_worktree sweep_ok)"
     git -C "$TEST_MAIN" merge -q --ff-only "feat/sweep_ok"

@@ -374,6 +374,15 @@ fold_worktree() {
     wt_list="$(git -C "$canon" worktree list --porcelain)"
     main_repo="$(printf '%s\n' "$wt_list" | awk '/^worktree /{print substr($0,10); exit}')"
 
+    # A main worktree is never an agent's to fold (git refuses it anyway), and
+    # reaching deinit_worktree_submodules() with one would delete that repo's
+    # SHARED submodule store before git's refusal ever lands. run_sweep() skips
+    # the main worktree, but the single-path form has no such exclusion.
+    if [[ "$canon" == "$(resolve_path "$main_repo")" ]]; then
+        echo "ABORT: $canon is the main worktree of its repository; not an agent's to fold"
+        return 1
+    fi
+
     deinit_worktree_submodules "$canon"
 
     if ! git -C "$main_repo" worktree remove "$canon"; then
