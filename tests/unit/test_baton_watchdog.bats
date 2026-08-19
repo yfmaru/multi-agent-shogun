@@ -4670,11 +4670,18 @@ YAML
 # ═══════════════════════════════════════════════════════════════
 # 【cmd_240/P-1】ゲートB抑止に上限を設ける
 #
-# 発端: 2026-08-19、足軽6号の`gh pr checks --watch`背景待機が95分
-# (5679秒)止まった際、gateBが transcript成長(生存の証拠)を理由に
-# 無期限に抑止し続け、番犬は一度も発報しなかった（B-4b suppressed:
-# agent=ashigaru6 gateA=true gateB=false stalled_for=5679s
-# liveness_age=-1s）。CLAUDE.md「待機の上限」節が個々のエージェントの
+# 発端: 2026-08-19、足軽6号の`gh pr checks --watch`背景待機を追った
+# ログに`B-4b suppressed: agent=ashigaru6 gateA=true gateB=false
+# stalled_for=5679s liveness_age=-1s`の1行が残った。stalled_for=5679s
+# (95分)は「抑止が始まった瞬間に成果物が既に古かった時間」であって
+# 抑止そのものの長さではない——実際の抑止は引き継ぎ時刻(03:46:13)まで
+# 約95秒で終わっている。本是正を当てても、この実例自体は依然として
+# 発報されない（gateA 90分+cap 30分=最短120分を要するのに対し、
+# 当該待機は95.5分で終わっているため）。
+#
+# 本節が塞ぐのは「観測済みの特定事例」ではなく、「当人が生き続ける限り
+# （transcriptが伸び続ける限り）gateBの抑止が無期限に続き得る」という
+# 構造上の穴である。CLAUDE.md「待機の上限」節が個々のエージェントの
 # 待機に課す30分の規範をそのままgateB抑止の上限
 # (baton_b4b_gateB_suppress_cap_sec、既定1800秒)として流用し、抑止が
 # それを超えて連続した場合は生存の証拠を無視して1回だけ強制発火する。
@@ -4691,7 +4698,7 @@ YAML
 #           畳まれ、次の抑止は新規の継続として計り直す
 # ═══════════════════════════════════════════════════════════════
 
-@test "T-P1-1: gateB suppression that continues past baton_b4b_gateB_suppress_cap_sec force-fires despite a fresh liveness marker (2026-08-19 ashigaru6 95min-suppression incident shape)" {
+@test "T-P1-1: gateB suppression that continues past baton_b4b_gateB_suppress_cap_sec force-fires despite a fresh liveness marker (structural cap-exceeding shape; the 2026-08-19 ashigaru6 stalled_for=5679s incident itself resolved in ~95s and would not have force-fired)" {
     write_settings true 5 60 "" "" 5 60   # progress_stall_after_sec=5 (gateA fires quickly)
     append_settings_line "  liveness_stall_after_sec: 30"
     append_settings_line "  baton_b4b_gateB_suppress_cap_sec: 10"
@@ -4706,10 +4713,11 @@ YAML
     run bash -c "
         source '$TEST_HARNESS'
         check_b4b_once
-        # 抑止に入ってから10秒のcapを超えて経過したことを模す(95分の
-        # 実例と同じ構造をより短い時間で再現する。B4B_SUPPRESS_SINCEを
-        # 直接バックデートするのは、T-A13が同じ理由でtouch -dを使うのと
-        # 同じ様式)。
+        # 抑止に入ってから10秒のcapを超えて経過したことを模す(cap超過
+        # という構造を短い時間で再現するもので、2026-08-19 ashigaru6の
+        # 実例そのものの再現ではない——同実例は約95秒で終わりcapには
+        # 届いていない。B4B_SUPPRESS_SINCEを直接バックデートするのは、
+        # T-A13が同じ理由でtouch -dを使うのと同じ様式)。
         B4B_SUPPRESS_SINCE[ashigaru1]=\$(( \$(date +%s) - 15 ))
         check_b4b_once
     "
