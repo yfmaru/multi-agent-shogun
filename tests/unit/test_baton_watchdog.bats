@@ -651,8 +651,8 @@ YAML
     run bash -c "
         source '$TEST_HARNESS'
         check_once
-        if [ \"\$BATON_HELD_NOTIFIED\" -ne 0 ]; then
-            echo 'unexpectedly notified on first detection'
+        if grep -q 'cmd_192' '$FIXTURE_ROOT/queue/baton_held_notified.tsv' 2>/dev/null; then
+            echo 'unexpectedly recorded cmd_192 in notify-state on first detection (elapsed below threshold)'
             exit 1
         fi
         sleep 3
@@ -4976,6 +4976,15 @@ YAML
 #     壊れている/タブが無い)で番犬が落ちず「未報告」側へ倒れる
 #   TC-240R-011/012 (AC-7/N-1): 本番同等set -euo pipefail下で
 #     held_keysが空/非空のいずれでも生還する
+#
+# 【cmd_240 追い足し・軍師QC(PR#123)所見F-1/F-2の是正・回帰固定】
+#   TC-240R-013 (F-1再現): lord⇄external経路切替でプルーンの母集合が
+#     held_keysのみに閉じていると、休んでいる側の刻印が誤って掃かれ
+#     再送間隔を無視して再発報する。母集合を両経路の和集合
+#     (held_live_keys)へ広げた是正後は、経路が入れ替わっても沈黙する。
+#   TC-240R-014 (F-2/NB-1回帰): 発報文面が列挙するcmd_idは、真に閾値超
+#     滞留している識別子集合のみに限られ、印は付いているが閾値未満の
+#     cmdまで「閾値超滞留」と誤って名指ししない。
 # ═══════════════════════════════════════════════════════════════
 
 @test "TC-240R-001 (AC-1): unread flapping on and off does not cause repeated re-notification (F-A reproduction)" {
@@ -5297,4 +5306,107 @@ YAML
     "
     [ "$status" -eq 0 ] || { echo "safety net crashed under set -euo pipefail with a non-empty held_keys array"; echo "$output"; false; }
     grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-013 (F-1 reproduction): switching between lord and external held identifiers does not erase the other side's repeat guard" {
+    write_settings true 5 60
+    local ext_epoch ext_since
+    ext_epoch=$(( $(date +%s) - 7200 ))
+    ext_since="$(date -d @${ext_epoch} '+%Y-%m-%dT%H:%M:%S')"
+
+    # step1: external mark only, already over the 3600s threshold -> notifies
+    # once and records ext:cmd_261 in the state file.
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_261
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#123のCI決着"
+    awaiting_check: "gh pr checks 123"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] \
+        || { echo "step1: expected exactly 1 notification"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q '^ext:cmd_261@' "$FIXTURE_ROOT/queue/baton_held_notified.tsv" \
+        || { echo "step1: expected ext:cmd_261 recorded"; cat "$FIXTURE_ROOT/queue/baton_held_notified.tsv" 2>/dev/null; false; }
+
+    # step2: a lord mark is added, also over threshold -> lord takes priority
+    # (T-P2-4) and notifies again (2 notifications cumulative).
+    local lord_since
+    lord_since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_261
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#123のCI決着"
+    awaiting_check: "gh pr checks 123"
+  - id: cmd_100
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$lord_since"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 2 ] \
+        || { echo "step2: expected exactly 2 notifications (cumulative)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # step3 (F-1 core assertion): the lord mark is removed again, the external
+    # mark is left untouched. Before the F-1 fix, ext:cmd_261's guard was
+    # pruned in step2 (prune universe was held_keys alone) and this tick
+    # would re-notify immediately, ignoring the 3600s repeat interval. After
+    # the fix (prune universe = union of both live paths), it stays silent.
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_261
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#123のCI決着"
+    awaiting_check: "gh pr checks 123"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 2 ] \
+        || { echo "step3 (F-1): expected still 2 notifications total (external guard must survive the lord/external switch, no premature re-notify)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-014 (F-2/NB-1 regression): the message names only identifiers actually over threshold, not every awaiting-lord marker" {
+    write_settings true 5 60
+    local since_250 since_251
+    since_250="$(date -d @$(( $(date +%s) - 7200 )) '+%Y-%m-%dT%H:%M:%S')"   # 2時間前(閾値3600s超)
+    since_251="$(date -d @$(( $(date +%s) - 120 )) '+%Y-%m-%dT%H:%M:%S')"    # 2分前(閾値未満)
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_250
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since_250"
+  - id: cmd_251
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since_251"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "cmd_250" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "expected the message to name cmd_250 (over threshold)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "cmd_251" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "did not expect the message to name cmd_251 (below threshold, NB-1 regression)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }

@@ -1226,6 +1226,7 @@ check_once() {
 
     # cmd_240追い足し(再送ガード識別子ベース化)専用のローカル変数。
     local -a held_keys=()
+    local -a held_live_keys=()  # cmd_240 F-1是正: プルーンの母集合(発報対象held_keysより広い)
     local held_repeat held_due held_last held_ids_csv
     local held_k held_hk held_found
 
@@ -1563,12 +1564,26 @@ check_once() {
             fi
         fi
 
-        # プルーン: 今この瞬間の識別子集合(held_keys)に無い行は状態から
-        # 捨てる。★このプルーンはif分岐の中でのみ行う(else分岐では絶対に
-        # 行わない — 雑音でガードを解く道が裏口から復活するため)。
+        # 【cmd_240 F-1是正】プルーンの母集合(held_live_keys)は、発報対象
+        # 選定(held_keys、lord優先はそのまま)より広く取る。lord印がある間、
+        # externalが閾値超で休んでいても、その刻印を「今の識別子集合に無い」
+        # と見なして掃いてしまうと、lord印が外れた直後に再送間隔を無視して
+        # 再発報する(軍師QC所見F-1、PR#123)。lord分岐にいる間だけ
+        # external側の閾値超識別子も母集合へ足す(external分岐では
+        # awaiting_idsが空である以上lord側の印自体が存在し得ないため、
+        # 逆方向の追加は不要)。
+        held_live_keys=("${held_keys[@]}")
+        if [ -n "$awaiting_ids" ]; then
+            baton_watchdog_external_held_elapsed "$now" "$held_threshold"
+            held_live_keys+=("${BATON_EXTERNAL_HELD_KEYS[@]}")
+        fi
+
+        # プルーン: 今この瞬間の識別子集合(held_live_keys)に無い行は状態
+        # から捨てる。★このプルーンはif分岐の中でのみ行う(else分岐では
+        # 絶対に行わない — 雑音でガードを解く道が裏口から復活するため)。
         for held_k in "${!BATON_HELD_NOTIFY_AT[@]}"; do
             held_found=0
-            for held_hk in "${held_keys[@]}"; do
+            for held_hk in "${held_live_keys[@]}"; do
                 if [ "$held_hk" = "$held_k" ]; then
                     held_found=1
                     break
