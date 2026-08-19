@@ -651,8 +651,8 @@ YAML
     run bash -c "
         source '$TEST_HARNESS'
         check_once
-        if [ \"\$BATON_HELD_NOTIFIED\" -ne 0 ]; then
-            echo 'unexpectedly notified on first detection'
+        if grep -q 'cmd_192' '$FIXTURE_ROOT/queue/baton_held_notified.tsv' 2>/dev/null; then
+            echo 'unexpectedly recorded cmd_192 in notify-state on first detection (elapsed below threshold)'
             exit 1
         fi
         sleep 3
@@ -4946,4 +4946,467 @@ YAML
     [ "$status" -eq 0 ]
     grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
     ! grep -q "external-held" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_240追い足し: 安全網の再送ガードを識別子ベース・ファイル裏付けへ
+# (gunshi_design_240_baton_watchdog_renotify_guard)
+#
+# 真因: 再送ガード(旧BATON_HELD_NOTIFIED)がプロセスローカルかつ、
+# 通常判定のelse分岐(unread!=0等)のたび0へリセットされていた。安全網
+# の時計(awaiting_since由来)はプロセスを跨いで不滅なのに、ガードは
+# 刹那——この不一致により「未読が一瞬立って消えるだけで即座に再発報
+# する」誤りが生じていた(2026-08-20 04:46〜04:55、将軍からの3通の
+# inbox_writeと一対一に対応する再発報として実測)。
+# 是正: 再送ガードを識別子(cmd_id + awaiting_since)ごとにファイル
+# (queue/baton_held_notified.tsv)へ持たせ、プロセスを跨いで保つ。
+#
+#   TC-240R-001 (AC-1): 未読の点滅では再発報せぬ(F-A再現)
+#   TC-240R-002a/b (AC-2): 再送間隔(baton_external_repeat_after_sec)
+#     未満では沈黙・超えれば1回だけ再発報
+#   TC-240R-003 (AC-3): 新しい閾値超の印が加わると、既報の印が居ても
+#     直ちに1通出る(印の外し忘れは必ず届く)
+#   TC-240R-004 (AC-3): 印を外すとcmdが開いたままでも状態ファイルの
+#     該当行が掃かれる(プルーン)
+#   TC-240R-005 (AC-4): 新しいプロセス(--once・常駐入替を代表)が
+#     既報の滞留について再発報せぬ(F-B再現)
+#   TC-240R-006/007 (AC-5): external経路も同じ再送ガードを持ち、
+#     lord優先の既存挙動(T-P2-4)は状態ファイルの中身でも保たれる
+#   TC-240R-008/009/010 (AC-6): 状態ファイルの異常系(無い/epoch欄が
+#     壊れている/タブが無い)で番犬が落ちず「未報告」側へ倒れる
+#   TC-240R-011/012 (AC-7/N-1): 本番同等set -euo pipefail下で
+#     held_keysが空/非空のいずれでも生還する
+#
+# 【cmd_240 追い足し・軍師QC(PR#123)所見F-1/F-2の是正・回帰固定】
+#   TC-240R-013 (F-1再現): lord⇄external経路切替でプルーンの母集合が
+#     held_keysのみに閉じていると、休んでいる側の刻印が誤って掃かれ
+#     再送間隔を無視して再発報する。母集合を両経路の和集合
+#     (held_live_keys)へ広げた是正後は、経路が入れ替わっても沈黙する。
+#   TC-240R-014 (F-2/NB-1回帰): 発報文面が列挙するcmd_idは、真に閾値超
+#     滞留している識別子集合のみに限られ、印は付いているが閾値未満の
+#     cmdまで「閾値超滞留」と誤って名指ししない。
+# ═══════════════════════════════════════════════════════════════
+
+@test "TC-240R-001 (AC-1): unread flapping on and off does not cause repeated re-notification (F-A reproduction)" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 7200 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        noise_ticks=(0 0 1 0 1 0 1 0)
+        for i in 1 2 3 4 5 6 7 8; do
+            idx=\$((i-1))
+            if [ \"\${noise_ticks[\$idx]}\" = \"1\" ]; then
+                cat > '$FIXTURE_ROOT/queue/inbox/karo.yaml' << 'INNERYAML'
+messages:
+  - id: msg_noise
+    read: false
+INNERYAML
+            else
+                cat > '$FIXTURE_ROOT/queue/inbox/karo.yaml' << 'INNERYAML'
+messages:
+  - id: msg_noise
+    read: true
+INNERYAML
+            fi
+            check_once
+        done
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] \
+        || { echo "expected exactly 1 karo notification across 8 ticks with 3 unread flaps, got:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-002a (AC-2): no repeat notification while under baton_external_repeat_after_sec for a marked identifier" {
+    write_settings true 5 60
+    local epoch since
+    epoch=$(( $(date +%s) - 7200 ))
+    since="$(date -d @${epoch} '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+    printf 'lord:cmd_240@%s\t%s\n' "$epoch" "$(( $(date +%s) - 100 ))" > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] \
+        || { echo "expected no repeat notification yet (recorded 100s ago, under 3600s repeat)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-002b (AC-2): repeat notification fires once baton_external_repeat_after_sec is exceeded for a marked identifier" {
+    write_settings true 5 60
+    local epoch since
+    epoch=$(( $(date +%s) - 7200 ))
+    since="$(date -d @${epoch} '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+    printf 'lord:cmd_240@%s\t%s\n' "$epoch" "$(( $(date +%s) - 3700 ))" > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] \
+        || { echo "expected exactly 1 re-notification (recorded 3700s ago, over 3600s repeat)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-003 (AC-3): a newly-marked cmd exceeding the threshold notifies immediately even while another marked cmd was already notified and is still within the repeat window" {
+    write_settings true 5 60
+    local epoch_a since_a since_b
+    epoch_a=$(( $(date +%s) - 7200 ))
+    since_a="$(date -d @${epoch_a} '+%Y-%m-%dT%H:%M:%S')"
+    since_b="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since_a"
+  - id: cmd_242
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since_b"
+YAML
+    # cmd_240は既に100秒前に報せ済み(再送間隔内)。cmd_242は未報告の新規識別子。
+    printf 'lord:cmd_240@%s\t%s\n' "$epoch_a" "$(( $(date +%s) - 100 ))" > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] \
+        || { echo "expected exactly 1 notification triggered by the new marker cmd_242"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_242" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-004 (AC-3): removing an awaiting marker sweeps its state row (prune), while the cmd stays open" {
+    write_settings true 5 60
+    local epoch
+    epoch=$(( $(date +%s) - 7200 ))
+    printf 'lord:cmd_240@%s\t%s\n' "$epoch" "$(( $(date +%s) - 100 ))" > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+    # 印を外す(cmdは開いたまま=status: in_progress)
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_240
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ -z "$(cat "$FIXTURE_ROOT/queue/baton_held_notified.tsv" 2>/dev/null)" ] \
+        || { echo "expected the state file to be swept empty after the marker was removed"; cat "$FIXTURE_ROOT/queue/baton_held_notified.tsv"; false; }
+}
+
+@test "TC-240R-005 (AC-4): a brand-new watchdog process does not re-notify for an identifier already recorded in the state file (F-B reproduction)" {
+    write_settings true 5 60
+    local epoch since
+    epoch=$(( $(date +%s) - 7200 ))
+    since="$(date -d @${epoch} '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+    printf 'lord:cmd_240@%s\t%s\n' "$epoch" "$(( $(date +%s) - 100 ))" > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    for i in 1 2 3; do
+        run bash -c "
+            source '$TEST_HARNESS'
+            check_once
+        "
+        [ "$status" -eq 0 ]
+    done
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] \
+        || { echo "expected no notification across 3 fresh processes (already recorded 100s ago, under repeat interval), got:"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-006 (AC-5): the external-held identifier also carries the file-backed repeat guard (no immediate re-notify across a fresh process)" {
+    write_settings true 5 60
+    local epoch since
+    epoch=$(( $(date +%s) - 7200 ))
+    since="$(date -d @${epoch} '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_236
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#118のCI決着"
+    awaiting_check: "gh pr checks 118"
+YAML
+    printf 'ext:cmd_236@%s\t%s\n' "$epoch" "$(( $(date +%s) - 100 ))" > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] \
+        || { echo "expected no repeat notification yet for the external-held identifier"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-007 (AC-5): when lord takes priority over a coexisting external marker, only the lord identifier is recorded in the state file" {
+    write_settings true 5 60
+    local lord_since ext_since
+    lord_since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    ext_since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_100
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$lord_since"
+  - id: cmd_236
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#118のCI決着"
+    awaiting_check: "gh pr checks 118"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q '^lord:cmd_100@' "$FIXTURE_ROOT/queue/baton_held_notified.tsv" \
+        || { echo "expected lord:cmd_100 recorded"; cat "$FIXTURE_ROOT/queue/baton_held_notified.tsv" 2>/dev/null; false; }
+    ! grep -q '^ext:cmd_236@' "$FIXTURE_ROOT/queue/baton_held_notified.tsv" \
+        || { echo "did not expect ext:cmd_236 recorded (lord takes priority)"; cat "$FIXTURE_ROOT/queue/baton_held_notified.tsv"; false; }
+}
+
+@test "TC-240R-008 (AC-6): a missing state file is treated as empty and does not crash the watchdog" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+    rm -f "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-009 (AC-6): a corrupted (non-numeric) epoch field in the state file is dropped silently and treated as not-yet-notified" {
+    write_settings true 5 60
+    local epoch since
+    epoch=$(( $(date +%s) - 7200 ))
+    since="$(date -d @${epoch} '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+    printf 'lord:cmd_240@%s\tNOT_A_NUMBER\n' "$epoch" > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "expected a notification (corrupted row must be treated as not-yet-notified, not as a live guard)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-010 (AC-6): a malformed line (no tab) in the state file is skipped without crashing" {
+    write_settings true 5 60
+    local epoch since
+    epoch=$(( $(date +%s) - 7200 ))
+    since="$(date -d @${epoch} '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+    printf 'this line has no tab at all\n' > "$FIXTURE_ROOT/queue/baton_held_notified.tsv"
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-011 (AC-7/N-1): the safety net survives under production-equivalent 'set -euo pipefail' when no identifier is over threshold (empty held_keys array)" {
+    write_settings true 5 60
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        branch_policy_notify() { return 0; }
+        set -euo pipefail
+        check_once
+    "
+    [ "$status" -eq 0 ] \
+        || { echo "safety net crashed under set -euo pipefail with an empty held_keys array (N-1 regression: bad array subscript from \"\\\${arr[@]:-}\")"; echo "$output"; false; }
+}
+
+@test "TC-240R-012 (AC-7/N-1): the safety net survives under production-equivalent 'set -euo pipefail' when it actually notifies (non-empty held_keys array)" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_240
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        branch_policy_notify() { return 0; }
+        set -euo pipefail
+        check_once
+    "
+    [ "$status" -eq 0 ] || { echo "safety net crashed under set -euo pipefail with a non-empty held_keys array"; echo "$output"; false; }
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-013 (F-1 reproduction): switching between lord and external held identifiers does not erase the other side's repeat guard" {
+    write_settings true 5 60
+    local ext_epoch ext_since
+    ext_epoch=$(( $(date +%s) - 7200 ))
+    ext_since="$(date -d @${ext_epoch} '+%Y-%m-%dT%H:%M:%S')"
+
+    # step1: external mark only, already over the 3600s threshold -> notifies
+    # once and records ext:cmd_261 in the state file.
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_261
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#123のCI決着"
+    awaiting_check: "gh pr checks 123"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 1 ] \
+        || { echo "step1: expected exactly 1 notification"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q '^ext:cmd_261@' "$FIXTURE_ROOT/queue/baton_held_notified.tsv" \
+        || { echo "step1: expected ext:cmd_261 recorded"; cat "$FIXTURE_ROOT/queue/baton_held_notified.tsv" 2>/dev/null; false; }
+
+    # step2: a lord mark is added, also over threshold -> lord takes priority
+    # (T-P2-4) and notifies again (2 notifications cumulative).
+    local lord_since
+    lord_since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_261
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#123のCI決着"
+    awaiting_check: "gh pr checks 123"
+  - id: cmd_100
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$lord_since"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 2 ] \
+        || { echo "step2: expected exactly 2 notifications (cumulative)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+
+    # step3 (F-1 core assertion): the lord mark is removed again, the external
+    # mark is left untouched. Before the F-1 fix, ext:cmd_261's guard was
+    # pruned in step2 (prune universe was held_keys alone) and this tick
+    # would re-notify immediately, ignoring the 3600s repeat interval. After
+    # the fix (prune universe = union of both live paths), it stays silent.
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_261
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#123のCI決着"
+    awaiting_check: "gh pr checks 123"
+YAML
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'INBOX_WRITE: karo ' "$SHOGUN_NOTIFY_LOG")" -eq 2 ] \
+        || { echo "step3 (F-1): expected still 2 notifications total (external guard must survive the lord/external switch, no premature re-notify)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "TC-240R-014 (F-2/NB-1 regression): the message names only identifiers actually over threshold, not every awaiting-lord marker" {
+    write_settings true 5 60
+    local since_250 since_251
+    since_250="$(date -d @$(( $(date +%s) - 7200 )) '+%Y-%m-%dT%H:%M:%S')"   # 2時間前(閾値3600s超)
+    since_251="$(date -d @$(( $(date +%s) - 120 )) '+%Y-%m-%dT%H:%M:%S')"    # 2分前(閾値未満)
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_250
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since_250"
+  - id: cmd_251
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$since_251"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "cmd_250" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "expected the message to name cmd_250 (over threshold)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "cmd_251" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "did not expect the message to name cmd_251 (below threshold, NB-1 regression)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }

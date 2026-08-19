@@ -84,9 +84,20 @@ BATON_HELD_SINCE=0     # 安全網条件(除外前open_cmds>0等)が揃い始め
                         # 【cmd_197/OBS-61-1是正】印付きcmdが1件も無い場合(当てられる
                         # タイムスタンプが無い残余ケース)にのみ使う。印付きcmdがある場合は
                         # awaiting_sinceから導くため、この変数は参照しない。
-BATON_HELD_NOTIFIED=0  # 安全網通知を同一継続で二重送信しないためのガード
 declare -A BATON_HELD_SINCE_FALLBACK=()  # cmd_id -> epoch（awaiting_sinceを持たぬ旧形式の印に対する、
                                           # このプロセス内限定のフォールバック起点。cmd_197/OBS-61-1是正）
+
+# cmd_240追い足し(再送ガードの識別子ベース・ファイル裏付け化): 再送ガードの
+# 寿命は、そのガードが守る時計の寿命と一致させねばならない
+# （queue/reports/gunshi_report.yaml gunshi_design_240_baton_watchdog_
+# renotify_guard §2 invariant）。印付き(lord/external)安全網の時計は
+# cmd自身のawaiting_since——プロセスを跨いで不変——であるのに対し、旧
+# BATON_HELD_NOTIFIEDはプロセスローカルかつelse分岐のたび0へ戻っていた。
+# 時計は不滅・ガードは刹那というこの不一致が誤発報の真因であったため、
+# ガードもファイル(queue/baton_held_notified.tsv)へ載せ替え、識別子
+# (cmd_id + awaiting_since)ごとに最後に報せたepochを持たせる。
+# BATON_HELD_NOTIFIEDは廃止した(参照は本ファイルに一切残さない)。
+declare -A BATON_HELD_NOTIFY_AT=()  # 識別子("lord:<cmd>@<since>"等) -> 最後に報せたepoch
 
 # cmd_208後続(awaiting:external): 外部待ち予算超過の際に発するE-3 ntfy
 # （baton_ntfy_emit_or_defer経由）を同一の継続超過につき1回に留めるための
@@ -664,10 +675,20 @@ PY
 # サブシェルで実行されBATON_HELD_SINCE_FALLBACKへの書き込みが呼び出し元
 # プロセスへ反映されず、毎サイクル「初検知」と誤認して計時が進まなくなる
 # ため、直接呼び出し（コマンド置換を使わない）を前提とする。
+#
+# 【cmd_240追い足し】第2引数 held_threshold を受け、同じ1パスの中で
+# 個々のcmdの滞留がheld_threshold以上のものだけをBATON_AWAITING_HELD_KEYS
+# （"lord:<cmd_id>@<since>"）へ積む。ファイル裏付けの再送ガード
+# （baton_held_notify_state_*）が参照する識別子集合はこれのみを使う——
+# 「それ自身の滞留が閾値を超えているcmdだけ」を載せる設計であり(gunshi
+# design §3 key_universe_rule)、副産物として発報文面（NB-1是正）も同じ
+# 集合を使い回せる。
 BATON_AWAITING_HELD_ELAPSED=0
+BATON_AWAITING_HELD_KEYS=()
 baton_watchdog_awaiting_held_elapsed() {
-    local now="$1" cmd_id since_epoch max_elapsed=0 elapsed fk
+    local now="$1" held_threshold="$2" cmd_id since_epoch max_elapsed=0 elapsed fk
     local -a seen_ids=()
+    BATON_AWAITING_HELD_KEYS=()
 
     while IFS=$'\t' read -r cmd_id since_epoch; do
         [ -n "$cmd_id" ] || continue
@@ -682,6 +703,9 @@ baton_watchdog_awaiting_held_elapsed() {
         elapsed=$((now - since_epoch))
         [ "$elapsed" -lt 0 ] && elapsed=0
         [ "$elapsed" -gt "$max_elapsed" ] && max_elapsed=$elapsed
+        if [ "$elapsed" -ge "$held_threshold" ]; then
+            BATON_AWAITING_HELD_KEYS+=("lord:${cmd_id}@${since_epoch}")
+        fi
     done < <(baton_watchdog_list_awaiting_lord_with_since)
 
     for fk in "${!BATON_HELD_SINCE_FALLBACK[@]}"; do
@@ -702,9 +726,16 @@ baton_watchdog_awaiting_held_elapsed() {
 # 戻り値はBATON_AWAITING_HELD_ELAPSEDと同じ理由でグローバル変数
 # BATON_EXTERNAL_HELD_ELAPSED へ格納する(この関数はサブシェル汚染の
 # 懸念自体が無いが、様式をawaiting_lord版に揃える)。
+#
+# 【cmd_240追い足し】第2引数 held_threshold を受け、個々のcmdの滞留が
+# held_threshold以上のものだけをBATON_EXTERNAL_HELD_KEYS
+# （"ext:<cmd_id>@<since>"）へ積む。baton_watchdog_awaiting_held_elapsed
+# と同じ理由・同じ様式。
 BATON_EXTERNAL_HELD_ELAPSED=0
+BATON_EXTERNAL_HELD_KEYS=()
 baton_watchdog_external_held_elapsed() {
-    local now="$1" cmd_id ext_target ext_check since_epoch ext_budget max_elapsed=0 elapsed
+    local now="$1" held_threshold="$2" cmd_id ext_target ext_check since_epoch ext_budget max_elapsed=0 elapsed
+    BATON_EXTERNAL_HELD_KEYS=()
 
     while IFS=$'\t' read -r cmd_id ext_target ext_check since_epoch ext_budget; do
         [ -n "$cmd_id" ] || continue
@@ -712,9 +743,65 @@ baton_watchdog_external_held_elapsed() {
         elapsed=$((now - since_epoch))
         [ "$elapsed" -lt 0 ] && elapsed=0
         [ "$elapsed" -gt "$max_elapsed" ] && max_elapsed=$elapsed
+        if [ "$elapsed" -ge "$held_threshold" ]; then
+            BATON_EXTERNAL_HELD_KEYS+=("ext:${cmd_id}@${since_epoch}")
+        fi
     done < <(baton_watchdog_list_external_wait_cmds)
 
     BATON_EXTERNAL_HELD_ELAPSED=$max_elapsed
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_240追い足し: 再送ガードのファイル裏付け(queue/baton_held_notified.tsv)
+#
+# 識別子(cmd_id + awaiting_since、または印なし残余経路のBATON_HELD_SINCE)
+# ごとに「最後に報せたepoch」を持つ。ntfy_deferred.tsvと同じ様式
+# (tmp+mvの原子的置換・ロック不要——番犬はwatcher_supervisorが単一
+# インスタンスとして起動する設計)。異常系(無い/空/epoch欄が壊れている/
+# 読めない)は黙って「未報告」側(=1通多い側)へ倒す(AC-6・pre_mortem)。
+# ═══════════════════════════════════════════════════════════════
+
+baton_held_notify_state_path() {
+    echo "$ROOT/queue/baton_held_notified.tsv"
+}
+
+# BATON_HELD_NOTIFY_AT を空にしてからファイルを読み込む。ファイルが
+# 無い・読めない場合は空のまま返す(=すべて未報告として扱われる。安全
+# 側への倒し方)。epoch欄が数字でない行は黙って捨てる(同じ安全側)。
+baton_held_notify_state_load() {
+    BATON_HELD_NOTIFY_AT=()
+    local f k v
+    f=$(baton_held_notify_state_path)
+    [ -r "$f" ] || return 0
+    while IFS=$'\t' read -r k v; do
+        [ -n "$k" ] || continue
+        case "$v" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        BATON_HELD_NOTIFY_AT["$k"]=$v
+    done < "$f"
+    return 0
+}
+
+# BATON_HELD_NOTIFY_AT の全件をtmp+mvで書き戻す。書き込み失敗は握り
+# 潰し、stderrに1行残すのみに留める(番犬プロセスを落とさない)。
+baton_held_notify_state_save() {
+    local f tmp k
+    f=$(baton_held_notify_state_path)
+    mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    tmp="${f}.tmp.$$"
+    if ! : > "$tmp" 2>/dev/null; then
+        echo "[$(date)] [baton_watchdog] baton_held_notify_state_save: ${tmp} へ書けぬ" >&2
+        return 0
+    fi
+    for k in "${!BATON_HELD_NOTIFY_AT[@]}"; do
+        printf '%s\t%s\n' "$k" "${BATON_HELD_NOTIFY_AT[$k]}" >> "$tmp"
+    done
+    if ! mv "$tmp" "$f" 2>/dev/null; then
+        echo "[$(date)] [baton_watchdog] baton_held_notify_state_save: ${f} への置換に失敗" >&2
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -1137,6 +1224,12 @@ check_once() {
     local msg msg_actionable held_msg open_machine_ids
     local ext_awaiting_ids  # cmd_240/P-2: 長い安全網専用。awaiting:externalの開いたcmd id一覧
 
+    # cmd_240追い足し(再送ガード識別子ベース化)専用のローカル変数。
+    local -a held_keys=()
+    local -a held_live_keys=()  # cmd_240 F-1是正: プルーンの母集合(発報対象held_keysより広い)
+    local held_repeat held_due held_last held_ids_csv
+    local held_k held_hk held_found
+
     # cmd_208後続(awaiting:external・gunshi_design_208_awaiting_external.yaml
     # §3.2)専用のローカル変数。open_cmds_machineの条件判定には一切触れず、
     # 「発報すると決めた後」の文面・間隔だけを差し替えるために使う。
@@ -1425,30 +1518,101 @@ check_once() {
     # 出所」の3点のみであり、発報そのものは従来どおり止めない
     # （awaiting_ids・ext_awaiting_ids のどちらも空でも、この安全網は
     # 変わらず「印なし」文面で発火し続ける）。
+    #
+    # 【cmd_240追い足し・再送ガードの識別子ベース化】不変条件(gunshi
+    # design §2): 再送ガードの寿命は、そのガードが守る時計の寿命と一致
+    # させねばならない。印付き(lord/external)経路の時計はcmd自身の
+    # awaiting_since——プロセスを跨いで不変——であるため、ガードも
+    # ファイル(queue/baton_held_notified.tsv)裏付けの識別子ベースへ
+    # 移した。旧BATON_HELD_NOTIFIEDは「unreadが一瞬立って消えるだけで
+    # else分岐に落ちて0へリセットされ、直後に即再発報する」欠陥を持って
+    # いた(2026-08-20 04:46〜04:55、将軍からの3通のinbox_writeと一対一
+    # に対応する再発報として実測)。識別子に載せるのは「それ自身の滞留が
+    # held_threshold以上のcmd」のみ(key_universe_rule) — この集合が
+    # 空か否かは、従来のmax(held_elapsed)>=held_thresholdによる発火可否
+    # 判定と数学的に同値であり(maxが閾値以上⇔少なくとも1件が閾値以上)、
+    # 発火するか否かの挙動は変えていない。変えたのは列挙対象(NB-1是正:
+    # 従来はawaiting_ids全件を列挙し閾値未満の印まで「閾値超滞留」と
+    # 誤って名指ししていた)と、再送ガードの寿命(プロセスローカル→
+    # ファイル裏付け)の2点のみ。
     if [ "${unread:-0}" -eq 0 ] && [ "${active:-0}" -eq 0 ] && [ "${open_cmds:-0}" -gt 0 ]; then
         held_threshold=$(baton_watchdog_query baton_lost_human_held_after_sec)
+        baton_held_notify_state_load
+        held_keys=()
 
         if [ -n "$awaiting_ids" ]; then
-            baton_watchdog_awaiting_held_elapsed "$now"
+            baton_watchdog_awaiting_held_elapsed "$now" "$held_threshold"
             held_elapsed=$BATON_AWAITING_HELD_ELAPSED
+            held_keys=("${BATON_AWAITING_HELD_KEYS[@]}")
+            held_repeat=$(baton_watchdog_query baton_external_repeat_after_sec)
         else
             ext_awaiting_ids=$(baton_watchdog_list_external_wait_cmds | cut -f1 | paste -sd, -)
             if [ -n "$ext_awaiting_ids" ]; then
-                baton_watchdog_external_held_elapsed "$now"
+                baton_watchdog_external_held_elapsed "$now" "$held_threshold"
                 held_elapsed=$BATON_EXTERNAL_HELD_ELAPSED
+                held_keys=("${BATON_EXTERNAL_HELD_KEYS[@]}")
+                held_repeat=$(baton_watchdog_query baton_external_repeat_after_sec)
             else
                 if [ "$BATON_HELD_SINCE" -eq 0 ]; then
                     BATON_HELD_SINCE=$now
                 fi
                 held_elapsed=$((now - BATON_HELD_SINCE))
+                held_repeat=$(baton_watchdog_query baton_lost_repeat_after_sec)
+                if [ "$held_elapsed" -ge "$held_threshold" ]; then
+                    held_keys=("none@${BATON_HELD_SINCE}")
+                fi
             fi
         fi
 
-        if [ "$held_elapsed" -ge "$held_threshold" ] && [ "$BATON_HELD_NOTIFIED" -eq 0 ]; then
+        # 【cmd_240 F-1是正】プルーンの母集合(held_live_keys)は、発報対象
+        # 選定(held_keys、lord優先はそのまま)より広く取る。lord印がある間、
+        # externalが閾値超で休んでいても、その刻印を「今の識別子集合に無い」
+        # と見なして掃いてしまうと、lord印が外れた直後に再送間隔を無視して
+        # 再発報する(軍師QC所見F-1、PR#123)。lord分岐にいる間だけ
+        # external側の閾値超識別子も母集合へ足す(external分岐では
+        # awaiting_idsが空である以上lord側の印自体が存在し得ないため、
+        # 逆方向の追加は不要)。
+        held_live_keys=("${held_keys[@]}")
+        if [ -n "$awaiting_ids" ]; then
+            baton_watchdog_external_held_elapsed "$now" "$held_threshold"
+            held_live_keys+=("${BATON_EXTERNAL_HELD_KEYS[@]}")
+        fi
+
+        # プルーン: 今この瞬間の識別子集合(held_live_keys)に無い行は状態
+        # から捨てる。★このプルーンはif分岐の中でのみ行う(else分岐では
+        # 絶対に行わない — 雑音でガードを解く道が裏口から復活するため)。
+        for held_k in "${!BATON_HELD_NOTIFY_AT[@]}"; do
+            held_found=0
+            for held_hk in "${held_live_keys[@]}"; do
+                if [ "$held_hk" = "$held_k" ]; then
+                    held_found=1
+                    break
+                fi
+            done
+            [ "$held_found" -eq 1 ] || unset 'BATON_HELD_NOTIFY_AT[$held_k]'
+        done
+
+        # 期限判定: 識別子が1件でも未報告(記録なし)か、前回の通知から
+        # held_repeat秒以上経っていれば発報due。
+        held_due=0
+        for held_hk in "${held_keys[@]}"; do
+            held_last=${BATON_HELD_NOTIFY_AT[$held_hk]:-0}
+            if [ "$held_last" -eq 0 ] || [ $((now - held_last)) -ge "$held_repeat" ]; then
+                held_due=1
+            fi
+        done
+
+        if [ "${#held_keys[@]}" -gt 0 ] && [ "$held_due" -eq 1 ]; then
+            # 【NB-1是正・軍師追加所見】文面が列挙するcmd_idは、真に
+            # held_threshold以上滞留している識別子集合(held_keys)から
+            # 導く。従来のawaiting_ids/ext_awaiting_idsは印付き全件で
+            # あり、閾値未満の印まで「閾値超滞留」と誤って名指しして
+            # いた(cmd_240 QCでPR#121をFAILとした理由と同じ型の欠陥)。
+            held_ids_csv=$(printf '%s\n' "${held_keys[@]}" | sed -E 's/^[a-z]+:([^@]+)@.*$/\1/' | paste -sd, -)
             if [ -n "$awaiting_ids" ]; then
-                held_msg="baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${awaiting_ids}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
+                held_msg="baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${held_ids_csv}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
             elif [ -n "$ext_awaiting_ids" ]; then
-                held_msg="baton_lost(external-held): unread=0 active=0 外部待ちの印が付いたまま${held_threshold}s+滞留: ${ext_awaiting_ids}。外部待ちの決着(gh pr checks等)が本当に続いているか、印の外し忘れかを確かめよ"
+                held_msg="baton_lost(external-held): unread=0 active=0 外部待ちの印が付いたまま${held_threshold}s+滞留: ${held_ids_csv}。外部待ちの決着(gh pr checks等)が本当に続いているか、印の外し忘れかを確かめよ"
             else
                 held_msg="baton_lost(human-held): unread=0 active=0 open_cmds=${open_cmds}(人待ちの印なし)が${held_threshold}s+滞留。主の手番が本当に続いているか確かめよ"
             fi
@@ -1457,11 +1621,18 @@ check_once() {
             # 外せる家老が受け取ってこそ意味を成す。
             baton_watchdog_notify_inbox karo "$held_msg"
             baton_watchdog_notify_shogun "$held_msg"
-            BATON_HELD_NOTIFIED=1
+            for held_hk in "${held_keys[@]}"; do
+                BATON_HELD_NOTIFY_AT[$held_hk]=$now
+            done
         fi
+
+        baton_held_notify_state_save
     else
         BATON_HELD_SINCE=0
-        BATON_HELD_NOTIFIED=0
+        # ★再送ガードはここでリセットしない(本是正の核心)。else分岐に
+        # 落ちても状態ファイル(queue/baton_held_notified.tsv)自体には
+        # 一切触れない — unreadが一瞬立って消えるだけの雑音でガードが
+        # 解け、直後に再発報する欠陥を防ぐため。
     fi
 
     echo "[$(date)] [baton_watchdog/check_once] unread=${unread} active=${active} open_cmds=${open_cmds} open_cmds_machine=${open_cmds_machine} awaiting_lord=${awaiting_n}(${awaiting_ids}) baton_condition=${condition}"
