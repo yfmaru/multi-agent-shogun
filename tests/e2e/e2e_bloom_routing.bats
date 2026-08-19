@@ -31,11 +31,11 @@ _E2E_BLOOM_SYNTHESIZED=0
 # _e2e_bloom_synth_session — "multiagent" セッションが存在しない環境
 # （CIランナー等）向けに、@agent_id オプションのみを備えたダミーpane群を
 # 合成する。実CLIは起動しない。全窓は `timeout -s HUP 1800 bash`
-# （対話bash・SIGTERM無視をSIGHUPで確実に終端）を上限とする自己終了設計だが、
-# このファイルの全テストが済み次第 teardown_file() が各窓へ `exit` を送り
-# 早期に畳む（CLAUDE.md Test Rules 5「全ての窓が閉じればセッションは
-# tmux自身の性質により消える」）——1800秒の上限は「起こり得る最悪」であり、
-# 本来は数秒で不要になる資源をジョブの残り時間いっぱい居座らせない。
+# （対話bash・SIGTERM無視をSIGHUPで確実に終端）を上限とする自己終了設計であり、
+# このファイルの全テストが済み次第 teardown_file() が `tmux kill-session` で
+# 即座に畳む（同期的に完了するため、後続テストへ持ち越さない）——1800秒の
+# 上限はteardown_file()自体が走らなかった場合の最終防衛線であり、
+# 通常は数秒で不要になる資源をジョブの残り時間いっぱい居座らせない。
 _e2e_bloom_synth_session() {
     local session="multiagent"
     local stdio_sink="/dev/null"
@@ -65,13 +65,25 @@ setup_file() {
 
 teardown_file() {
     [[ "$_E2E_BLOOM_SYNTHESIZED" == "1" ]] || return 0
-    # 自分が合成したpaneのみを閉じる（本番セッションを見つけて再利用した
-    # 場合はここに来ない）。killではなく各シェルへの通常のexit——
-    # CLAUDE.md「早く畳みたい時」と同じ、正常終了の経路。
-    local agent
-    for agent in "${_E2E_BLOOM_AGENTS[@]}"; do
-        tmux send-keys -t "multiagent:${agent}" "exit" Enter 2>/dev/null || true
-    done
+    # 自分が合成したセッションのみを畳む（本番セッションを見つけて再利用した
+    # 場合はここに来ない・_E2E_BLOOM_SYNTHESIZEDの真偽で判定済み）。
+    #
+    # cmd_241是正: 当初はtmux send-keysで各paneへ"exit"を送る方式だったが、
+    # これは非同期——送信直後にteardown_file()が返るため、送信先paneの
+    # シェルが実際にexitを処理し終える前に後続のbatsファイルの実行が進む。
+    # CIランナーの負荷次第でこの処理待ちがジョブ全体のtimeout-minutesまで
+    # 伸び、ジョブがハングする実例を確認した（PR#122、run 32297884758:
+    # 全41件の`ok`が出た後、ジョブがtimeout-minutes:10で強制cancelされた）。
+    # `tmux kill-session`はクライアントが完了を待つ同期呼び出しであり、
+    # このレースが原理的に起こらない。本リポジトリの他12件のE2Eテスト
+    # ファイルが使う tests/e2e/helpers/setup.bash の teardown_e2e_session()
+    # も同じ理由で同じ手段を使っており、CIで実証済みである。
+    # D006（kill/tmux kill-session の絶対禁止）は「他エージェント・本番
+    # 基盤の終了」を対象とする条文であり、本呼び出しは自分がこの
+    # teardown_file()の数秒前に合成した使い捨てセッションを自分で畳む
+    # ものゆえ対象外（本番"multiagent"セッションを見つけた場合は上の
+    # ガードによりここへ到達しない）。
+    tmux kill-session -t "multiagent" 2>/dev/null || true
 }
 
 setup() {
