@@ -25,27 +25,35 @@
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 BLOOM_SETTINGS="${PROJECT_ROOT}/tests/e2e/fixtures/settings_bloom_routing.yaml"
+_E2E_BLOOM_AGENTS=(ashigaru1 ashigaru2 ashigaru3 ashigaru4 ashigaru5 ashigaru6 ashigaru7)
+_E2E_BLOOM_SYNTHESIZED=0
 
 # _e2e_bloom_synth_session — "multiagent" セッションが存在しない環境
 # （CIランナー等）向けに、@agent_id オプションのみを備えたダミーpane群を
 # 合成する。実CLIは起動しない。全窓は `timeout -s HUP 1800 bash`
-# （対話bash・SIGTERM無視をSIGHUPで確実に終端）で自己終了する。
+# （対話bash・SIGTERM無視をSIGHUPで確実に終端）を上限とする自己終了設計だが、
+# このファイルの全テストが済み次第 teardown_file() が各窓へ `exit` を送り
+# 早期に畳む（CLAUDE.md Test Rules 5「全ての窓が閉じればセッションは
+# tmux自身の性質により消える」）——1800秒の上限は「起こり得る最悪」であり、
+# 本来は数秒で不要になる資源をジョブの残り時間いっぱい居座らせない。
 _e2e_bloom_synth_session() {
     local session="multiagent"
-    local agents=(ashigaru1 ashigaru2 ashigaru3 ashigaru4 ashigaru5 ashigaru6 ashigaru7)
+    local stdio_sink="/dev/null"
 
-    tmux new-session -d -s "$session" -n "${agents[0]}" "timeout -s HUP 1800 bash"
-    tmux set-option -p -t "${session}:${agents[0]}" @agent_id "${agents[0]}"
+    tmux new-session -d -s "$session" -n "${_E2E_BLOOM_AGENTS[0]}" \
+        "timeout -s HUP 1800 bash" >"$stdio_sink" 2>&1
+    tmux set-option -p -t "${session}:${_E2E_BLOOM_AGENTS[0]}" @agent_id "${_E2E_BLOOM_AGENTS[0]}"
 
     local agent
-    for agent in "${agents[@]:1}"; do
-        tmux new-window -t "$session" -n "$agent" "timeout -s HUP 1800 bash"
+    for agent in "${_E2E_BLOOM_AGENTS[@]:1}"; do
+        tmux new-window -t "$session" -n "$agent" "timeout -s HUP 1800 bash" >"$stdio_sink" 2>&1
         tmux set-option -p -t "${session}:${agent}" @agent_id "$agent"
     done
 
     # 各paneの対話bashがプロンプトを出すまでの猶予。idle判定はプロンプト
     # 文字列の有無で決まるため、生成直後の空pane読み取りを避ける。
     sleep 1
+    _E2E_BLOOM_SYNTHESIZED=1
 }
 
 setup_file() {
@@ -53,6 +61,17 @@ setup_file() {
     if ! tmux has-session -t multiagent 2>/dev/null; then
         _e2e_bloom_synth_session
     fi
+}
+
+teardown_file() {
+    [[ "$_E2E_BLOOM_SYNTHESIZED" == "1" ]] || return 0
+    # 自分が合成したpaneのみを閉じる（本番セッションを見つけて再利用した
+    # 場合はここに来ない）。killではなく各シェルへの通常のexit——
+    # CLAUDE.md「早く畳みたい時」と同じ、正常終了の経路。
+    local agent
+    for agent in "${_E2E_BLOOM_AGENTS[@]}"; do
+        tmux send-keys -t "multiagent:${agent}" "exit" Enter 2>/dev/null || true
+    done
 }
 
 setup() {
