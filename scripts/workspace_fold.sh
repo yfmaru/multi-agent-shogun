@@ -337,6 +337,28 @@ check_worktree() {
     return "$fail"
 }
 
+# Clears whatever blocks `git worktree remove` when $canon initialized
+# submodules at some point (cmd_222 follow-up: 40/42 real worktrees hit
+# `fatal: working trees containing submodules cannot be moved or
+# removed`). Empirically, `git submodule deinit --all -f` ALONE does not
+# clear the block — git still refuses afterward. The actual gate is
+# $canon's own git-dir/modules directory (created the first time
+# `git submodule update --init` runs in THIS worktree; separate from the
+# shared $main_repo/.git/modules object store), and it survives deinit.
+# Both steps are required, in this order: deinit first (clears the
+# submodule's working-tree checkout and gitlink so the directory doesn't
+# end up as a dangling `.git` pointer), then remove that leftover
+# metadata directory. A worktree that never initialized any submodule
+# has no such directory and is left untouched (no-op).
+deinit_worktree_submodules() {
+    local canon="$1" wt_gitdir
+    wt_gitdir="$(git -C "$canon" rev-parse --absolute-git-dir)"
+    [[ "$wt_gitdir" == */worktrees/* ]] || return 0
+    [[ -d "$wt_gitdir/modules" ]] || return 0
+    git -C "$canon" submodule deinit --all -f
+    rm -rf "$wt_gitdir/modules"
+}
+
 # Folds one worktree: assumes check_worktree already passed.
 fold_worktree() {
     local path="$1" canon branch main_repo wt_list
@@ -351,6 +373,17 @@ fold_worktree() {
     # dozens of worktrees (cmd_222 follow-up, discovered post-merge of PR#107).
     wt_list="$(git -C "$canon" worktree list --porcelain)"
     main_repo="$(printf '%s\n' "$wt_list" | awk '/^worktree /{print substr($0,10); exit}')"
+
+    # A main worktree is never an agent's to fold (git refuses it anyway), and
+    # reaching deinit_worktree_submodules() with one would delete that repo's
+    # SHARED submodule store before git's refusal ever lands. run_sweep() skips
+    # the main worktree, but the single-path form has no such exclusion.
+    if [[ "$canon" == "$(resolve_path "$main_repo")" ]]; then
+        echo "ABORT: $canon is the main worktree of its repository; not an agent's to fold"
+        return 1
+    fi
+
+    deinit_worktree_submodules "$canon"
 
     if ! git -C "$main_repo" worktree remove "$canon"; then
         echo "ABORT: git worktree remove refused for $canon (git's own safety check declined; not overridden)"

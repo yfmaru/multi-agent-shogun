@@ -492,6 +492,176 @@ STUB
     [[ "$output" == *"STRAY_SESSION: scratch_a3_225_z"* ]] || { echo "$output"; false; }
 }
 
+@test "a worktree that initialized a submodule folds successfully with --yes (cmd_222 follow-up: 'working trees containing submodules cannot be moved or removed')" {
+    # Self-contained local submodule remote — no network access, and no
+    # $TEST_MAIN entanglement: this exercises exactly the git-internal
+    # state (a worktree-private git-dir/modules directory) that blocks
+    # `git worktree remove`, independent of the actual submodule content.
+    git init -q --bare "$TEST_TMPDIR/subrepo.git"
+    git -C "$TEST_TMPDIR/subrepo.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/subseed"
+    git -C "$TEST_TMPDIR/subseed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/subseed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/subseed" checkout -q -b main
+    echo sub > "$TEST_TMPDIR/subseed/sub.txt"
+    git -C "$TEST_TMPDIR/subseed" add sub.txt
+    git -C "$TEST_TMPDIR/subseed" commit -q -m sub
+    git -C "$TEST_TMPDIR/subseed" remote add origin "$TEST_TMPDIR/subrepo.git"
+    git -C "$TEST_TMPDIR/subseed" push -q -u origin main
+
+    path="$(mk_clean_worktree submodule_fold)"
+    git -C "$path" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/subrepo.git" sub
+    git -C "$path" commit -q -m "add submodule"
+    git -C "$path" push -q origin "feat/submodule_fold"
+
+    # Sanity: this fixture really did trip the actual git precondition this
+    # test protects against — the worktree-private submodule metadata
+    # directory exists (deinit alone does not remove it; see fold_worktree()).
+    wt_gitdir="$(git -C "$path" rev-parse --git-dir)"
+    [ -d "$wt_gitdir/modules" ] || { echo "fixture did not initialize a submodule in this worktree"; false; }
+
+    git -C "$TEST_MAIN" merge -q --ff-only "feat/submodule_fold"
+    git -C "$TEST_MAIN" push -q origin develop
+
+    run bash "$FOLD" "$path" --yes
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [[ "$output" == *"FOLDED"* ]] || { echo "$output"; false; }
+    [ ! -d "$path" ]
+}
+
+@test "F-1 regression: single-target on another repo's main worktree must not delete the caller's own .git/modules (gunshi QC on PR#118: 'rev-parse --git-dir' is relative for a main worktree, so \$wt_gitdir/modules resolves against the invoking shell's cwd, not \$canon)" {
+    # "caller" = the repo whose cwd the script is invoked from. It has a
+    # real submodule initialized in its OWN main worktree, so its
+    # .git/modules is populated with real metadata that
+    # deinit_worktree_submodules() must never touch, no matter what path
+    # is passed as the fold target.
+    git init -q --bare "$TEST_TMPDIR/sub2.git"
+    git -C "$TEST_TMPDIR/sub2.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/sub2seed"
+    git -C "$TEST_TMPDIR/sub2seed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/sub2seed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/sub2seed" checkout -q -b main
+    echo sub2 > "$TEST_TMPDIR/sub2seed/sub2.txt"
+    git -C "$TEST_TMPDIR/sub2seed" add sub2.txt
+    git -C "$TEST_TMPDIR/sub2seed" commit -q -m sub2
+    git -C "$TEST_TMPDIR/sub2seed" remote add origin "$TEST_TMPDIR/sub2.git"
+    git -C "$TEST_TMPDIR/sub2seed" push -q -u origin main
+
+    caller="$TEST_TMPDIR/caller_repo"
+    git init -q --bare "$TEST_TMPDIR/caller_origin.git"
+    git clone -q "$TEST_TMPDIR/caller_origin.git" "$caller"
+    git -C "$caller" config user.email "test@example.com"
+    git -C "$caller" config user.name "Test User"
+    git -C "$caller" checkout -q -b develop
+    echo base > "$caller/base.txt"
+    git -C "$caller" add base.txt
+    git -C "$caller" commit -q -m base
+    git -C "$caller" push -q -u origin develop
+    git -C "$caller" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/sub2.git" sub2
+    git -C "$caller" commit -q -m "add submodule to caller"
+    git -C "$caller" push -q origin develop
+
+    # Sanity: caller really has its own populated .git/modules — the
+    # resource F-1 must not delete.
+    [ -d "$caller/.git/modules/sub2" ] || { echo "fixture did not initialize caller's submodule metadata"; false; }
+
+    # "victim" = a separate, unrelated repo's MAIN worktree, with no
+    # submodules of its own, targeted with --yes via the single-path form.
+    # It cannot itself be folded (git refuses to remove a main working
+    # tree) but the bug fires BEFORE that refusal.
+    victim="$TEST_TMPDIR/victim_main"
+    git init -q --bare "$TEST_TMPDIR/victim_origin.git"
+    git clone -q "$TEST_TMPDIR/victim_origin.git" "$victim"
+    git -C "$victim" config user.email "test@example.com"
+    git -C "$victim" config user.name "Test User"
+    git -C "$victim" checkout -q -b develop
+    echo v > "$victim/v.txt"
+    git -C "$victim" add v.txt
+    git -C "$victim" commit -q -m v
+    git -C "$victim" push -q -u origin develop
+
+    cd "$caller"
+    run bash "$FOLD" "$victim" --yes
+    cd "$TEST_TMPDIR"
+
+    [ -d "$caller/.git/modules" ] || { echo "F-1 regressed: caller's .git/modules was deleted entirely. output: $output"; false; }
+    [ -d "$caller/.git/modules/sub2" ] || { echo "F-1 regressed: caller's submodule metadata subdir is gone. output: $output"; false; }
+}
+
+@test "N-1 regression: main worktree of its own repo with its own .git/modules populated is never deleted, even outside a directory literally named worktrees (gunshi QC on PR#118, non-blocking: the */worktrees/* guard line in deinit_worktree_submodules() has no test covering its effect; this now also travels the same main_repo ABORT path as N-2)" {
+    git init -q --bare "$TEST_TMPDIR/subN1.git"
+    git -C "$TEST_TMPDIR/subN1.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/subN1seed"
+    git -C "$TEST_TMPDIR/subN1seed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/subN1seed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/subN1seed" checkout -q -b main
+    echo subn1 > "$TEST_TMPDIR/subN1seed/subn1.txt"
+    git -C "$TEST_TMPDIR/subN1seed" add subn1.txt
+    git -C "$TEST_TMPDIR/subN1seed" commit -q -m subn1
+    git -C "$TEST_TMPDIR/subN1seed" remote add origin "$TEST_TMPDIR/subN1.git"
+    git -C "$TEST_TMPDIR/subN1seed" push -q -u origin main
+
+    # A plain clone NOT placed under any directory literally named
+    # "worktrees" -- its own git-dir is $victim/.git, which never matches
+    # `*/worktrees/*` regardless of the guard line's presence. This is the
+    # case the */worktrees/* line alone was already protecting; nothing
+    # exercised that protection before this test.
+    victim="$TEST_TMPDIR/n1_main_repo"
+    git clone -q "$TEST_TMPDIR/origin.git" "$victim"
+    git -C "$victim" config user.email "test@example.com"
+    git -C "$victim" config user.name "Test User"
+    git -C "$victim" checkout -q develop
+    git -C "$victim" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/subN1.git" subn1
+    git -C "$victim" commit -q -m "add submodule to n1 victim"
+    git -C "$victim" push -q origin develop
+
+    # Sanity: victim really has its own populated .git/modules -- the
+    # resource this test protects.
+    [ -d "$victim/.git/modules/subn1" ] || { echo "fixture did not initialize victim's own submodule metadata"; false; }
+
+    run bash "$FOLD" "$victim" --yes
+    [[ "$output" == *"ABORT"* ]] || { echo "N-1 regressed: no ABORT for a main-worktree self-target. output: $output"; false; }
+    [ -d "$victim/.git/modules/subn1" ] || { echo "N-1 regressed: victim's own submodule metadata was deleted. output: $output"; false; }
+}
+
+@test "N-2 permanent fix: a main worktree placed under a directory literally named 'worktrees' is never folded, even though its git-dir path shape fools the */worktrees/* guard (gunshi QC on PR#118, non-blocking: main_repo self-target check added right after main_repo is resolved, before deinit_worktree_submodules() is ever called)" {
+    git init -q --bare "$TEST_TMPDIR/subN2.git"
+    git -C "$TEST_TMPDIR/subN2.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/subN2seed"
+    git -C "$TEST_TMPDIR/subN2seed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/subN2seed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/subN2seed" checkout -q -b main
+    echo subn2 > "$TEST_TMPDIR/subN2seed/subn2.txt"
+    git -C "$TEST_TMPDIR/subN2seed" add subn2.txt
+    git -C "$TEST_TMPDIR/subN2seed" commit -q -m subn2
+    git -C "$TEST_TMPDIR/subN2seed" remote add origin "$TEST_TMPDIR/subN2.git"
+    git -C "$TEST_TMPDIR/subN2seed" push -q -u origin main
+
+    # The directory component literally named "worktrees" is what fools
+    # the */worktrees/* path-shape guard: $victim/.git matches the glob
+    # even though $victim is a genuine main worktree, not a real git
+    # worktree-of-a-worktree.
+    mkdir -p "$TEST_TMPDIR/worktrees"
+    victim="$TEST_TMPDIR/worktrees/n2_main_repo"
+    git clone -q "$TEST_TMPDIR/origin.git" "$victim"
+    git -C "$victim" config user.email "test@example.com"
+    git -C "$victim" config user.name "Test User"
+    git -C "$victim" checkout -q develop
+    git -C "$victim" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/subN2.git" subn2
+    git -C "$victim" commit -q -m "add submodule to n2 victim"
+    git -C "$victim" push -q origin develop
+
+    # Sanity: this fixture really trips the path-shape confusion this test
+    # protects against.
+    wt_gitdir="$(git -C "$victim" rev-parse --absolute-git-dir)"
+    [[ "$wt_gitdir" == */worktrees/* ]] || { echo "fixture did not reproduce the */worktrees/* path-shape confusion: $wt_gitdir"; false; }
+    [ -d "$victim/.git/modules/subn2" ] || { echo "fixture did not initialize victim's own submodule metadata"; false; }
+
+    run bash "$FOLD" "$victim" --yes
+    [[ "$output" == *"ABORT"* ]] || { echo "N-2 regressed: no ABORT for a main-worktree self-target under a directory named worktrees. output: $output"; false; }
+    [ -d "$victim/.git/modules/subn2" ] || { echo "N-2 regressed: victim's own submodule metadata was deleted. output: $output"; false; }
+}
+
 @test "--sweep folds every eligible worktree and blocks the rest, main worktree untouched" {
     ok_path="$(mk_clean_worktree sweep_ok)"
     git -C "$TEST_MAIN" merge -q --ff-only "feat/sweep_ok"
