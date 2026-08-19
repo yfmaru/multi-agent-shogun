@@ -693,6 +693,30 @@ baton_watchdog_awaiting_held_elapsed() {
     BATON_AWAITING_HELD_ELAPSED=$max_elapsed
 }
 
+# cmd_240/P-2: 印付き(awaiting: external)の開いたcmdのうち、最も古い
+# awaiting_sinceからの経過秒数を返す。baton_watchdog_awaiting_held_elapsed
+# (awaiting: lord専用)と対をなすが、こちらはフォールバック計時を持たない
+# ——baton_watchdog_list_external_wait_cmds自身がawaiting_since欠落を
+# 「印無効」として既に除外しているため(W-4の規律。関数直前のコメント
+# 参照)、ここで拾える行は必ずsince_epochを持つ。
+# 戻り値はBATON_AWAITING_HELD_ELAPSEDと同じ理由でグローバル変数
+# BATON_EXTERNAL_HELD_ELAPSED へ格納する(この関数はサブシェル汚染の
+# 懸念自体が無いが、様式をawaiting_lord版に揃える)。
+BATON_EXTERNAL_HELD_ELAPSED=0
+baton_watchdog_external_held_elapsed() {
+    local now="$1" cmd_id ext_target ext_check since_epoch ext_budget max_elapsed=0 elapsed
+
+    while IFS=$'\t' read -r cmd_id ext_target ext_check since_epoch ext_budget; do
+        [ -n "$cmd_id" ] || continue
+        [ -n "$since_epoch" ] || continue
+        elapsed=$((now - since_epoch))
+        [ "$elapsed" -lt 0 ] && elapsed=0
+        [ "$elapsed" -gt "$max_elapsed" ] && max_elapsed=$elapsed
+    done < <(baton_watchdog_list_external_wait_cmds)
+
+    BATON_EXTERNAL_HELD_ELAPSED=$max_elapsed
+}
+
 # ═══════════════════════════════════════════════════════════════
 # periodic /clear (cmd_172/P7) — karo/軍師の定期文脈切断
 #
@@ -1111,6 +1135,7 @@ check_once() {
     local shogun_threshold ntfy_threshold elapsed excl_note
     local held_threshold held_elapsed repeat_threshold
     local msg msg_actionable held_msg open_machine_ids
+    local ext_awaiting_ids  # cmd_240/P-2: 長い安全網専用。awaiting:externalの開いたcmd id一覧
 
     # cmd_208後続(awaiting:external・gunshi_design_208_awaiting_external.yaml
     # §3.2)専用のローカル変数。open_cmds_machineの条件判定には一切触れず、
@@ -1390,6 +1415,16 @@ check_once() {
     # のみ、当てられるタイムスタンプが無いためBATON_HELD_SINCEによる
     # 従来どおりのプロセスローカル計時に留める(通常経路が先に発火する
     # ため実運用上は理論的な残余)。
+    #
+    # 【cmd_240/P-2是正】awaiting_ids は awaiting: lord のcmdしか
+    # 拾わない（baton_watchdog_list_awaiting_lord_cmd_ids）。ゆえに
+    # awaiting: external の印が正しく付いたcmdしか無い場合、
+    # [ -n "$awaiting_ids" ] が偽になり「印なし」分岐へ落ち、実際には印付きの
+    # cmdについて「印なし」と誤発報していた（2026-08-20 01:57、cmd_236で
+    # 現に発生）。ここで直すのは「印の有無の判定」「文面」「滞留時間の
+    # 出所」の3点のみであり、発報そのものは従来どおり止めない
+    # （awaiting_ids・ext_awaiting_ids のどちらも空でも、この安全網は
+    # 変わらず「印なし」文面で発火し続ける）。
     if [ "${unread:-0}" -eq 0 ] && [ "${active:-0}" -eq 0 ] && [ "${open_cmds:-0}" -gt 0 ]; then
         held_threshold=$(baton_watchdog_query baton_lost_human_held_after_sec)
 
@@ -1397,15 +1432,23 @@ check_once() {
             baton_watchdog_awaiting_held_elapsed "$now"
             held_elapsed=$BATON_AWAITING_HELD_ELAPSED
         else
-            if [ "$BATON_HELD_SINCE" -eq 0 ]; then
-                BATON_HELD_SINCE=$now
+            ext_awaiting_ids=$(baton_watchdog_list_external_wait_cmds | cut -f1 | paste -sd, -)
+            if [ -n "$ext_awaiting_ids" ]; then
+                baton_watchdog_external_held_elapsed "$now"
+                held_elapsed=$BATON_EXTERNAL_HELD_ELAPSED
+            else
+                if [ "$BATON_HELD_SINCE" -eq 0 ]; then
+                    BATON_HELD_SINCE=$now
+                fi
+                held_elapsed=$((now - BATON_HELD_SINCE))
             fi
-            held_elapsed=$((now - BATON_HELD_SINCE))
         fi
 
         if [ "$held_elapsed" -ge "$held_threshold" ] && [ "$BATON_HELD_NOTIFIED" -eq 0 ]; then
             if [ -n "$awaiting_ids" ]; then
                 held_msg="baton_lost(human-held): unread=0 active=0 人待ちの印が付いたまま${held_threshold}s+滞留: ${awaiting_ids}。主の手番が本当に続いているか、印の外し忘れかを確かめよ"
+            elif [ -n "$ext_awaiting_ids" ]; then
+                held_msg="baton_lost(external-held): unread=0 active=0 外部待ちの印が付いたまま${held_threshold}s+滞留: ${ext_awaiting_ids}。外部待ちの決着(gh pr checks等)が本当に続いているか、印の外し忘れかを確かめよ"
             else
                 held_msg="baton_lost(human-held): unread=0 active=0 open_cmds=${open_cmds}(人待ちの印なし)が${held_threshold}s+滞留。主の手番が本当に続いているか確かめよ"
             fi
@@ -1763,6 +1806,14 @@ declare -A B4B_NOTIFIED=()         # 主経路(将軍inbox)の二重通知防止
 declare -A B4B_NTFY_NOTIFIED=()    # 副経路(ntfy)の二重通知防止ガード（agentごと）
 declare -A B4B_SUPPRESSED=()       # cmd_226: ゲートB不成立で抑止中か（agentごと。遷移ログ用）
 
+# cmd_240/P-1: ゲートB抑止に上限を設けるための状態。B4B_CONDITION_SINCEとは
+# 絶対に混ぜない——B4B_CONDITION_SINCEは抑止中0へ巻き戻る設計（cmd_226
+# state_semantics「抑止中は起点を巻き戻す」）であり、抑止が始まった時刻
+# そのものを覚えていられない。B4B_SUPPRESS_SINCEは逆に「抑止が始まって
+# 以来ずっと」を覚え続けるための専用トラッカーである。
+declare -A B4B_SUPPRESS_SINCE=()   # agent -> gateA成立・gateB不成立の抑止が始まったepoch(0なら未抑止)
+declare -A B4B_CAP_NOTIFIED=()     # agent -> 抑止上限超過による強制発火を同一抑止継続で二重送信しないためのガード
+
 # queue/tasks/*.yaml が存在するエージェント名を1行1件で返す
 # （ファイル名から拡張子を除いたもの）。
 baton_watchdog_list_agents() {
@@ -1912,6 +1963,7 @@ baton_watchdog_agent_liveness_stalled() {
 check_b4b_once() {
     local agent now stall_threshold ntfy_threshold liveness_threshold
     local progress_mtime stalled_for elapsed task_id
+    local suppress_cap suppress_elapsed
 
     if [ "$(baton_watchdog_query enabled)" != "true" ]; then
         return 0
@@ -1921,6 +1973,7 @@ check_b4b_once() {
     stall_threshold=$(baton_watchdog_query progress_stall_after_sec)
     ntfy_threshold=$(baton_watchdog_query baton_b4b_ntfy_after_sec)
     liveness_threshold=$(baton_watchdog_query liveness_stall_after_sec)
+    suppress_cap=$(baton_watchdog_query baton_b4b_gateB_suppress_cap_sec)
 
     while IFS= read -r agent; do
         [ -n "$agent" ] || continue
@@ -1939,6 +1992,11 @@ check_b4b_once() {
                         echo "[$(date)] [baton_watchdog] B-4b gateB re-armed: agent=${agent} liveness_age=${B4B_LIVENESS_AGE}s" >&2
                         B4B_SUPPRESSED[$agent]=0
                     fi
+                    # cmd_240/P-1: 抑止が終わった（gateBが再武装した）ので
+                    # 抑止上限トラッカーも畳む。次に抑止に入った際は新規の
+                    # 抑止継続として計り直す。
+                    B4B_SUPPRESS_SINCE[$agent]=0
+                    B4B_CAP_NOTIFIED[$agent]=0
 
                     if [ "${B4B_CONDITION_SINCE[$agent]:-0}" -eq 0 ]; then
                         B4B_CONDITION_SINCE[$agent]=$now
@@ -1976,6 +2034,41 @@ check_b4b_once() {
                     B4B_CONDITION_SINCE[$agent]=0
                     B4B_NOTIFIED[$agent]=0
                     B4B_NTFY_NOTIFIED[$agent]=0
+
+                    # ── cmd_240/P-1: 抑止に上限を設ける ──
+                    # B4B_CONDITION_SINCEは抑止中0へ巻き戻る（直上）ため、
+                    # 「抑止がいつ始まったか」を別のトラッカー
+                    # (B4B_SUPPRESS_SINCE)で覚え続ける。抑止が
+                    # baton_b4b_gateB_suppress_cap_sec（既定1800秒/30分。
+                    # CLAUDE.md「待機の上限」の規範と同値）を超えて連続した
+                    # 場合、gateBの抑止を無視して1回だけ強制発火する——
+                    # 「生きている（transcriptが伸びている）」ことは、
+                    # gateAが既に要求したprogress_stall_after_sec
+                    # （既定90分）分の無進捗を無期限に隠してよい理由には
+                    # ならない。文面は「応答なし」ではなく「生きているが
+                    # 進んでいない」と名指しし、受け手が死亡と誤認しない
+                    # ようにする。
+                    #
+                    # 本節が塞ぐのは観測済みの特定事例ではなく、「当人が
+                    # 生き続ける限り（transcriptが伸び続ける限り）抑止が
+                    # 無期限に続き得る」という構造上の穴である。発端と
+                    # なった2026-08-19の足軽6号のログ（B-4b suppressed:
+                    # agent=ashigaru6 ... stalled_for=5679s）のstalled_for
+                    # =5679s(95分)は、抑止が始まった瞬間に成果物が既に
+                    # 古かった時間であって抑止そのものの長さではない。
+                    # 実際の抑止は引き継ぎ時刻まで約95秒で終わっており、
+                    # 本是正を当ててもこの実例自体は依然として発報されない
+                    # （gateA 90分+cap 30分=最短120分を要するのに対し、
+                    # 当該待機は95.5分で終わっているため）。
+                    if [ "${B4B_SUPPRESS_SINCE[$agent]:-0}" -eq 0 ]; then
+                        B4B_SUPPRESS_SINCE[$agent]=$now
+                    fi
+                    suppress_elapsed=$((now - B4B_SUPPRESS_SINCE[$agent]))
+                    if [ "$suppress_elapsed" -ge "$suppress_cap" ] && [ "${B4B_CAP_NOTIFIED[$agent]:-0}" -eq 0 ]; then
+                        task_id=$(baton_watchdog_task_id "$agent")
+                        baton_watchdog_notify_shogun "stalled_but_alive: agent=${agent} task_id=${task_id} stalled_for=${stalled_for}s suppressed_for=${suppress_elapsed}s liveness_age=${B4B_LIVENESS_AGE}s (生存痕跡はあるが進捗が${stall_threshold}s+止まっている。生きているが進んでいない——応答なしではない。gateB抑止上限${suppress_cap}s超過につき発報)"
+                        B4B_CAP_NOTIFIED[$agent]=1
+                    fi
                 fi
             else
                 # 条件(ii)が崩れた＝進捗が観測された。次に条件が揃った
@@ -1984,6 +2077,8 @@ check_b4b_once() {
                 B4B_NOTIFIED[$agent]=0
                 B4B_NTFY_NOTIFIED[$agent]=0
                 B4B_SUPPRESSED[$agent]=0
+                B4B_SUPPRESS_SINCE[$agent]=0
+                B4B_CAP_NOTIFIED[$agent]=0
             fi
         else
             # 条件(i)が崩れた＝バトンを保持していない（未着手 or 納品済み）。
@@ -1991,6 +2086,8 @@ check_b4b_once() {
             B4B_NOTIFIED[$agent]=0
             B4B_NTFY_NOTIFIED[$agent]=0
             B4B_SUPPRESSED[$agent]=0
+            B4B_SUPPRESS_SINCE[$agent]=0
+            B4B_CAP_NOTIFIED[$agent]=0
         fi
     done < <(baton_watchdog_list_agents)
 }
