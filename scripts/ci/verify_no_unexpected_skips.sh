@@ -40,15 +40,28 @@ if [ "$#" -eq 0 ]; then
 fi
 
 SKIP_COUNT=0
+TAP_OUT="$(mktemp)"
+trap 'rm -f "$TAP_OUT"' EXIT
 for f in "$@"; do
     [ -f "$f" ] || continue
-    RESULT=$(bats "${BATS_ARGS[@]}" "$f" --tap 2>/dev/null || true)
+    echo "::group::${f}"
+    # Redirect to a regular file rather than capturing via $(...). A test
+    # file that spawns a detached process (e.g. a synthesized tmux session
+    # for E2E fixtures) can leave a descendant holding stdout open past
+    # bats' own exit; `$(...)` waits for that pipe to reach EOF and hangs
+    # until the job's timeout-minutes kills it, even though bats itself
+    # already finished (cmd_241, observed on PR#122 run 32306695113 — this
+    # gate step never printed anything and was cancelled after 4 minutes).
+    # A file redirect has no such wait: the shell only waits for the
+    # direct child (bats) to exit, not for anything it left running.
+    bats "${BATS_ARGS[@]}" "$f" --tap >"$TAP_OUT" 2>/dev/null || true
     # Count skips, excluding known CI-environment skips (e.g. "claude not installed")
-    COUNT=$(echo "$RESULT" | grep "^ok.*# skip" | grep -cv "CI environment" || true)
+    COUNT=$(grep "^ok.*# skip" "$TAP_OUT" | grep -cv "CI environment" || true)
     if [ "$COUNT" -gt 0 ]; then
         echo "::error::${COUNT} unexpected SKIP(s) in ${f}"
     fi
     SKIP_COUNT=$((SKIP_COUNT + COUNT))
+    echo "::endgroup::"
 done
 
 if [ "$SKIP_COUNT" -gt 0 ]; then
