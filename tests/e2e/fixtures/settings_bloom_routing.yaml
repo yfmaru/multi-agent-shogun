@@ -1,0 +1,50 @@
+# settings_bloom_routing.yaml — tests/e2e/e2e_bloom_routing.bats 専用フィクスチャ
+#
+# cmd_241: 従来 e2e_bloom_routing.bats の setup() は CLI_ADAPTER_SETTINGS を
+# 本番 config/settings.yaml に固定していたが、この設定ファイルは
+# .gitignore 対象（!config/ の例外リストに settings.yaml は無い）ゆえ、
+# CIのチェックアウトには一切存在しない。find_agent_for_model() /
+# get_recommended_model() は settings 読込を try/except で握り潰すため、
+# 「ファイルが無い」ことは例外にすらならず、静かに空文字を返す構造で
+# あった——実行はされていたが、常に「候補なし」経路を踏んでいた疑いが
+# 強い（フォールバック経路の誤検証と同根の欠陥）。
+#
+# モデル構成は tests/unit/test_dynamic_model_routing.bats の
+# settings_mixed_cli.yaml と同一（ashigaru1-3=Spark, ashigaru4-5=Sonnet,
+# ashigaru6-7=Opus）——このbatsファイル本体のコメントが前提とする構成
+# そのものであり、TC-BLOOM-001〜006の全アサーションと整合する。
+cli:
+  default: claude
+  agents:
+    ashigaru1:
+      type: codex
+      model: gpt-5.3-codex-spark
+    ashigaru2:
+      type: codex
+      model: gpt-5.3-codex-spark
+    ashigaru3:
+      type: codex
+      model: gpt-5.3-codex-spark
+    ashigaru4:
+      type: claude
+      model: claude-sonnet-4-6
+    ashigaru5:
+      type: claude
+      model: claude-sonnet-4-6
+    ashigaru6:
+      type: claude
+      model: claude-opus-4-6
+    ashigaru7:
+      type: claude
+      model: claude-opus-4-6
+capability_tiers:
+  gpt-5.3-codex-spark:
+    max_bloom: 3
+    cost_group: chatgpt_pro
+  claude-sonnet-4-6:
+    max_bloom: 5
+    cost_group: claude_max
+  claude-opus-4-6:
+    max_bloom: 6
+    cost_group: claude_max
+bloom_routing: "manual"

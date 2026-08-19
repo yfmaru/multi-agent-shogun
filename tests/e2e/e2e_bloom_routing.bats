@@ -2,29 +2,69 @@
 # e2e_bloom_routing.bats — Dim C: スマート切り替えE2Eテスト
 # Issue #53 Phase 2 — find_agent_for_model() + karo bloom routing 統合検証
 #
-# VPS上でのみ実行を想定。tmuxセッション "multiagent" が起動済みで
-# 混合CLI設定（ashigaru1-3=Spark, ashigaru4-5=Sonnet, ashigaru6-7=Opus）が
-# 必要。
+# 実行対象: 本番VPS上の実セッション、またはCI上に合成した使い捨てセッション。
+# tmuxセッション "multiagent" が存在すればそれをそのまま使う（本番想定）。
+# 存在しなければ（CIランナーは常にこちら）setup_file() がダミーの
+# "multiagent" セッションを合成する——実CLIプロセスは不要で、
+# find_agent_for_model() が読むのは `tmux list-panes` の `@agent_id`
+# オプションと agent_is_busy_check() が見るpane内容のみであるため、
+# `timeout -s HUP 1800 bash` の対話シェルに @agent_id を設定するだけで足りる
+# （CLAUDE.md Test Rules 5準拠・自己終了設計。GitHub Actionsランナーは
+# ワークフロー実行ごとに独立インスタンスゆえ、本番の"multiagent"セッションとは
+# 衝突しない）。
 #
-# 事前条件:
-#   - VPS設定: ashigaru1-3=codex/spark, ashigaru4-5=claude/sonnet, ashigaru6-7=claude/opus
-#   - bloom_routing: "manual" または "auto"
-#   - 全足軽がアイドル状態（テスト開始前）
+# CLI_ADAPTER_SETTINGS は本番 config/settings.yaml ではなく
+# tests/e2e/fixtures/settings_bloom_routing.yaml を常に使う——前者は
+# .gitignore対象でCIのチェックアウトに存在せず、find_agent_for_model()の
+# YAML読込がtry/exceptで静かに空文字へ縮退する構造だった（cmd_241 是正）。
+# モデル構成（ashigaru1-3=Spark, ashigaru4-5=Sonnet, ashigaru6-7=Opus）は
+# フィクスチャ側のコメントを見よ。
 #
 # 実行方法:
 #   bats tests/e2e/e2e_bloom_routing.bats
 
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+BLOOM_SETTINGS="${PROJECT_ROOT}/tests/e2e/fixtures/settings_bloom_routing.yaml"
+
+# _e2e_bloom_synth_session — "multiagent" セッションが存在しない環境
+# （CIランナー等）向けに、@agent_id オプションのみを備えたダミーpane群を
+# 合成する。実CLIは起動しない。全窓は `timeout -s HUP 1800 bash`
+# （対話bash・SIGTERM無視をSIGHUPで確実に終端）で自己終了する。
+_e2e_bloom_synth_session() {
+    local session="multiagent"
+    local agents=(ashigaru1 ashigaru2 ashigaru3 ashigaru4 ashigaru5 ashigaru6 ashigaru7)
+
+    tmux new-session -d -s "$session" -n "${agents[0]}" "timeout -s HUP 1800 bash"
+    tmux set-option -p -t "${session}:${agents[0]}" @agent_id "${agents[0]}"
+
+    local agent
+    for agent in "${agents[@]:1}"; do
+        tmux new-window -t "$session" -n "$agent" "timeout -s HUP 1800 bash"
+        tmux set-option -p -t "${session}:${agent}" @agent_id "$agent"
+    done
+
+    # 各paneの対話bashがプロンプトを出すまでの猶予。idle判定はプロンプト
+    # 文字列の有無で決まるため、生成直後の空pane読み取りを避ける。
+    sleep 1
+}
+
+setup_file() {
+    command -v tmux &>/dev/null || return 0
+    if ! tmux has-session -t multiagent 2>/dev/null; then
+        _e2e_bloom_synth_session
+    fi
+}
 
 setup() {
-    # tmuxセッションの存在確認
+    # tmuxセッションの存在確認（本番セッション、または上の setup_file() が
+    # 合成したセッションのいずれか）
     if ! tmux has-session -t multiagent 2>/dev/null; then
-        skip "tmux session 'multiagent' が存在しない。VPS上でshutsuijin後に実行せよ。"
+        skip "tmux session 'multiagent' が存在せず、合成にも失敗した。"
     fi
 
     # lib/cli_adapter.sh のロード
     export CLI_ADAPTER_PROJECT_ROOT="$PROJECT_ROOT"
-    export CLI_ADAPTER_SETTINGS="${PROJECT_ROOT}/config/settings.yaml"
+    export CLI_ADAPTER_SETTINGS="$BLOOM_SETTINGS"
     # shellcheck disable=SC1090
     source "${PROJECT_ROOT}/lib/cli_adapter.sh"
     # shellcheck disable=SC1090
