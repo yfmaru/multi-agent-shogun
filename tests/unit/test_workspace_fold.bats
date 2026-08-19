@@ -529,6 +529,65 @@ STUB
     [ ! -d "$path" ]
 }
 
+@test "F-1 regression: single-target on another repo's main worktree must not delete the caller's own .git/modules (gunshi QC on PR#118: 'rev-parse --git-dir' is relative for a main worktree, so \$wt_gitdir/modules resolves against the invoking shell's cwd, not \$canon)" {
+    # "caller" = the repo whose cwd the script is invoked from. It has a
+    # real submodule initialized in its OWN main worktree, so its
+    # .git/modules is populated with real metadata that
+    # deinit_worktree_submodules() must never touch, no matter what path
+    # is passed as the fold target.
+    git init -q --bare "$TEST_TMPDIR/sub2.git"
+    git -C "$TEST_TMPDIR/sub2.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/sub2seed"
+    git -C "$TEST_TMPDIR/sub2seed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/sub2seed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/sub2seed" checkout -q -b main
+    echo sub2 > "$TEST_TMPDIR/sub2seed/sub2.txt"
+    git -C "$TEST_TMPDIR/sub2seed" add sub2.txt
+    git -C "$TEST_TMPDIR/sub2seed" commit -q -m sub2
+    git -C "$TEST_TMPDIR/sub2seed" remote add origin "$TEST_TMPDIR/sub2.git"
+    git -C "$TEST_TMPDIR/sub2seed" push -q -u origin main
+
+    caller="$TEST_TMPDIR/caller_repo"
+    git init -q --bare "$TEST_TMPDIR/caller_origin.git"
+    git clone -q "$TEST_TMPDIR/caller_origin.git" "$caller"
+    git -C "$caller" config user.email "test@example.com"
+    git -C "$caller" config user.name "Test User"
+    git -C "$caller" checkout -q -b develop
+    echo base > "$caller/base.txt"
+    git -C "$caller" add base.txt
+    git -C "$caller" commit -q -m base
+    git -C "$caller" push -q -u origin develop
+    git -C "$caller" -c protocol.file.allow=always submodule add -q "$TEST_TMPDIR/sub2.git" sub2
+    git -C "$caller" commit -q -m "add submodule to caller"
+    git -C "$caller" push -q origin develop
+
+    # Sanity: caller really has its own populated .git/modules — the
+    # resource F-1 must not delete.
+    [ -d "$caller/.git/modules/sub2" ] || { echo "fixture did not initialize caller's submodule metadata"; false; }
+
+    # "victim" = a separate, unrelated repo's MAIN worktree, with no
+    # submodules of its own, targeted with --yes via the single-path form.
+    # It cannot itself be folded (git refuses to remove a main working
+    # tree) but the bug fires BEFORE that refusal.
+    victim="$TEST_TMPDIR/victim_main"
+    git init -q --bare "$TEST_TMPDIR/victim_origin.git"
+    git clone -q "$TEST_TMPDIR/victim_origin.git" "$victim"
+    git -C "$victim" config user.email "test@example.com"
+    git -C "$victim" config user.name "Test User"
+    git -C "$victim" checkout -q -b develop
+    echo v > "$victim/v.txt"
+    git -C "$victim" add v.txt
+    git -C "$victim" commit -q -m v
+    git -C "$victim" push -q -u origin develop
+
+    cd "$caller"
+    run bash "$FOLD" "$victim" --yes
+    cd "$TEST_TMPDIR"
+
+    [ -d "$caller/.git/modules" ] || { echo "F-1 regressed: caller's .git/modules was deleted entirely. output: $output"; false; }
+    [ -d "$caller/.git/modules/sub2" ] || { echo "F-1 regressed: caller's submodule metadata subdir is gone. output: $output"; false; }
+}
+
 @test "--sweep folds every eligible worktree and blocks the rest, main worktree untouched" {
     ok_path="$(mk_clean_worktree sweep_ok)"
     git -C "$TEST_MAIN" merge -q --ff-only "feat/sweep_ok"

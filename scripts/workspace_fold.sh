@@ -352,7 +352,8 @@ check_worktree() {
 # has no such directory and is left untouched (no-op).
 deinit_worktree_submodules() {
     local canon="$1" wt_gitdir
-    wt_gitdir="$(git -C "$canon" rev-parse --git-dir)"
+    wt_gitdir="$(git -C "$canon" rev-parse --absolute-git-dir)"
+    [[ "$wt_gitdir" == */worktrees/* ]] || return 0
     [[ -d "$wt_gitdir/modules" ]] || return 0
     git -C "$canon" submodule deinit --all -f
     rm -rf "$wt_gitdir/modules"
