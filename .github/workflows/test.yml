@@ -188,7 +188,13 @@ jobs:
     name: E2E Tests (Mock CLI)
     runs-on: ubuntu-latest
     needs: [unit-tests, shellcheck]
-    timeout-minutes: 10
+    # cmd_241: SKIP=FAILゲート("Verify zero unexpected SKIPs"ステップ)は
+    # tests/e2e/*.bats を1ファイルずつ再実行し、"Run E2E tests"ステップと
+    # 同じ13ファイルをまるごと二度走らせる。実測(PR#122 run 32308761639)
+    # では前者が約6分、後者は6ファイル消化時点で既に約4分——旧
+    # timeout-minutes:10では「ハング」ではなく単純にジョブの正味作業量が
+    # 収まらなかった。20分に引き上げる。
+    timeout-minutes: 20
 
     strategy:
       fail-fast: false
