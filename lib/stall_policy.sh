@@ -161,6 +161,14 @@ DEFAULT_BATON_WATCHDOG = {
     # (痕跡=shogun_transcript_<agent>の指し先mtimeがこの秒数以上
     # 進んでいなければ「生存の証拠なし」とみなし発火側へ倒す)。
     "liveness_stall_after_sec": 1800,
+    # cmd_240/P-1: ゲートB（生存痕跡）による抑止の上限。CLAUDE.md「待機の
+    # 上限」節が個々のエージェントの待機に課す30分の規範をそのまま流用
+    # した(新しい規範を作らない)。gateAが既にprogress_stall_after_sec
+    # (既定5400秒/90分)以上の無進捗を要求した後の話であるため、この値は
+    # 「gateA成立からの猶予」ではなく「gateAが成立し続けたままgateBに
+    # 抑止され続けてよい上限」である——生きている(transcriptが伸びている)
+    # ことは、90分間何も進んでいない事実を無期限に消さない。
+    "baton_b4b_gateB_suppress_cap_sec": 1800,
     "usage_warn_pct": 80,
     "usage_resume_below_pct": 50,
     "usage_check_interval_sec": 300,
@@ -198,7 +206,7 @@ def policy_get(key):
 
 if query in ("enabled", "periodic_clear_enabled", "baton_ntfy_quiet_enabled"):
     print("true" if policy_get(query) is True else "false")
-elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec", "baton_lost_repeat_after_sec", "baton_external_repeat_after_sec", "baton_external_default_budget_sec", "baton_ntfy_quiet_max_span_min", "baton_ntfy_deferred_max_entries", "liveness_stall_after_sec"):
+elif query in ("baton_lost_after_sec", "baton_ntfy_after_sec", "baton_d1_ntfy_after_sec", "progress_stall_after_sec", "baton_b4b_ntfy_after_sec", "baton_b4c_stale_after_sec", "poll_interval_sec", "periodic_clear_idle_sec", "usage_warn_pct", "usage_resume_below_pct", "usage_check_interval_sec", "baton_b4c_machine_stale_after_sec", "baton_lost_human_held_after_sec", "baton_lost_repeat_after_sec", "baton_external_repeat_after_sec", "baton_external_default_budget_sec", "baton_ntfy_quiet_max_span_min", "baton_ntfy_deferred_max_entries", "liveness_stall_after_sec", "baton_b4b_gateB_suppress_cap_sec"):
     print(int(policy_get(query)))
 elif query in ("baton_ntfy_quiet_start", "baton_ntfy_quiet_end", "baton_ntfy_quiet_tz"):
     print(str(policy_get(query)))

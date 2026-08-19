@@ -4666,3 +4666,276 @@ YAML
     grep -q "cmd_305が貴殿の裁可を待って" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
     grep -q "cmd_304が貴殿の裁可を待って.* / .*cmd_305が貴殿の裁可を待って" "$SHOGUN_NOTIFY_LOG" || { echo "expected ' / ' join between the two shogun-awaiting entries"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
+
+# ═══════════════════════════════════════════════════════════════
+# 【cmd_240/P-1】ゲートB抑止に上限を設ける
+#
+# 発端: 2026-08-19、足軽6号の`gh pr checks --watch`背景待機が95分
+# (5679秒)止まった際、gateBが transcript成長(生存の証拠)を理由に
+# 無期限に抑止し続け、番犬は一度も発報しなかった（B-4b suppressed:
+# agent=ashigaru6 gateA=true gateB=false stalled_for=5679s
+# liveness_age=-1s）。CLAUDE.md「待機の上限」節が個々のエージェントの
+# 待機に課す30分の規範をそのままgateB抑止の上限
+# (baton_b4b_gateB_suppress_cap_sec、既定1800秒)として流用し、抑止が
+# それを超えて連続した場合は生存の証拠を無視して1回だけ強制発火する。
+# 文面は「no_progress」ではなく「stalled_but_alive」とし、受け手が
+# 応答なし(死亡)と誤認しないようにする。
+#
+#   T-P1-1: 抑止がcapを超えて連続 → gateBを無視して強制発火し、文面に
+#           「生きているが進んでいない」を含む
+#   T-P1-2: cap未満の抑止では強制発火しない（早鳴きしない）
+#   T-P1-3: 強制発火のメッセージが従来の"no_progress:"文言と衝突しない
+#           （受け手が死亡と誤認しない、の直接検査）
+#   T-P1-4: 同一の抑止継続について、強制発火は1回のみ（二重送信防止）
+#   T-P1-5: gateBが再武装（抑止終了）すればB4B_SUPPRESS_SINCEが0へ
+#           畳まれ、次の抑止は新規の継続として計り直す
+# ═══════════════════════════════════════════════════════════════
+
+@test "T-P1-1: gateB suppression that continues past baton_b4b_gateB_suppress_cap_sec force-fires despite a fresh liveness marker (2026-08-19 ashigaru6 95min-suppression incident shape)" {
+    write_settings true 5 60 "" "" 5 60   # progress_stall_after_sec=5 (gateA fires quickly)
+    append_settings_line "  liveness_stall_after_sec: 30"
+    append_settings_line "  baton_b4b_gateB_suppress_cap_sec: 10"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 2   # liveness age=2s < 30s threshold → gateB suppresses
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        # 抑止に入ってから10秒のcapを超えて経過したことを模す(95分の
+        # 実例と同じ構造をより短い時間で再現する。B4B_SUPPRESS_SINCEを
+        # 直接バックデートするのは、T-A13が同じ理由でtouch -dを使うのと
+        # 同じ様式)。
+        B4B_SUPPRESS_SINCE[ashigaru1]=\$(( \$(date +%s) - 15 ))
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "INBOX_WRITE: shogun" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "stalled_but_alive: agent=ashigaru1 task_id=subtask_1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "生きているが進んでいない" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-P1-2: gateB suppression under the cap does not force-fire (no premature alert)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    append_settings_line "  baton_b4b_gateB_suppress_cap_sec: 1800"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 2
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    [ ! -s "$SHOGUN_NOTIFY_LOG" ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-P1-3: the forced cap-fire message text does not collide with the normal 'no_progress:' wording (does not read as unresponsive/dead)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    append_settings_line "  baton_b4b_gateB_suppress_cap_sec: 10"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 2
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        B4B_SUPPRESS_SINCE[ashigaru1]=\$(( \$(date +%s) - 15 ))
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    ! grep -qE '^INBOX_WRITE: shogun no_progress: agent=ashigaru1 ' "$SHOGUN_NOTIFY_LOG" \
+        || { echo "forced cap-fire must not be spelled as no_progress: (reads as dead, not alive-but-stalled)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "stalled_but_alive: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-P1-4: the cap-fire notification is sent only once per suppression continuation (dedup guard)" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 30"
+    append_settings_line "  baton_b4b_gateB_suppress_cap_sec: 10"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    write_liveness_marker ashigaru1 2
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        B4B_SUPPRESS_SINCE[ashigaru1]=\$(( \$(date +%s) - 15 ))
+        check_b4b_once
+        check_b4b_once
+        check_b4b_once
+    "
+    [ "$status" -eq 0 ]
+    local count
+    count=$(grep -c "stalled_but_alive: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG")
+    [ "$count" -eq 1 ] || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-P1-5: B4B_SUPPRESS_SINCE resets when gateB re-arms, so a later suppression episode starts its own cap countdown" {
+    write_settings true 5 60 "" "" 5 60
+    append_settings_line "  liveness_stall_after_sec: 5"
+    append_settings_line "  baton_b4b_gateB_suppress_cap_sec: 10"
+    cat > "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml" << 'YAML'
+task:
+  task_id: subtask_1
+  status: assigned
+YAML
+    touch -d "@$(( $(date +%s) - 100 ))" "$FIXTURE_ROOT/queue/tasks/ashigaru1.yaml"
+    local target
+    target=$(write_liveness_marker ashigaru1 1)   # fresh → suppressed at first
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_b4b_once
+        # capには未到達のうちにgateBが再武装する(印が古くなる)ことを模す。
+        B4B_SUPPRESS_SINCE[ashigaru1]=\$(( \$(date +%s) - 8 ))
+        touch -d \"@\$(( \$(date +%s) - 100 ))\" '$target'
+        check_b4b_once
+        echo \"SUPPRESS_SINCE_AFTER_REARM=\${B4B_SUPPRESS_SINCE[ashigaru1]:-unset}\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SUPPRESS_SINCE_AFTER_REARM=0"* ]] || { echo "$output"; false; }
+    ! grep -q "stalled_but_alive: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "cap-fire must not have happened; gateB re-armed before the cap"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "no_progress: agent=ashigaru1" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 【cmd_240/P-2】長い安全網(cmd_197)がawaiting:externalの印を認識する
+#
+# 発端: 2026-08-20 01:57、cmd_236に`awaiting: external`が正しく付いて
+# いたにもかかわらず、番犬は「人待ちの印なし」と報せた。長い安全網の
+# 分岐選択が`awaiting_ids`(awaiting: lordのcmdしか拾わない
+# baton_watchdog_list_awaiting_lord_cmd_idsの戻り値)だけを見ており、
+# externalの印を「印なし」の残余ケースへ落としていたのが原因。
+# 直したのは「印の有無の判定」「文面」「滞留時間の出所」の3点のみ——
+# 発報そのものは(印の有無にかかわらず)従来どおり続く。
+#
+#   T-P2-1: 正しく付いたawaiting:externalの印を認識し、「印なし」では
+#           なく専用文言(baton_lost(external-held))とcmd_idで発火する
+#           （cmd_236実例の直接再現）
+#   T-P2-2: 滞留時間がBATON_HELD_SINCE(プロセスローカル・番犬再起動で
+#           0に戻る)ではなくcmd自身のawaiting_sinceから導かれること
+#           （プロセスがこの瞬間にソースされたばかりでも発火する）
+#   T-P2-3: 印が一件も無い残余ケースは従来どおり「印なし」文言のまま
+#           （回帰固定・過剰マッチしないことの直接検査）
+#   T-P2-4: lordの印がある場合はexternalより優先され、human-held文言に
+#           なる（既存の分岐順序の回帰固定）
+# ═══════════════════════════════════════════════════════════════
+
+@test "T-P2-1: the long safety net recognizes a correctly-set awaiting:external marker instead of reporting 'no marker' (2026-08-20 01:57 cmd_236 incident shape)" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"   # 既定held_threshold=3600sを超過
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_236
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#118のCI決着"
+    awaiting_check: "gh pr checks 118"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(external-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    grep -q "cmd_236" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "人待ちの印なし" "$SHOGUN_NOTIFY_LOG" \
+        || { echo "expected the awaiting:external marker to be recognized, not reported as absent"; cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-P2-2: the external-held elapsed time is derived from the cmd's own awaiting_since, not a process-local timer that resets on watchdog restart" {
+    write_settings true 5 60
+    local since
+    since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_236
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$since"
+    awaiting_target: "PR#118のCI決着"
+    awaiting_check: "gh pr checks 118"
+YAML
+
+    run bash -c "
+        # 番犬プロセスがこの直前に入れ替わったばかりであることを明示的に
+        # 模す。是正前のBATON_HELD_SINCEフォールバックであれば1回目の
+        # check_onceでheld_elapsed=0となり発火しないはずだが、
+        # awaiting_sinceから導く経路であればプロセスの若さに関係なく
+        # 最初の呼び出しで発火する(TC-BATON-AW-003/007と同じ主張)。
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(external-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-P2-3: the safety net still reports 'no marker' when no cmd has any awaiting marker at all (regression pin, no over-matching)" {
+    write_settings true 5 60   # held_threshold既定3600s
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << 'YAML'
+commands:
+  - id: cmd_1
+    status: in_progress
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        BATON_HELD_SINCE=\$(( \$(date +%s) - 4000 ))
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held): unread=0 active=0 open_cmds=1(人待ちの印なし)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "external-held" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
+
+@test "T-P2-4: a lord marker takes priority over a coexisting external marker (existing branch order regression pin)" {
+    write_settings true 5 60
+    local lord_since ext_since
+    lord_since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    ext_since="$(date -d @$(( $(date +%s) - 4000 )) '+%Y-%m-%dT%H:%M:%S')"
+    cat > "$FIXTURE_ROOT/queue/shogun_to_karo.yaml" << YAML
+commands:
+  - id: cmd_100
+    status: in_progress
+    awaiting: lord
+    awaiting_since: "$lord_since"
+  - id: cmd_236
+    status: in_progress
+    awaiting: external
+    awaiting_since: "$ext_since"
+    awaiting_target: "PR#118のCI決着"
+    awaiting_check: "gh pr checks 118"
+YAML
+
+    run bash -c "
+        source '$TEST_HARNESS'
+        check_once
+    "
+    [ "$status" -eq 0 ]
+    grep -q "baton_lost(human-held)" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+    ! grep -q "external-held" "$SHOGUN_NOTIFY_LOG" || { cat "$SHOGUN_NOTIFY_LOG"; false; }
+}
