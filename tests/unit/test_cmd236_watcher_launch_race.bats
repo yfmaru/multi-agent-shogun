@@ -96,7 +96,7 @@ teardown() {
 # ---------------------------------------------------------------------------
 @test "T-RACE-002: two concurrent callers sharing start_watcher_if_missing launch at most one watcher" {
     if ! command -v flock >/dev/null 2>&1; then
-        skip "flock not available on this host (e.g. macOS CI runner); production environment is always Linux (WSL2) and has flock — see CLAUDE.md 環境節"
+        skip "flock not available (CI environment: macOS runners lack util-linux's flock); production environment is always Linux (WSL2) and has flock — see CLAUDE.md 環境節"
     fi
 
     local agent="cmd236race_$$"
