@@ -342,19 +342,29 @@ check_worktree() {
 # `fatal: working trees containing submodules cannot be moved or
 # removed`). Empirically, `git submodule deinit --all -f` ALONE does not
 # clear the block — git still refuses afterward. The actual gate is
-# $canon's own git-dir/modules directory (created the first time
-# `git submodule update --init` runs in THIS worktree; separate from the
-# shared $main_repo/.git/modules object store), and it survives deinit.
-# Both steps are required, in this order: deinit first (clears the
+# $canon's own git-dir/modules directory, and it survives deinit. Both
+# steps are required, in this order: deinit first (clears the
 # submodule's working-tree checkout and gitlink so the directory doesn't
 # end up as a dangling `.git` pointer), then remove that leftover
-# metadata directory. A worktree that never initialized any submodule
-# has no such directory and is left untouched (no-op).
+# metadata directory.
+#
+# cmd_237: this directory is NOT reliably present before deinit runs.
+# When a submodule's `.git` is still embedded in the worktree (checked
+# out by something other than `git submodule update --init` in this
+# worktree — e.g. a raw `git clone` into the path — `absorbgitdirs` has
+# never fired yet), $wt_gitdir/modules does not exist until `git
+# submodule deinit --all -f` itself triggers the migration as a side
+# effect (git prints "This will be replaced with a .git file by using
+# absorbgitdirs" and creates modules/ during the deinit). Gating on the
+# directory's prior existence skipped exactly the worktrees that most
+# needed deinit, leaving their submodule blocking `git worktree remove`.
+# `deinit --all -f` is unconditionally safe to run on a worktree with no
+# submodules at all — it is a no-op — so it is always attempted once the
+# */worktrees/* shape check confirms this is a linked worktree.
 deinit_worktree_submodules() {
     local canon="$1" wt_gitdir
     wt_gitdir="$(git -C "$canon" rev-parse --absolute-git-dir)"
     [[ "$wt_gitdir" == */worktrees/* ]] || return 0
-    [[ -d "$wt_gitdir/modules" ]] || return 0
     git -C "$canon" submodule deinit --all -f
     rm -rf "$wt_gitdir/modules"
 }

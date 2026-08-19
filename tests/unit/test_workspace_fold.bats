@@ -529,6 +529,68 @@ STUB
     [ ! -d "$path" ]
 }
 
+@test "cmd_237 regression: a worktree whose submodule .git is still embedded (absorbgitdirs never ran) folds successfully with --yes, even though \$wt_gitdir/modules does not exist BEFORE deinit runs" {
+    # This is the gap PR#118 (cmd_222 follow-up) left open: the fixture
+    # above ("a worktree that initialized a submodule...") uses
+    # `git submodule add` INSIDE the worktree, which git itself absorbs
+    # into $wt_gitdir/modules immediately — so $wt_gitdir/modules already
+    # existed before the script ever ran, and the old
+    # `[[ -d "$wt_gitdir/modules" ]] || return 0` guard happened to pass.
+    # 4/40 real worktrees (family diagnosed 2026-08-19) instead had their
+    # submodule's .git checked out as a real embedded directory (e.g. via
+    # a raw `git clone` into the path rather than `git submodule update
+    # --init`) — absorbgitdirs had never fired, so $wt_gitdir/modules did
+    # not exist yet, the old guard early-returned, and the submodule was
+    # never deinitialized. `git worktree remove` then refused with
+    # `fatal: working trees containing submodules cannot be moved or
+    # removed`. This fixture reproduces exactly that pre-absorb state.
+    git init -q --bare "$TEST_TMPDIR/sub237.git"
+    git -C "$TEST_TMPDIR/sub237.git" symbolic-ref HEAD refs/heads/main
+    git init -q "$TEST_TMPDIR/sub237seed"
+    git -C "$TEST_TMPDIR/sub237seed" config user.email "test@example.com"
+    git -C "$TEST_TMPDIR/sub237seed" config user.name "Test User"
+    git -C "$TEST_TMPDIR/sub237seed" checkout -q -b main
+    echo sub237 > "$TEST_TMPDIR/sub237seed/sub237.txt"
+    git -C "$TEST_TMPDIR/sub237seed" add sub237.txt
+    git -C "$TEST_TMPDIR/sub237seed" commit -q -m sub237
+    git -C "$TEST_TMPDIR/sub237seed" remote add origin "$TEST_TMPDIR/sub237.git"
+    git -C "$TEST_TMPDIR/sub237seed" push -q -u origin main
+
+    path="$(mk_clean_worktree embedded_submodule)"
+
+    # Raw clone (NOT `git submodule add`/`update --init`) leaves a real
+    # `.git` DIRECTORY under sub/ — the pre-absorbgitdirs state.
+    git -c protocol.file.allow=always clone -q "$TEST_TMPDIR/sub237.git" "$path/sub"
+    cat > "$path/.gitmodules" <<EOF
+[submodule "sub"]
+	path = sub
+	url = $TEST_TMPDIR/sub237.git
+EOF
+    # `git add` on a directory containing an embedded .git creates the
+    # gitlink automatically (with an advisory hint on stderr); this
+    # matches how these 4 real worktrees ended up with a submodule
+    # gitlink whose working tree was never actually absorbed.
+    git -C "$path" add .gitmodules sub >/dev/null 2>&1
+    git -C "$path" commit -q -m "add submodule (embedded .git, not absorbed)"
+    git -C "$path" push -q origin "feat/embedded_submodule"
+
+    # Sanity: this fixture reproduces the exact gap — the submodule's
+    # working tree really is a raw embedded .git directory, and
+    # $wt_gitdir/modules does NOT exist yet (the old guard's precondition
+    # is false here, unlike the sibling fixture above).
+    [ -d "$path/sub/.git" ] || { echo "fixture did not create an embedded submodule .git directory"; false; }
+    wt_gitdir="$(git -C "$path" rev-parse --absolute-git-dir)"
+    [ ! -e "$wt_gitdir/modules" ] || { echo "fixture invalid: \$wt_gitdir/modules already exists before the script ran, this must reproduce the PRE-absorb gap"; false; }
+
+    git -C "$TEST_MAIN" merge -q --ff-only "feat/embedded_submodule"
+    git -C "$TEST_MAIN" push -q origin develop
+
+    run bash "$FOLD" "$path" --yes
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    [[ "$output" == *"FOLDED"* ]] || { echo "$output"; false; }
+    [ ! -d "$path" ]
+}
+
 @test "F-1 regression: single-target on another repo's main worktree must not delete the caller's own .git/modules (gunshi QC on PR#118: 'rev-parse --git-dir' is relative for a main worktree, so \$wt_gitdir/modules resolves against the invoking shell's cwd, not \$canon)" {
     # "caller" = the repo whose cwd the script is invoked from. It has a
     # real submodule initialized in its OWN main worktree, so its
