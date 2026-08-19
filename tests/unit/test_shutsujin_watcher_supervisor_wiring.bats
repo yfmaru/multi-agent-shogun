@@ -19,9 +19,15 @@ SCRIPT_PATH="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)/shutsujin_dep
         || grep -B3 'scripts/watcher_supervisor.sh"' "$SCRIPT_PATH" | grep -q 'pgrep -f "scripts/watcher_supervisor.sh"'
 }
 
-@test "T-SDW-003: existing per-agent inbox_watcher startup block (STEP 6.6) is untouched" {
+@test "T-SDW-003: per-agent inbox_watcher startup block (STEP 6.6) launches via the shared start_watcher_if_missing() (cmd_236)" {
+    # cmd_236以降、STEP 6.6は scripts/inbox_watcher.sh への直接nohupを
+    # やめ、watcher_supervisor.sh の start_watcher_if_missing()（唯一の
+    # 実装・flockで排他）を source して呼ぶ形へ差し替えた
+    # （queue/reports/... 参照。詳細は tests/unit/test_cmd236_watcher_launch_race.bats）。
     grep -q "STEP 6.6: inbox_watcher起動（全エージェント）" "$SCRIPT_PATH"
-    grep -q 'scripts/inbox_watcher.sh" shogun "shogun:main.0"' "$SCRIPT_PATH"
+    grep -qF 'source "$SCRIPT_DIR/scripts/watcher_supervisor.sh"' "$SCRIPT_PATH"
+    grep -q 'start_watcher_if_missing "shogun" "shogun:main.0"' "$SCRIPT_PATH"
+    ! grep -q 'nohup.*scripts/inbox_watcher\.sh.*shogun.*shogun:main\.0' "$SCRIPT_PATH"
 }
 
 @test "T-SDW-004: shutsujin_departure.sh has no syntax errors" {

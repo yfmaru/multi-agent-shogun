@@ -115,7 +115,7 @@ join_lines() {
     [[ "$output" == *$'gunshi2\tmultiagent:agents.4\tlogs/inbox_watcher_gunshi2.log'* ]]
 }
 
-@test "agent_registry: shogun pane matches the literal pane shutsujin_departure.sh passes to inbox_watcher.sh" {
+@test "agent_registry: shogun pane matches the literal pane shutsujin_departure.sh passes to start_watcher_if_missing" {
     local settings="$TEST_TMP/settings.yaml"
     write_settings "$settings" 'cli:
   agents:
@@ -127,9 +127,14 @@ join_lines() {
     local registry_pane
     registry_pane="$(agent_registry_pane_for_agent shogun)"
 
+    # cmd_236: shutsujin_departure.sh は STEP 6.6 で watcher_supervisor.sh
+    # の start_watcher_if_missing() を呼ぶ形へ差し替わった（scripts/inbox_watcher.sh
+    # への直接nohupではない）。本テストの主旨（agent_registryの計算するshogun
+    # paneと、shutsujin側が実際に使うリテラルpaneが一致すること）はそのまま、
+    # 照合先の呼び出し形だけ新実装に合わせる。
     local departure_script="$PROJECT_ROOT/shutsujin_departure.sh"
     [ -f "$departure_script" ]
-    grep -q "inbox_watcher.sh\" shogun \"${registry_pane}\"" "$departure_script" \
+    grep -q "start_watcher_if_missing \"shogun\" \"${registry_pane}\"" "$departure_script" \
         || { echo "agent_registry shogun pane ($registry_pane) not found as literal in $departure_script"; false; }
 }
 

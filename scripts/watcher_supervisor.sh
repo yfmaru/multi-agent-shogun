@@ -209,13 +209,21 @@ start_all_watchers() {
     done < <(watcher_specs)
 }
 
-if [ "${1:-}" = "--print-watchers" ]; then
-    watcher_specs
-    exit 0
-fi
+# cmd_236: shutsujin_departure.sh がこのファイルを source して
+# start_watcher_if_missing() を直接呼ぶため、直接実行時のみ
+# main loop（無限ループ）へ入るようガードする。source時に
+# ${BASH_SOURCE[0]} は本ファイル自身のパスのまま、${0} は
+# source元のスクリプト名（またはbash自体）になるため両者は
+# 一致しない。
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    if [ "${1:-}" = "--print-watchers" ]; then
+        watcher_specs
+        exit 0
+    fi
 
-while true; do
-    start_all_watchers
-    rotate_all_managed_logs
-    sleep 5
-done
+    while true; do
+        start_all_watchers
+        rotate_all_managed_logs
+        sleep 5
+    done
+fi
