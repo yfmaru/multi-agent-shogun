@@ -913,40 +913,46 @@ NINJA_EOF
     done
 
     # 既存のwatcherと孤児inotifywait/fswatchをkill
-    pkill -f "inbox_watcher.sh" 2>/dev/null || true
+    # cmd_236: パターン文字列が本pkill呼び出し自身のコマンドライン
+    # （ラッパのcmdline）にliteralに載ると自己マッチし得る
+    # （CLAUDE.md「pgrep Self-Match Pitfall in Wait Loops」節）。
+    # 角括弧分割で回避する。
+    pkill -f "inbox_watch[e]r.sh" 2>/dev/null || true
     pkill -f "inotifywait.*queue/inbox" 2>/dev/null || true
     pkill -f "fswatch.*queue/inbox" 2>/dev/null || true
     sleep 1
 
-    # 将軍のwatcher（ntfy受信の自動起床に必要）
-    # 安全モード: phase2/phase3エスカレーションは無効、timeout周期処理も無効（event-drivenのみ）
-    _shogun_watcher_cli=$(tmux show-options -p -t "shogun:main" -v @agent_cli 2>/dev/null || echo "claude")
-    nohup env ASW_DISABLE_ESCALATION=1 ASW_PROCESS_TIMEOUT=0 ASW_DISABLE_NORMAL_NUDGE=0 \
-        bash "$SCRIPT_DIR/scripts/inbox_watcher.sh" shogun "shogun:main.0" "$_shogun_watcher_cli" \
-        >> "$SCRIPT_DIR/logs/inbox_watcher_shogun.log" 2>&1 &
-    disown
+    # cmd_236: 起動経路の一本化。
+    # 従来はここで直接nohupしていたが、STEP 6.6.5のwatcher_supervisor.sh
+    # 側の起動判定（pgrep+flock）とは独立した実装であったため、両者が
+    # 近接タイミングで起動すると排他が効かず二重起動が起こり得た
+    # （2026-08-19未明の実害・軍師CLI破損）。scripts/watcher_supervisor.sh
+    # が既に持つ start_watcher_if_missing()（flockで排他する唯一の
+    # 実装）をsourceして呼ぶ形へ差し替え、両方の起こし手が同じ排他を
+    # 共有するようにする。
+    # サブシェル化する理由: watcher_supervisor.shはset -euo pipefailを
+    # 持つため、本スクリプトの以後のフローへその設定を波及させぬため。
+    (
+        source "$SCRIPT_DIR/scripts/watcher_supervisor.sh"
 
-    # 家老のwatcher
-    _karo_watcher_cli=$(tmux show-options -p -t "multiagent:agents.${PANE_BASE}" -v @agent_cli 2>/dev/null || echo "claude")
-    nohup bash "$SCRIPT_DIR/scripts/inbox_watcher.sh" karo "multiagent:agents.${PANE_BASE}" "$_karo_watcher_cli" \
-        >> "$SCRIPT_DIR/logs/inbox_watcher_karo.log" 2>&1 &
-    disown
+        # 将軍のwatcher（ntfy受信の自動起床に必要）
+        # 安全モード: phase2/phase3エスカレーションは無効、timeout周期処理も無効（event-drivenのみ）
+        ASW_DISABLE_ESCALATION=1 ASW_PROCESS_TIMEOUT=0 ASW_DISABLE_NORMAL_NUDGE=0 \
+            start_watcher_if_missing "shogun" "shogun:main.0" "$SCRIPT_DIR/logs/inbox_watcher_shogun.log"
 
-    # 足軽のwatcher
-    for i in $(seq 1 "$_ASHIGARU_COUNT"); do
-        p=$((PANE_BASE + i))
-        _ashi_watcher_cli=$(tmux show-options -p -t "multiagent:agents.${p}" -v @agent_cli 2>/dev/null || echo "claude")
-        nohup bash "$SCRIPT_DIR/scripts/inbox_watcher.sh" "ashigaru${i}" "multiagent:agents.${p}" "$_ashi_watcher_cli" \
-            >> "$SCRIPT_DIR/logs/inbox_watcher_ashigaru${i}.log" 2>&1 &
-        disown
-    done
+        # 家老のwatcher
+        start_watcher_if_missing "karo" "multiagent:agents.${PANE_BASE}" "$SCRIPT_DIR/logs/inbox_watcher_karo.log"
 
-    # 軍師のwatcher
-    p=$((PANE_BASE + _ASHIGARU_COUNT + 1))
-    _gunshi_watcher_cli=$(tmux show-options -p -t "multiagent:agents.${p}" -v @agent_cli 2>/dev/null || echo "claude")
-    nohup bash "$SCRIPT_DIR/scripts/inbox_watcher.sh" "gunshi" "multiagent:agents.${p}" "$_gunshi_watcher_cli" \
-        >> "$SCRIPT_DIR/logs/inbox_watcher_gunshi.log" 2>&1 &
-    disown
+        # 足軽のwatcher
+        for i in $(seq 1 "$_ASHIGARU_COUNT"); do
+            p=$((PANE_BASE + i))
+            start_watcher_if_missing "ashigaru${i}" "multiagent:agents.${p}" "$SCRIPT_DIR/logs/inbox_watcher_ashigaru${i}.log"
+        done
+
+        # 軍師のwatcher
+        p=$((PANE_BASE + _ASHIGARU_COUNT + 1))
+        start_watcher_if_missing "gunshi" "multiagent:agents.${p}" "$SCRIPT_DIR/logs/inbox_watcher_gunshi.log"
+    )
 
     log_success "  └─ $((_ASHIGARU_COUNT + 3))エージェント分のinbox_watcher起動完了（将軍+家老+足軽${_ASHIGARU_COUNT}+軍師）"
 
