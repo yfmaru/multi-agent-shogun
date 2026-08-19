@@ -85,8 +85,20 @@ teardown() {
 # 「flockが2本の同時呼び出しのうち1本しか本体へ進ませぬこと」の一点)。
 # pgrepは「既存watcher無し」を返す（=各呼び出し内で唯一分岐するのは
 # flockの成否のみ、という単純化）。
+#
+# flockが無い環境（macOS CI runner等。util-linux由来のためmacOSには
+# 標準で存在しない）ではskipする——本番稼働環境は常にLinux(WSL2)で
+# あり（CLAUDE.md環境節）、flockの不在はテスト対象コードの不備ではなく
+# CIマトリクス側の既知の欠如である。既存のtests/unit/test_watcher_supervisor.bats
+# 内の全テストも同じ理由でflockをスタブしている（コメント「macOS runners
+# lack flock」参照）が、本テストはflockの実挙動そのものを検証したいため
+# スタブでは意味を成さず、skipを選ぶ。
 # ---------------------------------------------------------------------------
 @test "T-RACE-002: two concurrent callers sharing start_watcher_if_missing launch at most one watcher" {
+    if ! command -v flock >/dev/null 2>&1; then
+        skip "flock not available on this host (e.g. macOS CI runner); production environment is always Linux (WSL2) and has flock — see CLAUDE.md 環境節"
+    fi
+
     local agent="cmd236race_$$"
     local pane="faketest:0.0"
     local lockfile="/tmp/shogun_watcher_start_${agent}.lock"
