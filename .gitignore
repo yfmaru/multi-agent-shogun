@@ -13,6 +13,7 @@
 !.gitignore
 !.gitattributes
 !.gitleaks.toml
+!.secretscanignore
 !CLAUDE.md
 !LICENSE
 !README.md
@@ -104,6 +105,7 @@
 !scripts/build_instructions.sh
 !scripts/slim_yaml.sh
 !scripts/slim_yaml.py
+!scripts/secret_scan.sh
 scripts/seo_qc.py
 scripts/seo_qc.sh
 !scripts/stop_hook_inbox.sh
@@ -225,6 +227,10 @@ tests/specs/osato_lms_*
 !.github/PULL_REQUEST_TEMPLATE.md
 !.github/workflows/
 !.github/workflows/*.yml
+
+# Secret scan pre-push hook (cmd_242)
+!.githooks/
+!.githooks/pre-push
 
 # Android companion app
 !android/
