@@ -151,10 +151,13 @@ run_scan_all() {
 # ============================================================
 
 @test "T-SCAN-012: output never contains the detected secret value" {
-    local secret="AKIA$(repeat Z 16)"
-    add_file "fixture.txt" "aws_key = ${secret}"
+    # 変数名を"secret"にすると、この行のソーステキスト自体が(gitleaksの
+    # generic-passwordルールのような)key=value形式の検出器に誤反応しうる
+    # ため、意図的に別名にしてある。
+    local specimen_value="AKIA$(repeat Z 16)"
+    add_file "fixture.txt" "aws_key = ${specimen_value}"
     run_scan_all
-    refute_output --partial "$secret" || { echo "SECRET VALUE LEAKED INTO OUTPUT: $output"; false; }
+    refute_output --partial "$specimen_value" || { echo "SECRET VALUE LEAKED INTO OUTPUT: $output"; false; }
     assert_output --partial "valuelen="
 }
 
