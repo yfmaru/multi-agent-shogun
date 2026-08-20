@@ -27,7 +27,12 @@ Thank you for your interest in contributing to multi-agent-shogun! This document
    ```bash
    git clone https://github.com/YOUR_USERNAME/multi-agent-shogun.git
    cd multi-agent-shogun
+   git config core.hooksPath .githooks
    ```
+   `core.hooksPath` はrepositoryごとの設定であり、cloneには付いて回らない。
+   これを踏まぬcloneでは秘密走査のpre-pushフック（`.githooks/pre-push`、
+   cmd_242）が効かない——だからCI側にも同じ検査（`secret-scan`ジョブ）が
+   独立に存在する。
 3. **Create a feature branch**:
    ```bash
    git checkout -b feature/your-feature-name
@@ -438,6 +443,20 @@ implementation, before it ever reached CI.
      by ashigaru3, root-caused and verified by gunshi (3-run comparison,
      `queue/inbox/karo.yaml` message `msg_20260806_143818_b3fad97f`,
      2026-08-06 14:38 JST), escalated by shogun.
+
+### タスクYAML作成者向け: 検体は合成せよ（cmd_242）
+
+**タスクYAMLを書く者（家老・軍師・将軍）は、テスト検体・fixtureに実データを
+指定してはならない。**「本物のqueueスナップショットをfixtureへコピーせよ」
+のような具体的な実データ指定は、実装者がそれをそのまま追跡ツリーへ
+書き込む事故につながる（cmd_221付随の事故、`docs/incidents.md`参照 —
+実データがそのままテストfixtureとして公開リポジトリへ露出した）。
+
+代わりに「検体は合成せよ（synthesize the specimen）」と明記すること。
+実装者は、実データの形式・構造だけを模した架空の値を作る。合成検体には
+`test-`/`fake-`/`mock-`接頭辞、見本値には`your-`等のプレースホルダ語を
+用いることで、`scripts/secret_scan.sh`の誤検知フィルタも自然に効く
+（CLAUDE.md「Secrets Discipline」節参照）。
 
 ---
 
