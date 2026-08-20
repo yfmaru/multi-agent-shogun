@@ -2560,7 +2560,8 @@ _usage_window_check() {
     USAGE_RESUMED_WINDOW[$label]=$reset
 }
 
-if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ]; then
+if [ "${__BATON_WATCHDOG_TESTING__:-}" != "1" ] \
+   && [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     mkdir -p "$ROOT/logs"
 
     # enabled=false ならデーモンとして起動する意味自体が無いため即終了する。

@@ -5410,3 +5410,40 @@ YAML
     ! grep -q "cmd_251" "$SHOGUN_NOTIFY_LOG" \
         || { echo "did not expect the message to name cmd_251 (below threshold, NB-1 regression)"; cat "$SHOGUN_NOTIFY_LOG"; false; }
 }
+
+# 【cmd_242: BASH_SOURCE guard・予防的是正】
+# 2026-08-20、本ファイルを__BATON_WATCHDOG_TESTING__=1を立てずに素の
+# sourceで実行してしまい、常駐daemonの主ループ(while true)が実際に
+# 走り出し、本物のqueue/へ誤った状態を書き込む事故が1日で3度起きた
+# (家老1度・将軍2度)。姉妹ファイルscripts/watcher_supervisor.shには
+# 既に[[ "${BASH_SOURCE[0]}" == "${0}" ]]ガードが在ったが、本ファイル
+# には無かった。本テストはそのガードが機能することを固定する。
+#   TC-242-001: __BATON_WATCHDOG_TESTING__無しでsourceしても主ループへ
+#               入らず即座に制御が戻ること(関数定義の読み込みのみ)
+
+@test "TC-242-001: sourcing without __BATON_WATCHDOG_TESTING__ does not enter the main loop (BASH_SOURCE guard)" {
+    run timeout 10 env BATON_WATCHDOG_ROOT="$FIXTURE_ROOT" STALL_POLICY_SETTINGS="$FIXTURE_ROOT/config/settings.yaml" \
+        bash -c "unset __BATON_WATCHDOG_TESTING__; source '$WATCHDOG_SCRIPT'; echo SOURCED_RETURNED"
+    [ "$status" -eq 0 ] \
+        || { echo "expected sourcing to return promptly instead of hanging in the main loop; status=$status"; echo "$output"; false; }
+    grep -q "SOURCED_RETURNED" <<< "$output" \
+        || { echo "sourcing never returned control to the caller — the main loop was entered despite the BASH_SOURCE guard"; echo "$output"; false; }
+}
+
+# 軍師QC所見F-1: TC-242-001はガードが「sourceで入らぬこと」しか試験して
+# おらず、「直接実行では入ること」を守る試験が無かった(ガードの片方向
+# 検証不足)。--onceは成功してもガードに塞がれても終了コードは同じ0に
+# なるため、終了コードでは判別できない——主ループに入った正の痕跡
+# (baton_watchdog/check_once ログ)で判定する。
+#   TC-242-002: 直接実行(bash "$WATCHDOG_SCRIPT" --once)では主ループへ
+#               実際に入ること(ガードが過剰遮断しないこと)
+
+@test "TC-242-002: executing the script directly still enters the main block (guard does not over-block)" {
+    run timeout 60 env BATON_WATCHDOG_ROOT="$FIXTURE_ROOT" \
+        STALL_POLICY_SETTINGS="$FIXTURE_ROOT/config/settings.yaml" \
+        USAGE_LIMIT_CREDS="$USAGE_TEST_CREDS" \
+        PATH="$USAGE_TEST_BIN:$PATH" \
+        bash "$WATCHDOG_SCRIPT" --once
+    grep -q "baton_watchdog/check_once" <<< "$output" \
+        || { echo "direct execution did not enter the main block — the BASH_SOURCE guard is over-blocking and the watchdog would never start"; echo "$output"; false; }
+}
