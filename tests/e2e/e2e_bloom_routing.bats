@@ -2,16 +2,20 @@
 # e2e_bloom_routing.bats — Dim C: スマート切り替えE2Eテスト
 # Issue #53 Phase 2 — find_agent_for_model() + karo bloom routing 統合検証
 #
-# 実行対象: 本番VPS上の実セッション、またはCI上に合成した使い捨てセッション。
-# tmuxセッション "multiagent" が存在すればそれをそのまま使う（本番想定）。
-# 存在しなければ（CIランナーは常にこちら）setup_file() がダミーの
-# "multiagent" セッションを合成する——実CLIプロセスは不要で、
-# find_agent_for_model() が読むのは `tmux list-panes` の `@agent_id`
-# オプションと agent_is_busy_check() が見るpane内容のみであるため、
-# `timeout -s HUP 1800 bash` の対話シェルに @agent_id を設定するだけで足りる
-# （CLAUDE.md Test Rules 5準拠・自己終了設計。GitHub Actionsランナーは
-# ワークフロー実行ごとに独立インスタンスゆえ、本番の"multiagent"セッションとは
-# 衝突しない）。
+# 実行対象: 本ファイルが自分で合成した使い捨てセッションのみ。
+# find_agent_for_model() は `tmux list-panes -a` で全セッションを走査し
+# `@agent_id` オプションで突き合わせるだけで、セッション名は判定に一切
+# 関与しない（軍師実測・cmd_241是正）。ゆえに本番想定で"multiagent"
+# セッションを探して再利用する必要は元々無く、他12件のE2Eテストファイルと
+# 同じくPID接尾辞付きの一意な名前（例: e2e_bloom_$$）で毎回合成すれば
+# 検証内容は一切損なわれない。本番セッションを見つけて再利用する経路は
+# 「本物の足軽のpaneへ誤ってsend-keysが飛ぶ」事故（cmd_241 1回目redoの
+# 原因そのもの）を構造的に許す設計だったため廃止した。
+# 実CLIプロセスは不要で、find_agent_for_model() が読むのは
+# `tmux list-panes` の `@agent_id` オプションと agent_is_busy_check() が
+# 見るpane内容のみであるため、`timeout -s HUP 1800 bash` の対話シェルに
+# @agent_id を設定するだけで足りる（CLAUDE.md Test Rules 5準拠・
+# 自己終了設計）。
 #
 # CLI_ADAPTER_SETTINGS は本番 config/settings.yaml ではなく
 # tests/e2e/fixtures/settings_bloom_routing.yaml を常に使う——前者は
@@ -26,18 +30,18 @@
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 BLOOM_SETTINGS="${PROJECT_ROOT}/tests/e2e/fixtures/settings_bloom_routing.yaml"
 _E2E_BLOOM_AGENTS=(ashigaru1 ashigaru2 ashigaru3 ashigaru4 ashigaru5 ashigaru6 ashigaru7)
-_E2E_BLOOM_SYNTHESIZED=0
+_E2E_BLOOM_SESSION=""
 
-# _e2e_bloom_synth_session — "multiagent" セッションが存在しない環境
-# （CIランナー等）向けに、@agent_id オプションのみを備えたダミーpane群を
-# 合成する。実CLIは起動しない。全窓は `timeout -s HUP 1800 bash`
-# （対話bash・SIGTERM無視をSIGHUPで確実に終端）を上限とする自己終了設計であり、
-# このファイルの全テストが済み次第 teardown_file() が `tmux kill-session` で
-# 即座に畳む（同期的に完了するため、後続テストへ持ち越さない）——1800秒の
-# 上限はteardown_file()自体が走らなかった場合の最終防衛線であり、
-# 通常は数秒で不要になる資源をジョブの残り時間いっぱい居座らせない。
+# _e2e_bloom_synth_session — @agent_id オプションのみを備えたダミーpane群を
+# PID接尾辞付きの一意な名前のセッションへ合成する。実CLIは起動しない。
+# 全窓は `timeout -s HUP 1800 bash`（対話bash・SIGTERM無視をSIGHUPで確実に
+# 終端）を上限とする自己終了設計であり、このファイルの全テストが済み次第
+# teardown_file() が `tmux kill-session` で即座に畳む（同期的に完了する
+# ため、後続テストへ持ち越さない）——1800秒の上限はteardown_file()自体が
+# 走らなかった場合の最終防衛線であり、通常は数秒で不要になる資源を
+# ジョブの残り時間いっぱい居座らせない。
 _e2e_bloom_synth_session() {
-    local session="multiagent"
+    local session="e2e_bloom_$$"
     local stdio_sink="/dev/null"
 
     tmux new-session -d -s "$session" -n "${_E2E_BLOOM_AGENTS[0]}" \
@@ -53,20 +57,19 @@ _e2e_bloom_synth_session() {
     # 各paneの対話bashがプロンプトを出すまでの猶予。idle判定はプロンプト
     # 文字列の有無で決まるため、生成直後の空pane読み取りを避ける。
     sleep 1
-    _E2E_BLOOM_SYNTHESIZED=1
+    _E2E_BLOOM_SESSION="$session"
 }
 
 setup_file() {
     command -v tmux &>/dev/null || return 0
-    if ! tmux has-session -t multiagent 2>/dev/null; then
-        _e2e_bloom_synth_session
-    fi
+    _e2e_bloom_synth_session
 }
 
 teardown_file() {
-    [[ "$_E2E_BLOOM_SYNTHESIZED" == "1" ]] || return 0
-    # 自分が合成したセッションのみを畳む（本番セッションを見つけて再利用した
-    # 場合はここに来ない・_E2E_BLOOM_SYNTHESIZEDの真偽で判定済み）。
+    [[ -n "$_E2E_BLOOM_SESSION" ]] || return 0
+    # 自分がsetup_file()で合成したセッションのみを畳む——本番セッションを
+    # 探して再利用する経路は廃止済みゆえ、ここに来るのは常に自分が作った
+    # ものである。
     #
     # cmd_241是正: 当初はtmux send-keysで各paneへ"exit"を送る方式だったが、
     # これは非同期——送信直後にteardown_file()が返るため、送信先paneの
@@ -81,16 +84,14 @@ teardown_file() {
     # D006（kill/tmux kill-session の絶対禁止）は「他エージェント・本番
     # 基盤の終了」を対象とする条文であり、本呼び出しは自分がこの
     # teardown_file()の数秒前に合成した使い捨てセッションを自分で畳む
-    # ものゆえ対象外（本番"multiagent"セッションを見つけた場合は上の
-    # ガードによりここへ到達しない）。
-    tmux kill-session -t "multiagent" 2>/dev/null || true
+    # ものゆえ対象外。
+    tmux kill-session -t "$_E2E_BLOOM_SESSION" 2>/dev/null || true
 }
 
 setup() {
-    # tmuxセッションの存在確認（本番セッション、または上の setup_file() が
-    # 合成したセッションのいずれか）
-    if ! tmux has-session -t multiagent 2>/dev/null; then
-        skip "tmux session 'multiagent' が存在せず、合成にも失敗した。"
+    # 合成セッションの存在確認（setup_file() が既に合成しているはず）
+    if [[ -z "$_E2E_BLOOM_SESSION" ]] || ! tmux has-session -t "$_E2E_BLOOM_SESSION" 2>/dev/null; then
+        skip "合成tmuxセッションが存在しない(setup_file()での合成に失敗した)。"
     fi
 
     # lib/cli_adapter.sh のロード

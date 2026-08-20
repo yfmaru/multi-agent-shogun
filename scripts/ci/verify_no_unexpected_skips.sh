@@ -16,8 +16,11 @@
 # Remaining arguments are expected to already be an expanded list of .bats
 # files (the caller's shell glob, e.g. `tests/*.bats tests/unit/*.bats`). A
 # glob that matched nothing (literal pattern passed through unexpanded) is
-# silently skipped, matching the historical `[ -f "$f" ] || continue`
-# behavior this replaces.
+# skipped per-file via `[ -f "$f" ] || continue`, matching the historical
+# behavior this replaces. But if that leaves zero files actually checked
+# (including the no-args case), the gate errors out instead of silently
+# reporting success — measuring nothing must never look like passing
+# (cmd_241 F-4).
 set -euo pipefail
 
 BATS_ARGS=()
@@ -34,16 +37,13 @@ while [[ $# -gt 0 && "$1" == --* ]]; do
     esac
 done
 
-if [ "$#" -eq 0 ]; then
-    echo "::warning::verify_no_unexpected_skips.sh: no target files given"
-    exit 0
-fi
-
 SKIP_COUNT=0
+CHECKED_COUNT=0
 TAP_OUT="$(mktemp)"
 trap 'rm -f "$TAP_OUT"' EXIT
 for f in "$@"; do
     [ -f "$f" ] || continue
+    CHECKED_COUNT=$((CHECKED_COUNT + 1))
     echo "::group::${f}"
     # Redirect to a regular file rather than capturing via $(...). A test
     # file that spawns a detached process (e.g. a synthesized tmux session
@@ -64,8 +64,13 @@ for f in "$@"; do
     echo "::endgroup::"
 done
 
+if [ "$CHECKED_COUNT" -eq 0 ]; then
+    echo "::error::verify_no_unexpected_skips.sh: 0 files were actually checked (all args were missing/unexpanded globs). Refusing to report success without measuring anything."
+    exit 1
+fi
+
 if [ "$SKIP_COUNT" -gt 0 ]; then
     echo "::error::${SKIP_COUNT} tests were SKIPPED unexpectedly. SKIP = FAIL policy (FR-054)."
     exit 1
 fi
-echo "All tests executed (0 unexpected skips)"
+echo "All tests executed (0 unexpected skips, ${CHECKED_COUNT} file(s) checked)"
