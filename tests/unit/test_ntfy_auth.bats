@@ -47,13 +47,13 @@ teardown() {
 # --- T-AUTH-001: Bearer token認証 ---
 
 @test "T-AUTH-001: ntfy_get_auth_args returns Bearer header when NTFY_TOKEN is set" {
-    export NTFY_TOKEN="tk_test1234567890abcdef"
+    export NTFY_TOKEN="test-tk1234567890abcdef"
 
     local result
     result=$(ntfy_get_auth_args /dev/null)
 
     echo "$result" | grep -q -- '-H'
-    echo "$result" | grep -q 'Authorization: Bearer tk_test1234567890abcdef'
+    echo "$result" | grep -q 'Authorization: Bearer test-tk1234567890abcdef'
 }
 
 # --- T-AUTH-002: Basic認証 ---
@@ -81,14 +81,14 @@ teardown() {
 # --- T-AUTH-004: token優先 ---
 
 @test "T-AUTH-004: ntfy_get_auth_args prefers token over basic auth" {
-    export NTFY_TOKEN="tk_priority_token"
+    export NTFY_TOKEN="test-priority-token"
     export NTFY_USER="should_not_use"
     export NTFY_PASS="should_not_use"
 
     local result
     result=$(ntfy_get_auth_args /dev/null)
 
-    echo "$result" | grep -q 'Bearer tk_priority_token'
+    echo "$result" | grep -q 'Bearer test-priority-token'
     ! echo "$result" | grep -q 'should_not_use'
 }
 
