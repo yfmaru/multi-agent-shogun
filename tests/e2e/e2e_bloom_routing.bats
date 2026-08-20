@@ -30,7 +30,7 @@
 PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 BLOOM_SETTINGS="${PROJECT_ROOT}/tests/e2e/fixtures/settings_bloom_routing.yaml"
 _E2E_BLOOM_AGENTS=(ashigaru1 ashigaru2 ashigaru3 ashigaru4 ashigaru5 ashigaru6 ashigaru7)
-_E2E_BLOOM_SESSION=""
+_E2E_BLOOM_SESSION="${_E2E_BLOOM_SESSION:-}"
 
 # _e2e_bloom_synth_session — @agent_id オプションのみを備えたダミーpane群を
 # PID接尾辞付きの一意な名前のセッションへ合成する。実CLIは起動しない。
@@ -57,7 +57,7 @@ _e2e_bloom_synth_session() {
     # 各paneの対話bashがプロンプトを出すまでの猶予。idle判定はプロンプト
     # 文字列の有無で決まるため、生成直後の空pane読み取りを避ける。
     sleep 1
-    _E2E_BLOOM_SESSION="$session"
+    export _E2E_BLOOM_SESSION="$session"
 }
 
 setup_file() {
