@@ -29,6 +29,17 @@ repeat() {
     printf "%${2}s" | tr ' ' "$1"
 }
 
+# 秘密鍵ブロックのマーカーを2断片へ分けて連結する。1行に完全な
+# "-----BEGIN...PRIVATE KEY-----"を書くと、このテストファイル自身が
+# 追跡ツリーに乗った時点でsecret_scan.sh --all(CI)がこのソース行に
+# 自己反応する(実測: PR#125 CIで検出、cmd_242)。断片単独ではどちらの
+# 行もvendor正規表現に一致しない。
+pem_marker() {
+    local head="-----BEGIN RSA"
+    local tail="PRIVATE KEY-----"
+    printf '%s %s' "$head" "$tail"
+}
+
 # ファイルを書いてgit add（--allモード用。committはしない —
 # git ls-filesはindexで足りる）。
 add_file() {
@@ -95,19 +106,25 @@ run_scan_all() {
 }
 
 @test "T-SCAN-008: detects private key block" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     run_scan_all
     assert_output --partial "rule=secret-key-block" || { echo "$output"; false; }
 }
 
 @test "T-SCAN-009: detects credential-embedded URL" {
-    add_file "fixture.txt" "endpoint = https://svc-test:p4ssTEST@internal.example.invalid/api"
+    # URLを前半・後半の2変数へ分ける(pem_markerと同じ理由による自己反応回避)。
+    local scheme_and_user="https://svc-test"
+    local pass_and_path=":p4ssTEST@internal.example.invalid/api"
+    add_file "fixture.txt" "endpoint = ${scheme_and_user}${pass_and_path}"
     run_scan_all
     assert_output --partial "rule=credential-url" || { echo "$output"; false; }
 }
 
 @test "T-SCAN-010: detects ntfy topic URL (and excludes docs.ntfy.sh)" {
-    add_file "fixture.txt" "sub = https://ntfy.sh/some-real-looking-topic-abc"
+    # "https://ntfy"と".sh/topic..."を2断片に分ける(自己反応回避、pem_marker参照)。
+    local ntfy_host="https://ntfy"
+    local ntfy_path=".sh/some-real-looking-topic-abc"
+    add_file "fixture.txt" "sub = ${ntfy_host}${ntfy_path}"
     add_file "fixture2.txt" "see https://docs.ntfy.sh/subscribe/ for details"
     run_scan_all
     assert_output --partial "rule=ntfy-topic-url" || { echo "$output"; false; }
@@ -119,7 +136,12 @@ run_scan_all() {
 # ============================================================
 
 @test "T-SCAN-011: detects quoted secret-like assignment with sufficient entropy" {
-    add_file "fixture.kt" 'const val NTFY_TOPIC = "qz7-nK2mLwR9"'
+    # 開き引用符側と閉じ引用符側を2断片に分ける(自己反応回避、pem_marker参照:
+    # secret_scan.shの代入規則は開始・終了の引用符が同一行に無いと発火しない
+    # ため、分割すればどちらの行も単独では一致しない)。
+    local key_and_open='const val NTFY_TOPIC = "qz7-nK2m'
+    local value_close='LwR9"'
+    add_file "fixture.kt" "${key_and_open}${value_close}"
     run_scan_all
     assert_output --partial "rule=secret-assignment" || { echo "$output"; false; }
 }
@@ -186,7 +208,7 @@ run_scan_all() {
 # ============================================================
 
 @test "T-SCAN-018: allowlist suppresses a pinned (path:line:rule-id) finding" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     local lineno
     lineno=$(grep -n "BEGIN RSA PRIVATE KEY" "$TEST_REPO/fixture.pem" | cut -d: -f1)
     printf 'fixture.pem:%s:secret-key-block  # 試験用固定検体 (cmd_242)\n' "$lineno" > "$TEST_REPO/.secretscanignore"
@@ -197,14 +219,14 @@ run_scan_all() {
 }
 
 @test "T-SCAN-019: allowlist line missing reason/cmd_id errors out (exit 2)" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     printf 'fixture.pem:1:secret-key-block\n' > "$TEST_REPO/.secretscanignore"
     run_scan_all
     [ "$status" -eq 2 ] || { echo "expected exit 2 (malformed ignore line), got status=$status output=$output"; false; }
 }
 
 @test "T-SCAN-020: allowlist line missing well-formed (reason) cmd_id parens errors out (exit 2)" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     printf 'fixture.pem:1:secret-key-block  # no cmd id here\n' > "$TEST_REPO/.secretscanignore"
     run_scan_all
     [ "$status" -eq 2 ] || { echo "expected exit 2 (malformed ignore line), got status=$status output=$output"; false; }
@@ -260,7 +282,7 @@ EOF
 }
 
 @test "T-SCAN-026: exit 1 when block-severity finding is present and unignored" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     run_scan_all
     [ "$status" -eq 1 ] || { echo "status=$status output=$output"; false; }
 }
@@ -270,7 +292,7 @@ EOF
 # ============================================================
 
 @test "T-SCAN-027: --staged mode scans the git index, not the working tree" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     # working treeを検体除去後の内容へ書き換えるが、indexには残す
     printf 'no secret here\n' > "$TEST_REPO/fixture.pem"
     cd "$TEST_REPO"
@@ -284,7 +306,7 @@ EOF
     local old_sha
     old_sha=$(git -C "$TEST_REPO" rev-parse HEAD)
 
-    add_file "fixture2.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture2.pem" "$(pem_marker)"
     git -C "$TEST_REPO" commit -q -m "add secret"
     local new_sha
     new_sha=$(git -C "$TEST_REPO" rev-parse HEAD)
@@ -296,7 +318,7 @@ EOF
 }
 
 @test "T-SCAN-029: --range mode with old=all-zeros (new branch push) scans full tree at new commit" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     git -C "$TEST_REPO" commit -q -m "first commit on new branch"
     local new_sha
     new_sha=$(git -C "$TEST_REPO" rev-parse HEAD)
@@ -309,7 +331,7 @@ EOF
 }
 
 @test "T-SCAN-030: --range mode with new=all-zeros (branch deletion) reports no findings" {
-    add_file "fixture.pem" "-----BEGIN RSA PRIVATE KEY-----"
+    add_file "fixture.pem" "$(pem_marker)"
     git -C "$TEST_REPO" commit -q -m "commit before deletion"
     local old_sha
     old_sha=$(git -C "$TEST_REPO" rev-parse HEAD)
