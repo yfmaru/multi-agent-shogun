@@ -149,13 +149,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # gitleaks-actionはPRのbase..headの範囲をgit logで辿るため、既定の
+      # fetch-depth:1(浅いclone)ではその範囲のコミットが存在せず
+      # "unknown revision"で落ちる(実測: PR#125 run 32369008393)。
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # 主役。種規則(config/settings.yaml・$USER)はgitignore対象ゆえここでは
-      # 使えず、パターン規則のみで走る——これがL2の限界であり、公開そのものを
-      # 防ぐのはローカルのpre-pushフック(L1)である(cmd_242)。venv/pip install
-      # は不要（システムのpython3標準ライブラリのみで動く）。
+      # 主役。種規則のうちconfig/settings.yamlはgitignore対象ゆえCIには
+      # 存在せず、$USERはCI環境変数が立っている間secret_scan.sh自身が
+      # 意図的に読まない(runner等の汎用ユーザ名による誤検知を避けるため)。
+      # ゆえにCIはパターン規則のみで走る——これがL2の限界であり、公開
+      # そのものを防ぐのはローカルのpre-pushフック(L1)である(cmd_242)。
+      # venv/pip installは不要（システムのpython3標準ライブラリのみで動く）。
       - name: Run secret_scan.sh (primary)
         run: bash scripts/secret_scan.sh --all
 
