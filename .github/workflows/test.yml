@@ -144,6 +144,29 @@ jobs:
           echo "::warning::scripts/build_instructions.sh not found. Skipping build check."
           echo "This check will be enabled once template generation is implemented (Phase 2)"
 
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 主役。種規則(config/settings.yaml・$USER)はgitignore対象ゆえここでは
+      # 使えず、パターン規則のみで走る——これがL2の限界であり、公開そのものを
+      # 防ぐのはローカルのpre-pushフック(L1)である(cmd_242)。venv/pip install
+      # は不要（システムのpython3標準ライブラリのみで動く）。
+      - name: Run secret_scan.sh (primary)
+        run: bash scripts/secret_scan.sh --all
+
+      # 補助。種規則を持たぬgitleaksは今回の実際の露出(E-1/E-2)を0/3しか
+      # 検出できなかった(gunshi_report F-1b)。汎用ベンダパターンの網を広く
+      # 保守してもらう目的でCIにのみ配線する——主役はあくまでsecret_scan.sh。
+      - name: Run gitleaks (secondary, vendor-pattern coverage)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   shellcheck:
     name: Shell Script Linting
     runs-on: ubuntu-latest
