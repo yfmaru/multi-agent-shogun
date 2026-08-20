@@ -54,6 +54,17 @@ if [ ! -f "$VENV_DIR/bin/python3" ] || ! "$VENV_DIR/bin/python3" -c "import yaml
     fi
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 秘密走査フックの配線（cmd_242）
+# ───────────────────────────────────────────────────────────────────────────────
+# .git/config はworktree間で共有されるため、ここで1回設定すれば以後の
+# `git worktree add` 全てに引き継がれる（毎回冪等）。ただし別途 `git clone`
+# した独立チェックアウトには付かない — CONTRIBUTING.md「Fork, Branch, PR
+# Workflow」節にも同じ1行を明記してある。踏まぬcloneに対する背水として
+# CIジョブ `secret-scan` が独立に存在する。
+# ═══════════════════════════════════════════════════════════════════════════════
+git config core.hooksPath .githooks
+
 # CLI Adapter読み込み（Multi-CLI Support）
 if [ -f "$SCRIPT_DIR/lib/cli_adapter.sh" ]; then
     source "$SCRIPT_DIR/lib/cli_adapter.sh"
