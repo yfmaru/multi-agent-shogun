@@ -5,12 +5,13 @@ title = "Gitleaks config for multi-agent-shogun"
 # ============================================
 
 [allowlist]
-description = "Allowlist for test files, design docs, and README placeholders"
+description = "Allowlist for design docs and README placeholders"
 
-# テストファイル内のダミーキー
-paths = [
-    '''tests/.*''',
-]
+# cmd_242: tests/.* の包括除外は撤廃した（gunshi_report F-3・cmd_221の
+# 教訓——包括除外は検査器が腐る最短路であり、tests配下へ本物の秘密が
+# 入っても永久に鳴らなくなる）。テスト検体は`test-`/`fake-`等の接頭辞を
+# 用いる規約（CLAUDE.md「Secrets Discipline」）に統一し、個々のルール側の
+# allowlistへ値パターンで許可する（下記 ntfy-topic-name・bearer-token 参照）。
 
 # 設計書内のサンプルコード（reports/design_*.md）
 regexes = [
@@ -42,6 +43,8 @@ id = "bearer-token"
 description = "Bearer Token (X API, OAuth, etc.)"
 regex = '''Bearer [a-zA-Z0-9_\-\.]{20,}'''
 tags = ["bearer", "token", "oauth"]
+[rules.allowlist]
+regexes = ['''Bearer test-[a-zA-Z0-9_\-\.]{1,}''', '''Bearer fake-[a-zA-Z0-9_\-\.]{1,}''', '''Bearer mock-[a-zA-Z0-9_\-\.]{1,}''']
 
 [[rules]]
 id = "openai-api-key"
@@ -125,5 +128,5 @@ description = "ntfy topic name (acts as password)"
 regex = '''ntfy_topic:\s*["']?[a-zA-Z0-9_\-]{5,}["']?'''
 tags = ["ntfy", "secret"]
 [rules.allowlist]
-regexes = ['''ntfy_topic:\s*["']?shogun-yourname["']?''', '''ntfy_topic:\s*["']?your-topic["']?''', '''ntfy_topic:\s*["']?your-random-topic-name-here["']?''']
+regexes = ['''ntfy_topic:\s*["']?shogun-yourname["']?''', '''ntfy_topic:\s*["']?your-topic["']?''', '''ntfy_topic:\s*["']?your-random-topic-name-here["']?''', '''ntfy_topic:\s*["']?test[-_][a-zA-Z0-9_\-]*["']?''']
 paths = ['''SECURITY\.md''', '''config/ntfy_auth\.env\.sample''']

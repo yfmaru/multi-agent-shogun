@@ -1,0 +1,13 @@
+# .gitleaksignore
+#
+# gitleaksが報告するfingerprint(commit:file:rule:startLine)単位で
+# 個別に無視する。cmd_242。
+#
+# 下記は tests/unit/test_secret_scan.bats が合成検体として書いていた
+# ローカル変数名"secret"(値はAKIA形式のダミー・$()による動的生成で
+# 実体は無い)に、gitleaksのgeneric-passwordルールが誤反応したもの
+# （実測: PR#125初回CI run 32369159871）。当該コミット時点の値は既に
+# secret_scan.sh自身の変数参照フィルタでは正しく無視されていたが、
+# gitleaksはそのフィルタを持たないため反応した。以後のコミットで
+# 変数名をspecimen_valueへ改めており、新規コードとしては再発しない。
+c1bc3e25c6ef6c161cc691d04433fe1e77df7ed8:tests/unit/test_secret_scan.bats:generic-password:132

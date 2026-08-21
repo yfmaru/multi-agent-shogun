@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# .githooks/pre-push
+#
+# push前に scripts/secret_scan.sh --range を走らせ、秘密らしき値が
+# 検出された場合は push を止める（cmd_242 L1・本丸）。
+#
+# 有効化には `git config core.hooksPath .githooks` が必要
+# （`shutsujin_departure.sh` が毎起動時に冪等に設定するほか、
+# CONTRIBUTING.md のclone手順にも明記してある）。踏まぬcloneでは
+# 本フックは効かない——その背水としてCIジョブ`secret-scan`が別途在る。
+#
+# git pre-push フックの標準入力: 1行につき
+#   <local ref> <local sha1> <remote ref> <remote sha1>
+# https://git-scm.com/docs/githooks#_pre_push
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+Z40="0000000000000000000000000000000000000000"
+status=0
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [[ -n "$local_sha" ]] || continue
+    [[ "$local_sha" != "$Z40" ]] || continue   # ブランチ削除。走査対象なし
+
+    if ! bash "$REPO_ROOT/scripts/secret_scan.sh" --range "${remote_sha}..${local_sha}"; then
+        status=1
+    fi
+done
+
+if [[ "$status" -ne 0 ]]; then
+    echo "secret_scan.sh: block重大度の検出により push を止めた。" >&2
+    echo "検出内容を確認し、.secretscanignore へ理由付きでpinするか、値を修正せよ。" >&2
+fi
+
+exit "$status"

@@ -27,6 +27,9 @@ object Defaults {
     const val SSH_PORT_STR = "22"
     const val SHOGUN_SESSION = "shogun"
     const val AGENTS_SESSION = "multiagent"
-    const val NTFY_TOPIC = "sho-y0uhey"
+    // cmd_242 T-6: ntfyはトピック名が唯一の認証であり、設定せぬ利用者
+    // 全員が同一トピックを共有する既定は危うい。プレースホルダへ改めた
+    // （実在か架空かに関わらず、既定値としては不適である）。
+    const val NTFY_TOPIC = "your-ntfy-topic"
     const val TMUX = "/usr/bin/tmux"
 }

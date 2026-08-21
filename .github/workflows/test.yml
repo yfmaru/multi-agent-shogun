@@ -144,6 +144,36 @@ jobs:
           echo "::warning::scripts/build_instructions.sh not found. Skipping build check."
           echo "This check will be enabled once template generation is implemented (Phase 2)"
 
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      # gitleaks-actionはPRのbase..headの範囲をgit logで辿るため、既定の
+      # fetch-depth:1(浅いclone)ではその範囲のコミットが存在せず
+      # "unknown revision"で落ちる(実測: PR#125 run 32369008393)。
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 主役。種規則のうちconfig/settings.yamlはgitignore対象ゆえCIには
+      # 存在せず、$USERはCI環境変数が立っている間secret_scan.sh自身が
+      # 意図的に読まない(runner等の汎用ユーザ名による誤検知を避けるため)。
+      # ゆえにCIはパターン規則のみで走る——これがL2の限界であり、公開
+      # そのものを防ぐのはローカルのpre-pushフック(L1)である(cmd_242)。
+      # venv/pip installは不要（システムのpython3標準ライブラリのみで動く）。
+      - name: Run secret_scan.sh (primary)
+        run: bash scripts/secret_scan.sh --all
+
+      # 補助。種規則を持たぬgitleaksは今回の実際の露出(E-1/E-2)を0/3しか
+      # 検出できなかった(gunshi_report F-1b)。汎用ベンダパターンの網を広く
+      # 保守してもらう目的でCIにのみ配線する——主役はあくまでsecret_scan.sh。
+      - name: Run gitleaks (secondary, vendor-pattern coverage)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   shellcheck:
     name: Shell Script Linting
     runs-on: ubuntu-latest
