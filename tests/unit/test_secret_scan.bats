@@ -358,3 +358,17 @@ EOF
     run bash "$SECRET_SCAN" --bogus-flag
     [ "$status" -eq 2 ] || { echo "status=$status output=$output"; false; }
 }
+
+# ============================================================
+# L1配線: フックが実行ビット付きでcommitされていること
+# (cmd_242 fix2 R-3 — gunshi_report F-1/F-6。
+#  mode 100644 だとgitがフックを無言でskipし、L1が丸ごと不発になる
+#  ——DrvFs上ではパーミッションが常に0777に見えるため、この欠陥は
+#  DrvFs外(ext4等)でのgit ls-tree検査でしか検出できない)
+# ============================================================
+
+@test "T-SCAN-033: .githooks/pre-push is committed with the executable bit set" {
+    run git -C "$PROJECT_ROOT" ls-tree HEAD .githooks/pre-push
+    assert_success
+    assert_output --partial "100755"
+}

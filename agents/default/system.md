@@ -575,6 +575,15 @@ CIがイメージを建てぬ限り、CIの緑はホストでの実測の**複�
    洗い出してからfixtureへ向けること。** かつ、curlをstub化する場合は
    **stubに引数を記録させるな**（資格情報はargvに載る——記録した時点で
    ログファイルという新たな追跡外だが持続する漏洩経路を作ることになる）。
+7. **種規則（`config/settings.yaml`・`config/secret_seeds.local`・`$USER`等）
+   はgitignore対象であり、足軽のworktree・CI環境には存在しない。** 現用の
+   秘密を捕らえられるのは母屋の作業ツリーで`--all`を走らせた時のみである
+   ——worktree・CIでのpush/CI緑は「種規則不在ゆえの緑」であり得ることを
+   承知せよ（cmd_242 fix2、gunshi_report F-3）。
+8. **pre-pushフックはpushする最終状態しか見ない。** 一度commitした秘密は、
+   その後同一push内で除去しても、commit自体はremoteへ送られ公開リポジ
+   トリの履歴に残る。「消したから大丈夫」ではない（cmd_242 fix2、
+   gunshi_report F-4）。
 
 # Batch Processing Protocol (all agents)
 
