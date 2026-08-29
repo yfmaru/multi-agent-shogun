@@ -534,9 +534,19 @@ get_pane_busy_rc() {
             if [[ "$(agent_turn_state "$agent_id")" == "busy" ]]; then
                 return 0
             fi
-            # else は置かない。hook未装填でturn_stateが常にidleへ
-            # 縮退しても表示層が沈黙せぬよう、agent_is_busy_check へ落とす
-            # （S-1と同形。gunshi_qc_220_pr103 F-1 是正）。
+            # cmd_243 AC2: hook装填済みなら turn_state の idle は信用してよい。
+            # pane解析へ落ちるのは装填の証拠が1つも無い時だけとする
+            # （cmd_220 F-1 が残した理由＝縮退時の沈黙回避、をそのまま
+            #  条件に写したもの）。装填済みで落ちると、ターンが死んで
+            #  凍った画面の 'esc to interrupt' を読んで表示層だけが
+            #  「稼働中」と言い続ける（cmd_243 §B-2）。
+            local _fd="${IDLE_FLAG_DIR:-/tmp}"
+            if [ -f "${_fd}/shogun_ups_${agent_id}" ] || [ -f "${_fd}/shogun_busy_${agent_id}" ]; then
+                return 1
+            fi
+            # else は置かない（装填の証拠が無い場合）。hook未装填で
+            # turn_stateが常にidleへ縮退しても表示層が沈黙せぬよう、
+            # agent_is_busy_check へ落とす（S-1と同形。gunshi_qc_220_pr103 F-1 是正）。
         fi
     fi
 

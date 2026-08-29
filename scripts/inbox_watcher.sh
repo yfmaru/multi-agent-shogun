@@ -297,6 +297,13 @@ SHOGUN_DEFER_NTFY_SENT=${SHOGUN_DEFER_NTFY_SENT:-0}
 # next stale-busy episode can notify again.
 STALE_BUSY_NTFY_SENT=${STALE_BUSY_NTFY_SENT:-0}
 
+# cmd_243: unread-independent stale-busy-mark net (liveness_tick 内で発火).
+# STALE_BUSY_HASH/_SINCE(legacy)とは別変数——AC3「緩めぬ」ゆえ、legacyの
+# 一回性(STALE_BUSY_NTFY_SENT)を共有すると壊す。
+STALE_BUSY_MARK_HASH=""
+STALE_BUSY_MARK_HASH_SINCE=0
+STALE_BUSY_MARK_NTFY_LAST=0
+
 # Clears shogun-defer state. Call when a nudge actually reaches the pane
 # (send-keys success) or when the inbox goes back to zero unread.
 reset_shogun_defer_state() {
@@ -1995,12 +2002,83 @@ attempt_stall_recovery() {
 LIVENESS_LAST_TS=${LIVENESS_LAST_TS:-0}
 LIVENESS_MIN_INTERVAL=${LIVENESS_MIN_INTERVAL:-20}
 
+# ─── cmd_243: unread-independent stale-busy-mark net ───
+# cmd_217 の legacy安全網（2214/2371付近。三枚目が本関数）は
+# FIRST_UNREAD_SEEN を busy印の齢の代理に使うため、未読が1通も無い場面
+# では原理的に発火しない（cmd_243 §0-D）。ここでは代理をやめ busy印の
+# mtime を直接読む。cmd_217 D-1 の「齢だけで断ずるな、画面停止も要求
+# せよ」は維持する（N-3 の誤発火実例）。liveness_tick からのみ呼ぶ——
+# process_unread() の内側に置くと fast-path と else 分岐の両方に要る
+# 構造（cmd_218 が塞いだもの）を再生産するため。
+stale_busy_mark_net() {
+    local cli
+    cli=$(get_effective_cli_type)
+    [[ "$cli" == "claude" ]] || return 0   # 二枚印方式は claude 専用
+
+    [[ "$(agent_turn_state "$AGENT_ID")" == "busy" ]] || {
+        # 印が busy でない間は凍結追跡をたたむ（is_stalled_pane と同じ作法）
+        STALE_BUSY_MARK_HASH=""
+        STALE_BUSY_MARK_HASH_SINCE=0
+        return 0
+    }
+
+    local busy_flag="${IDLE_FLAG_DIR:-/tmp}/shogun_busy_${AGENT_ID}"
+    local mt now age limit
+    mt=$(stat -c %Y "$busy_flag" 2>/dev/null) || return 0
+    now=$(date +%s)
+    age=$((now - mt))
+    limit="${STALE_BUSY_MARK_LIMIT:-300}"
+    [ "$age" -ge "$limit" ] || return 0     # ここまでは stat 1回のみ（安価）
+
+    # cmd_217 D-1 STALE_BUSY_REQUIRES_FROZEN_PANE
+    local frozen rc
+    pane_hash_frozen_sec STALE_BUSY_MARK_HASH STALE_BUSY_MARK_HASH_SINCE
+    rc=$?
+    frozen="$PANE_HASH_FROZEN_SEC"
+    [ "$rc" -eq 0 ] || return 0             # capture不能は固着と断じない（T-D4）
+    [ "$frozen" -ge "$limit" ] || return 0
+
+    # cmd_219 の軸（「その画面が何であるか」）を借りる。入力待ちと
+    # 名指しできる画面は、ターンが死んだのではなく人を待っている。
+    # 印を倒せば「考えている最中を断ち切る」偽idleを新設することになる。
+    local safety
+    safety=$(pane_input_safety "$PANE_TARGET" 2>/dev/null || echo unknown)
+    if [ "$safety" = "modal" ]; then
+        stale_busy_mark_notify "$age" "$frozen" "modal"
+        return 0                            # 印は触らぬ。報せるだけ
+    fi
+
+    echo "[$(date)] [STALE-BUSY-MARK] $AGENT_ID: busy印の齢=${age}s 画面停止=${frozen}s 未読非依存 screen=${safety} — forcing idle flag (unread-independent stale busy recovery; hook不発の疑い)" >&2
+    touch "${IDLE_FLAG_DIR:-/tmp}/shogun_idle_${AGENT_ID}"
+    stale_busy_mark_notify "$age" "$frozen" "$safety"
+    # 印を倒した以上、凍結追跡は畳む（次のbusyで測り直す）
+    STALE_BUSY_MARK_HASH=""
+    STALE_BUSY_MARK_HASH_SINCE=0
+    return 0
+}
+
+stale_busy_mark_notify() {
+    local age="$1" frozen="$2" screen="$3" nnow cooldown
+    nnow=$(date +%s)
+    cooldown="${STALE_BUSY_MARK_NTFY_COOLDOWN:-600}"
+    [ "$((nnow - STALE_BUSY_MARK_NTFY_LAST))" -ge "$cooldown" ] || return 0
+    STALE_BUSY_MARK_NTFY_LAST=$nnow
+    if [ "$screen" = "modal" ]; then
+        type branch_policy_notify &>/dev/null && branch_policy_notify \
+          "${AGENT_ID}: busy印が${age}s古く画面も${frozen}s停止。ただし入力待ち画面ゆえ印は触らず(要人手)" 2>/dev/null || true
+    else
+        type branch_policy_notify &>/dev/null && branch_policy_notify \
+          "${AGENT_ID}: busy印が${age}s古く画面も${frozen}s停止のため強制idle化(未読ゼロ・hook不発の疑い)" 2>/dev/null || true
+    fi
+}
+
 liveness_tick() {
     local now
     now=$(date +%s)
     [ "$((now - LIVENESS_LAST_TS))" -ge "$LIVENESS_MIN_INTERVAL" ] || return 0
     LIVENESS_LAST_TS=$now
     attempt_stall_recovery
+    stale_busy_mark_net        # cmd_243 追加。stall層に先番を譲る
     return 0   # Never return 1 — set -euo pipefail would kill the watcher
 }
 
@@ -2208,6 +2286,7 @@ for s in data.get('specials', []):
         if agent_is_busy && [[ "$AGENT_ID" != "shogun" ]]; then
             local busy_cli
             busy_cli=$(get_effective_cli_type)
+            # 三枚目が liveness_tick に在る。cmd_243
             # Stale busy safety net: if agent has been "busy" for >5 minutes with
             # unread messages, force-create idle flag. This recovers from false-busy
             # deadlock where stop_hook failed to create the flag.
@@ -2354,6 +2433,7 @@ for s in data.get('specials', []):
             fi
         fi
     elif [ "${special_deferred:-0}" -eq 1 ]; then
+        # 三枚目が liveness_tick に在る。cmd_243
         # cmd_220 F-D: normal_count is 0 (a deferred clear_command doesn't
         # count as a normal message), so the branch above — and the 300s
         # stale-busy safety net inside it — is unreachable for pure-special
