@@ -31,6 +31,13 @@
 #             かつ画面に'esc to interrupt'が残る → 待機中(rc=1)（§B-2の直列性）
 #   T-243-09: get_pane_busy_rc: ups印もbusy印も無い(未装填) → 従来どおり
 #             pane解析へ落ちる（cmd_220 F-1 の維持）
+#   T-243-10: liveness_tick の呼び出し順（attempt_stall_recovery が
+#             stale_busy_mark_net より先）を固定する（§A1 call_order /
+#             §A-4 R2(a)。gunshi_report.yaml F-1 recommendation (1)）
+#   T-243-11: AGENT_ID=shogun でも T-243-02 と同じ発火を要求する
+#             （§A3-2。shogun除外変異を検出する。F-1 recommendation (2)）
+#   T-243-12: 強制idle化時、NTFY_LOG に1件、文言に「強制idle化」を含む
+#             通知が出ることを検める（§A-4 R2(b)。F-1 recommendation (3)）
 
 SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 WATCHER_SCRIPT="$SCRIPT_DIR/scripts/inbox_watcher.sh"
@@ -362,4 +369,76 @@ setup_lib_only() {
     [ "$status" -eq 0 ] \
         || { echo "FAIL: expected rc=0 (busy via pane-analysis fallback, 'esc to interrupt' last line) when hook unarmed; got rc=$status"; false; }
     rm -rf "$TEST_LIB_TMPDIR"
+}
+
+# ─── T-243-10: liveness_tick の呼び出し順を固定する ───
+# gunshi_report.yaml F-1: 設計 §A1 call_order・§A-4 R2(a) は「stall層に
+# 先番を譲る」順序そのものを退行防止の手当てと位置づける。順序を入れ
+# 替える変異（liveness_tick 内で stale_busy_mark_net を
+# attempt_stall_recovery より先に呼ぶ）が62ケース全green だった穴を塞ぐ。
+
+@test "T-243-10: liveness_tick calls attempt_stall_recovery before stale_busy_mark_net (call-order invariant, §A1/§A-4 R2(a))" {
+    run bash -c "
+        source '$TEST_HARNESS'
+        ORDER_LOG='$TEST_TMPDIR/call_order.log'
+        attempt_stall_recovery() { echo stall >> \"\$ORDER_LOG\"; }
+        stale_busy_mark_net() { echo stale >> \"\$ORDER_LOG\"; }
+        LIVENESS_LAST_TS=0
+        liveness_tick
+        cat \"\$ORDER_LOG\"
+    "
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(printf 'stall\nstale')" ] \
+        || { echo "FAIL: expected call order [attempt_stall_recovery, stale_busy_mark_net] (stall層先番); got: $output"; false; }
+}
+
+# ─── T-243-11: AGENT_ID=shogun でも同じ発火を要求する ───
+# gunshi_report.yaml F-1: 設計 §A3-2 は shogun を意図して含めた
+# （legacy 2枚は逆に shogun を除外している）。shogun を除外する変異
+# （`[[ "$AGENT_ID" != "shogun" ]] || return 0` を足す）が
+# 検出されなかった穴を塞ぐ。
+
+@test "T-243-11: liveness_tick fires stale_busy_mark_net for AGENT_ID=shogun exactly as for any other agent (§A3-2 — shogun is intentionally included)" {
+    touch "$TEST_TMPDIR/shogun_busy_shogun"
+    touch -d "@$(( $(date +%s) - 600 ))" "$TEST_TMPDIR/shogun_busy_shogun"
+    rm -f "$TEST_TMPDIR/shogun_idle_shogun"
+
+    MOCK_CAPTURE_PANE="$WORKING_CAPTURE" run bash -c "
+        source '$TEST_HARNESS'
+        AGENT_ID='shogun'
+        $(seed_stale_busy_mark_hash "$WORKING_CAPTURE" 500)
+        LIVENESS_LAST_TS=0
+        liveness_tick
+    "
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q '\[STALE-BUSY-MARK\]' \
+        || { echo "FAIL: expected [STALE-BUSY-MARK] log line for AGENT_ID=shogun; output: $output"; false; }
+    [ -f "$TEST_TMPDIR/shogun_idle_shogun" ] \
+        || { echo 'FAIL: idle印 was not touched for AGENT_ID=shogun (shogun must not be excluded)'; false; }
+}
+
+# ─── T-243-12: 強制idle化時、通知に「強制idle化」を含む ───
+# gunshi_report.yaml F-1: 設計 §A-4 R2(b) は、この通知を「stall層の
+# エスカレーションを先回りして潰すこと」への代償と位置づける。T-243-06は
+# modal経路の通知だけを固定しており、強制idle経路（非modal）の
+# stale_busy_mark_notify 呼び出しを削る変異は検出されなかった。
+
+@test "T-243-12: forced-idle path (non-modal) notifies once with wording containing 強制idle化 (§A-4 R2(b))" {
+    touch "$TEST_TMPDIR/shogun_busy_ashigaru9"
+    touch -d "@$(( $(date +%s) - 600 ))" "$TEST_TMPDIR/shogun_busy_ashigaru9"
+    rm -f "$TEST_TMPDIR/shogun_idle_ashigaru9"
+
+    MOCK_CAPTURE_PANE="$WORKING_CAPTURE" run bash -c "
+        source '$TEST_HARNESS'
+        $(seed_stale_busy_mark_hash "$WORKING_CAPTURE" 500)
+        LIVENESS_LAST_TS=0
+        liveness_tick
+    "
+    [ "$status" -eq 0 ]
+    [ -f "$TEST_TMPDIR/shogun_idle_ashigaru9" ] \
+        || { echo 'FAIL: precondition broken — idle印 was not touched (forced-idle path did not run)'; false; }
+    [ "$(grep -c 'NOTIFY:' "$NTFY_LOG")" -eq 1 ] \
+        || { echo "FAIL: expected exactly 1 notify for the forced-idle case; log: $(cat "$NTFY_LOG")"; false; }
+    grep -q '強制idle化' "$NTFY_LOG" \
+        || { echo "FAIL: notify wording missing 強制idle化 phrasing (R2(b) 代償が欠落); log: $(cat "$NTFY_LOG")"; false; }
 }
